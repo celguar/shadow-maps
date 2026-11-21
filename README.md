@@ -164,6 +164,18 @@ minhook (ClassicAPI's own submodule) passes for every trampoline page. Verified
 by allocating one page per level in a throwaway i686 process and writing to it:
 only `0x4` and `0x40` came back with the bytes they were given.
 
+The stub's `add esp, 16` after the fixup call is the other half of the same kind
+of trap. MSVC gives a `static` C function a **plain `ret`** — opcode `c3`, no
+`imm16` — so the caller, not the callee, must drop the two pushed argument dwords
+(`this`, `record`) plus the 8-byte scratch the stub reserves before them: 16 in
+total. Asking for 8 instead is silent at compile time and an access violation
+inside the client at run time: `popad` then runs 8 bytes low, every register
+comes back from the wrong slot, and `ecx` — `CMapChunk::Load`'s `this`, which the
+client stores at `this+0x168` at `0x6AF5FF` right after resuming — holds whatever
+the client's old `ebx` was. `verify_dll.py` reads `fixup_chunk`'s epilogue out of
+the linked image and requires the stub's `add` to match whichever `ret` form this
+build chose, so an off-by-eight is a build failure, not an in-game crash.
+
 ## What this machine produces
 
 `out\ShadowMaps.dll` 134,144 bytes and `build\Release\ShadowMaps.dll` 135,168
@@ -185,15 +197,19 @@ any non-zero `Load` with its own generic `was not loaded properly (load
 function failed)` popup — that popup is never the reason, this file is:
 
 ```
-sv3 no shadowmaps.dat where the DLL is: the client keeps stock shadows; looked in 'G:\Games\twmoa_1181\shadowmaps.dat' (rename the variant .dat to that name, it belongs beside the DLL, not beside the game)
-sv3 installed: map 'Azeroth' variant 'shadows-Azeroth-morning', entries 114328, payloads 66413 (32 MB arena), hook 0x6AF5F0 patched, resume 0x6AF5F6, detour at 0x........
+sv4 no shadowmaps.dat where the DLL is: the client keeps stock shadows; looked in 'G:\Games\twmoa_1181\shadowmaps.dat' (rename the variant .dat to that name, it belongs beside the DLL, not beside the game)
+sv4 installed: map 'Azeroth' variant 'shadows-Azeroth-morning', entries 114328, payloads 66413 (32 MB arena), hook 0x6AF5F0 patched, resume 0x6AF5F6, detour at 0x........
+fixup: first chunk with no payload: gy 521 gx 440 key 533944 (the bake left it without a shadow map, or its tile is not in this set)
 fixup: first chunk matched: gy 352 gx 352 key 360800, shadow drawn from arena+........
 fixup: 10000 chunks matched so far, of 114328 entries
 ```
 
 …and every 10,000 matched chunks up to 60 lines, which is the in-game evidence
 that the arena is what is being drawn and how far under 114,328 the tiles not
-in this set leave it.
+in this set leave it. The first-chunk line names the chunk the client really
+loaded first and comes in both flavours: this set covers 487 of Azeroth's 741
+tiles, so a chunk outside it (`gy 521 gx 440` is tile `27,32`) legitimately logs
+"no payload", and only the `first chunk matched` line proves a payload was drawn.
 
 ## Honest limits
 

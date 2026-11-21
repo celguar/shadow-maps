@@ -63,7 +63,7 @@
 #include <string.h>
 #include "../shadow_dat.h"
 
-#define STAMP "sv3" /* build stamp, printed in every log line: an old build of
+#define STAMP "sv4" /* build stamp, printed in every log line: an old build of
                     * this DLL sitting next to a new .dat is the most common
                     * confusion, so the line says which build made it */
 
@@ -260,15 +260,22 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
  *
  * Stack on entry: [esp]=ret, [esp+4]=record, [esp+8]=first; `this` is in ecx
  * (the client's Load is thiscall). pushfd/pushad preserve every register the
- * game had; fixup_chunk runs as plain cdecl with (ecx=this, record) pushed on
- * the stack; after its ret 8 the stack sits exactly back after the sub esp,8,
- * and the single add esp,8 undoes the sub, so popad/popfd leaves the frame
- * pristine for the replayed prologue:
+ * game had; fixup_chunk is passed (this, record) on the stack, and MSVC gives a
+ * static C function like this a PLAIN ret -- opcode c3, no imm16 -- so the
+ * caller, not the callee, has to drop the two argument dwords. This is not a
+ * mistake a compiler would catch: cleanup off by eight means popad runs at esp-44
+ * instead of esp-36, every register comes back from the wrong slot (ecx holds
+ * the client's old ebx), and Load's own next act is mov [esi+0x168], eax at
+ * 0x6AF5FF with esi = ecx = this -- an ACCESS_VIOLATION on the first chunk
+ * loaded, which is exactly what an in-game crash at 0x6AF5FF means. verify_dll.py
+ * reads the epilogue out of the linked image and checks this add against it:
  *   -4 -32 -8 (pushfd pushad sub) = esp-44: [esp+48] = entry esp+4 = record
- *   -4 -4 (push eax push ecx), call: callee ret 8 pops ret + the 8 arg bytes
- *   +8 (add esp,8), +32 (popad), +4 (popfd) = back to entry esp.
+ *   -4 -4 (push eax push ecx), then call: plain ret leaves the args behind, so
+ *     the callee returns at esp-52
+ *   +16 (add esp,16 = the 8 arg bytes + the 8 scratch bytes), +32 (popad, which
+ *     starts at esp-36 where pushad put its first slot), +4 (popfd) = entry esp
  * The 6 replayed bytes then set up ebp and eax = record exactly as the game
- * expects (ecx was never touched), and the jmp resumes Load's own body.
+ * expects (ecx is back from pushad), and the jmp resumes Load's own body.
  *
  * Encoding note: x86-32 has no `sub r/m32, imm8` -- the one-byte-immediate
  * group (opcode 83) only covers add/or/adc/sbb/and/xor/cmp, and its reg field
@@ -298,7 +305,8 @@ static const unsigned char stub_code[] = {
     0x51,                         /* push ecx  (this)           */
     0xB8, 0x00, 0x00, 0x00, 0x00, /* mov  eax, <fixup_chunk>    */
     0xFF, 0xD0,                   /* call eax                   */
-    0x83, 0xC4, 0x08,             /* add  esp, 8                */
+    0x83, 0xC4, 0x10,             /* add  esp, 16  (8 arg bytes the callee left,
+                                        8 scratch bytes)      */
     0x61,                         /* popad                      */
     0x9D,                         /* popfd                      */
     0x55,                         /* push ebp        -- replayed */

@@ -28,7 +28,7 @@ them with addresses only this process can know:
     51                 push ecx  (this)
     b8 <imm32>         mov  eax, <fixup_chunk>     slot STUB_SLOT_FIXUP  = 12
     ff d0              call eax
-    83 c4 08           add  esp, 8
+    83 c4 10           add  esp, 16  (8 arg bytes the callee left, 8 scratch)
     61                 popad
     9d                 popfd
     55 8b ec           push ebp / mov ebp, esp     the 6 replayed prologue
@@ -43,6 +43,16 @@ The needle is PARSED out of mod.c rather than hardcoded, so the fingerprint
 cannot drift from the source: if someone edits stub_code, this script follows.
 It also cross-checks mod.c's own STUB_BYTES and slot defines against the
 array, which is the same equality BuildStub asserts at runtime.
+
+One check cannot come from the source at all: the stub's `add esp, 16` after the
+call. MSVC gives a static C function a PLAIN ret (opcode c3) and makes the caller
+drop the arguments, but the optimiser is free to choose `ret imm16` instead, and
+either way the stub must undo exactly what THIS build chose -- an eight-byte
+mistake is silent at compile time and an ACCESS_VIOLATION inside the client at
+runtime, because popad then restores every register from the wrong slot. So the
+sibling map file locates fixup_chunk in the image, its epilogue is disassembled,
+and the stub's add is required to be the matching 8 (callee cleans) or 16
+(caller cleans: 8 argument bytes plus the 8-byte scratch reservation).
 
 Usage
     python verify_dll.py [<ShadowMaps.dll> ...]   (default: out\ShadowMaps.dll)
@@ -68,7 +78,7 @@ OK_IMPORTS = {"ntdll.dll", "kernel32.dll", "kernel32.exe", "user32.dll",
 
 # fallback needle, used only if mod.c cannot be read; kept in sync by hand
 FALLBACK_STUB = bytes.fromhex(
-    "9c6083c4f88b4424305051b800000000ffd083c408619d558bec8b4508b800000000ffe0")
+    "9c6083c4f88b4424305051b800000000ffd083c410619d558bec8b4508b800000000ffe0")
 FALLBACK_SLOTS = (12, 30)
 
 
@@ -86,6 +96,48 @@ def parse_stub(source_text):
         if hit:
             defines[name] = int(hit.group(1))
     return data, defines
+
+
+def callee_cleanup(path, blob, pe, base, md):
+    """Bytes the callee itself removes for the fixup call, read from the image.
+
+    The map beside the DLL names fixup_chunk; its epilogue's `ret` form is what
+    the stub's add esp,N must match. Returns 0 (plain ret: caller cleans), the
+    imm16 the linker chose (callee cleans), or None when the function cannot be
+    located in this build."""
+    map_path = os.path.join(os.path.dirname(path), "ShadowMaps.map")
+    if not os.path.isfile(map_path):
+        return None
+    raw = open(map_path, "rb").read()
+    va = None
+    for enc in ("cp1252", "utf-16", "utf-8"):
+        try:
+            txt = raw.decode(enc, "replace")
+            break
+        except Exception:
+            continue
+    for line in txt.splitlines():
+        hit = re.search(r"([0-9a-fA-F]{8})\s+f\s+mod\.obj", line)
+        if hit and "fixup_chunk" in line:
+            va = int(hit.group(1), 16)
+    if va is None:
+        return None
+
+    def rd(v, n):
+        for sec in pe.sections:
+            size = max(sec.Misc_VirtualSize, sec.SizeOfRawData)
+            if sec.VirtualAddress <= v - base < sec.VirtualAddress + size:
+                off = v - base - sec.VirtualAddress + sec.PointerToRawData
+                return blob[off:off + n]
+        return b""
+
+    body = rd(va, 0x2000)
+    for ins in md.disasm(body, va):
+        if ins.mnemonic == "ret":
+            if not ins.op_str:
+                return 0
+            return int(ins.op_str, 0)
+    return None
 
 
 def main(argv):
@@ -159,6 +211,28 @@ def main(argv):
             if flag:
                 bad += 1
             print("   import %s (%d named)%s" % (name, len(mod.imports), flag))
+
+        # ---- the detour's esp math: what the callee actually did -------------
+        cleaned = callee_cleanup(path, blob, pe, base, md)
+        call_at = stub.find(b"\xff\xd0")
+        add_at = stub.find(b"\x83\xc4", call_at + 2) if call_at >= 0 else -1
+        got = stub[add_at + 2] if add_at >= 0 and add_at + 3 <= len(stub) else None
+        if cleaned is None:
+            print("   fixup_chunk not in a sibling map (a copy in the game folder"
+                  " has none): the epilogue form is unchecked here, the two"
+                  " build outputs are the ones that decide")
+        else:
+            want = 8 if cleaned else 16
+            print("   fixup_chunk epilogue: %s, so the caller must drop %d bytes"
+                  " (args %d + scratch 8)"
+                  % ("ret (caller cleans)" if not cleaned else "ret %#x" % cleaned,
+                     want, want - 8))
+            if got != want:
+                bad += 1
+                print("     the stub adds esp,%s: off by %d, popad restores"
+                      " every register from the wrong slot and the client"
+                      " faults on the first chunk"
+                      % ("%#x" % got if got is not None else "?", abs(want - (got or 0))))
 
         # ---- the detour: a const table, so in .rdata or wherever it landed ---
         found = 0
