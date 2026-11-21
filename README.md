@@ -89,6 +89,19 @@ build this contract was read from (`benilla-re`, `CMapChunk::Load`, build 5875):
 disassembles them; it exits non-zero when a client is not the build this mod
 was written for.
 
+The write is also checked against the client's own resolver at run time. `0x6AF970`
+turns eight header ofss into addresses with one `lea esi,[ofs+record+8]` each,
+and `BuildVertices` (`0x6B0E50`) then walks 145 floats off the MCVT one — its
+inner loop at `0x6B0FB7` is `mov ecx,[ebx]` with `ebx = this+0xf14` advanced 4
+a vertex. So the seven ofss this file does not write (`+0x14 +0x18 +0x1c +0x20
++0x24 +0x58 +0x60`) are sampled before and after the mutation: if any of them
+moved, `FIELD_MCSH_OFS` is not `0x2c` on this client, and the run would die in
+that vertex loop with an `ACCESS_VIOLATION` on what is really an arena
+displacement. In that case the ofss are put back, one log line names `hdr`, the
+ofs slot that moved, its value before and after, the arena and the displacement
+that was written — enough to recompute the field — and mutation stops for the
+rest of the run, so the session finishes instead of crashing.
+
 ## Building
 
 Requires CMake (3.10+) and an MSVC toolchain that can target 32-bit Windows.
@@ -197,10 +210,11 @@ any non-zero `Load` with its own generic `was not loaded properly (load
 function failed)` popup — that popup is never the reason, this file is:
 
 ```
-sv4 no shadowmaps.dat where the DLL is: the client keeps stock shadows; looked in 'G:\Games\twmoa_1181\shadowmaps.dat' (rename the variant .dat to that name, it belongs beside the DLL, not beside the game)
-sv4 installed: map 'Azeroth' variant 'shadows-Azeroth-morning', entries 114328, payloads 66413 (32 MB arena), hook 0x6AF5F0 patched, resume 0x6AF5F6, detour at 0x........
-fixup: first chunk with no payload: gy 521 gx 440 key 533944 (the bake left it without a shadow map, or its tile is not in this set)
-fixup: first chunk matched: gy 352 gx 352 key 360800, shadow drawn from arena+........
+sv5 no shadowmaps.dat where the DLL is: the client keeps stock shadows; looked in 'G:\Games\twmoa_1181\shadowmaps.dat' (rename the variant .dat to that name, it belongs beside the DLL, not beside the game)
+sv5 installed: map 'Azeroth' variant 'shadows-Azeroth-morning', entries 114328, payloads 66413 (32 MB arena at 0x........), hook 0x6AF5F0 patched, resume 0x6AF5F6, detour at 0x........
+fixup: first chunk with no payload: gy 519 gx 439 key 531895 (the bake left it without a shadow map, or its tile is not in this set)
+fixup: first chunk matched: gy 352 gx 352 key 360800, shadow drawn from arena+0, this 0x........ record 0x........ hdr 0x........ arena 0x........, hdr flags 0x........ size 0x200 ofs 0x........, mcvtof 0x........ mcnrof 0x........ mclyof 0x........ mcrof 0x........ mcalof 0x........ mcseof 0x........ mclof 0x........
+fixup: the shadow write moved a sub-record ofs: hdr 0x........ ofs at hdr+0x14 was 0x........ and is 0x........ now, ofs written 0x........ (= arena 0x........ - hdr), FIELD_MCSH_OFS 0x2c is wrong for this client; the ofss are restored and no more chunks are patched so the run finishes
 fixup: 10000 chunks matched so far, of 114328 entries
 ```
 
@@ -208,8 +222,11 @@ fixup: 10000 chunks matched so far, of 114328 entries
 that the arena is what is being drawn and how far under 114,328 the tiles not
 in this set leave it. The first-chunk line names the chunk the client really
 loaded first and comes in both flavours: this set covers 487 of Azeroth's 741
-tiles, so a chunk outside it (`gy 521 gx 440` is tile `27,32`) legitimately logs
+tiles, so a chunk outside it (`gy 519 gx 439` is tile `27,32`) legitimately logs
 "no payload", and only the `first chunk matched` line proves a payload was drawn.
+That line also dumps the header the write went into — `this`, `record`, `hdr`,
+the arena and all eight sub-record ofss — so the addresses a crash report names
+can be matched against it.
 
 ## Honest limits
 
@@ -217,6 +234,12 @@ tiles, so a chunk outside it (`gy 521 gx 440` is tile `27,32`) legitimately logs
   from the client's own bytes, not from a screenshot. The `MCNK` header writes
   follow the client's decode chain, but the first real confirmation is someone
   loading it and seeing the shadows.
+- The last runs left the client crashing inside `BuildVertices` — `ACCESS_VIOLATION
+  at 0x6B0FB7`, the `mov ecx,[ebx]` that reads the MCVT floats, `ebx =
+  this+0xf14`, and in both reports the same `0x6CF97F32` while `this` moved. That
+  is a header write landing somewhere other than `hdr+0x2c`, and the probe above
+  is what turns it into a log line naming the field rather than a crash; the next
+  build fixes `FIELD_MCSH_OFS` from that line.
 - A shadow set only says "this chunk's shadow map is these 512 bytes". The
   client's own shadow path still decides the rest: the `MCNK` flag bit and the
   world-wide shadow flag gate it, and `shadowLevel` still picks the 64×64 vs

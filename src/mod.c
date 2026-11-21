@@ -63,7 +63,7 @@
 #include <string.h>
 #include "../shadow_dat.h"
 
-#define STAMP "sv4" /* build stamp, printed in every log line: an old build of
+#define STAMP "sv5" /* build stamp, printed in every log line: an old build of
                     * this DLL sitting next to a new .dat is the most common
                     * confusion, so the line says which build made it */
 
@@ -94,6 +94,25 @@ static const unsigned char k_gate[] = {
 #define FIELD_GLOBAL_ROW 0x90u /* CMapChunk: area base + row (gy)    */
 #define FIELD_MCSH_OFS   0x2Cu /* MCNK header: ofsMCSH               */
 #define FIELD_MCSH_SIZE  0x30u /* MCNK header: sizeMCSH              */
+
+/* The sub-record ofss the client's own resolver (0x6AF970) turns into
+ * addresses, every one of them but the shadow slot this file writes:
+ *   mov eax,[ecx+0x168]        eax = the record Load was handed
+ *   lea edx,[eax+8]            edx = hdr, kept at this+0xf08
+ *   mov esi,[edx+0x14] / lea esi,[esi+eax+8] / mov [ecx+0xf14],esi
+ * ... for +0x14 +0x18 +0x1c +0x20 +0x24 +0x2c +0x58 +0x60. They are the only
+ * thing between the write below and a crash: BuildVertices (0x6B0E50) walks
+ * 145 floats off the MCVT one, and its inner loop at 0x6B0FB7 is `mov
+ * ecx,[ebx]` with ebx = this+0xf14 advanced 4 a vertex -- the ACCESS_VIOLATION
+ * reading the MCVT cursor is what a wrong FIELD_MCSH_OFS looks like in-game.
+ * So the seven untouched ofss are sampled before and after the write, and a
+ * sample that moved is proof the shadow field is not at hdr+0x2c here: the
+ * ofss are put back so the vertex walk survives, the shift is logged with the
+ * addresses to recompute FIELD_MCSH_OFS from, and mutation stops for the rest
+ * of the run rather than dying in that loop. */
+static const unsigned k_probe_ofs[] = {0x14u, 0x18u, 0x1cu,
+                                       0x20u, 0x24u, 0x58u, 0x60u};
+#define PROBE_COUNT 7u
 
 /* ------------------------------------------------------- runtime state ***/
 
@@ -126,6 +145,7 @@ static int g_log_mismatch;            /* one-shot log flags, fixup is hot   */
 static int g_log_nomatch;
 static int g_log_first;
 static int g_log_hits;                /* how many progress lines were logged */
+static int g_log_field;               /* a probe dword moved: logged once   */
 
 static DWORD WINAPI InitWorker(LPVOID p);
 static int Install(void);
@@ -169,9 +189,11 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
 {
     const unsigned char *client_map;
     unsigned gx, gy, key;
+    unsigned i, moved;
+    unsigned before[PROBE_COUNT];
     int lo, hi, mid, hit;
     unsigned char *hdr;
-    char msg[512];
+    char msg[768];
 
     if (!g_ready || !self_ || !record_)
         return;
@@ -224,10 +246,48 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
      * edx,[eax+8]). ofsMCSH is relative to hdr, and the game resolves every
      * sub-record as hdr + ofs, so hdr + ofs lands in the arena. */
     hdr = (unsigned char *)record_ + 8;
+    for (i = 0; i < PROBE_COUNT; ++i)
+        before[i] = ((const unsigned *)(hdr + k_probe_ofs[i]))[0];
     hdr[0] |= 1; /* MCNK flag bit 0: the shadow path's own gate */
     ((unsigned *)(hdr + FIELD_MCSH_OFS))[0] =
         (unsigned)((size_t)(g_arena + g_offs[hit]) - (size_t)hdr);
     ((unsigned *)(hdr + FIELD_MCSH_SIZE))[0] = SHADOW_DAT_PAYLOAD_BYTES;
+
+    /* proof that the write stayed in the shadow slot: none of the other
+     * sub-record ofss may move. One that did says hdr is not the header the
+     * resolver has, so the ofss are put back -- BuildVertices would otherwise
+     * read 145 floats off an MCVT cursor that is really an arena displacement,
+     * i.e. the 0x6B0FB7 crash -- and mutation is switched off for the rest of
+     * the run so the session finishes and the log can be read whole. */
+    moved = 0;
+    for (i = 0; i < PROBE_COUNT; ++i) {
+        unsigned now = ((unsigned *)(hdr + k_probe_ofs[i]))[0];
+        if (now == before[i])
+            continue;
+        if (!g_log_field) {
+            g_log_field = 1;
+            snprintf(msg, sizeof msg,
+                     "fixup: the shadow write moved a sub-record ofs: hdr %#x,"
+                     " ofs at hdr+%#x was %#x and is %#x now, ofs written %#x"
+                     " (= arena %#x - hdr), FIELD_MCSH_OFS 0x%x is wrong for"
+                     " this client; the ofss are restored and no more chunks"
+                     " are patched so the run finishes",
+                     (unsigned)(size_t)hdr, k_probe_ofs[i], before[i], now,
+                     (unsigned)((size_t)(g_arena + g_offs[hit]) - (size_t)hdr),
+                     (unsigned)(size_t)g_arena, FIELD_MCSH_OFS);
+            LogMsg(msg);
+        }
+        ((unsigned *)(hdr + k_probe_ofs[i]))[0] = before[i];
+        moved = 1;
+    }
+    if (moved) {
+        g_ready = 0;
+        if (g_log_field)
+            LogMsg(STAMP " fixup: the field contract does not hold on this"
+                         " client, shadows left stock for the rest of the run");
+        return;
+    }
+
     ++g_hits;
 
     /* one progress line every 10000 matched chunks, capped at 60 lines: cheap
@@ -244,8 +304,23 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
     if (!g_log_first) {
         g_log_first = 1;
         snprintf(msg, sizeof msg,
-                 "fixup: first chunk matched: gy %u gx %u key %u, shadow drawn from arena+%u",
-                 gy, gx, key, g_offs[hit]);
+                 "fixup: first chunk matched: gy %u gx %u key %u, shadow drawn"
+                 " from arena+%u, this %#x record %#x hdr %#x arena %#x,"
+                 " hdr flags %#x size %#x ofs %#x, mcvtof %#x mcnrof %#x"
+                 " mclyof %#x mcrof %#x mcalof %#x mcseof %#x mclof %#x",
+                 gy, gx, key, g_offs[hit],
+                 (unsigned)(size_t)self_, (unsigned)(size_t)record_,
+                 (unsigned)(size_t)hdr, (unsigned)(size_t)g_arena,
+                 ((const unsigned *)(hdr + 0x00u))[0],
+                 ((const unsigned *)(hdr + FIELD_MCSH_SIZE))[0],
+                 ((const unsigned *)(hdr + FIELD_MCSH_OFS))[0],
+                 ((const unsigned *)(hdr + 0x14u))[0],
+                 ((const unsigned *)(hdr + 0x18u))[0],
+                 ((const unsigned *)(hdr + 0x1cu))[0],
+                 ((const unsigned *)(hdr + 0x20u))[0],
+                 ((const unsigned *)(hdr + 0x24u))[0],
+                 ((const unsigned *)(hdr + 0x58u))[0],
+                 ((const unsigned *)(hdr + 0x60u))[0]);
         LogMsg(msg);
     }
 }
@@ -591,9 +666,12 @@ static int Install(void)
     memcpy(g_dat_map, head.map, 24);
     g_ready = 1;
     snprintf(msg, sizeof msg,
-             STAMP " installed: map '%s' variant '%s', entries %u, payloads %u (%u MB arena), hook 0x6AF5F0 patched, resume 0x6AF5F6, detour at %#x",
+             STAMP " installed: map '%s' variant '%s', entries %u, payloads %u"
+                   " (%u MB arena at %#x), hook 0x6AF5F0 patched, resume"
+                   " 0x6AF5F6, detour at %#x",
              (const char *)head.map, (const char *)head.variant, head.entryCount,
-             head.payloadUnique, head.payloadBytes / (1024u * 1024u), (unsigned)(size_t)g_stub);
+             head.payloadUnique, head.payloadBytes / (1024u * 1024u),
+             (unsigned)(size_t)arena, (unsigned)(size_t)g_stub);
     LogMsg(msg);
     return 1;
 }
