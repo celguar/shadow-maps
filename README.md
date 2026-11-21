@@ -150,7 +150,19 @@ DLL G:\Games\twmoa_1181\ShadowMaps.dll was not loaded properly (load function fa
 ```
 
 The common cause is exactly the one that line names: the `.dat` still carries
-its variant name.
+its variant name. Allocation refusals name the shape they asked for and the
+operating system's own `GetLastError`, so a bad parameter is read, not guessed.
+
+`VirtualAlloc` and `VirtualProtect` do **not** take a bit-or of access bits here:
+`<winnt.h>` gives a level family — `0x1` readable, `0x2` write-combine (written
+but never read back), `0x4` readable/writable/executable, `0x40` =
+`PAGE_EXECUTE_READWRITE`, the same level over every mapping of the page — and
+every OR of two of them (`0x3`, `0x7`, `0xF`) is refused outright with
+`GetLastError 0x57` "the parameter specified is invalid". So the arena asks
+`0x4` and the detour page and the write dance ask `0x40`, which is the value
+minhook (ClassicAPI's own submodule) passes for every trampoline page. Verified
+by allocating one page per level in a throwaway i686 process and writing to it:
+only `0x4` and `0x40` came back with the bytes they were given.
 
 ## What this machine produces
 
@@ -173,8 +185,8 @@ any non-zero `Load` with its own generic `was not loaded properly (load
 function failed)` popup — that popup is never the reason, this file is:
 
 ```
-sv2 no shadowmaps.dat where the DLL is: the client keeps stock shadows; looked in 'G:\Games\twmoa_1181\shadowmaps.dat' (rename the variant .dat to that name, it belongs beside the DLL, not beside the game)
-sv2 installed: map 'Azeroth' variant 'shadows-Azeroth-morning', entries 114328, payloads 66413 (32 MB arena), hook 0x6AF5F0 patched, resume 0x6AF5F6, detour at 0x........
+sv3 no shadowmaps.dat where the DLL is: the client keeps stock shadows; looked in 'G:\Games\twmoa_1181\shadowmaps.dat' (rename the variant .dat to that name, it belongs beside the DLL, not beside the game)
+sv3 installed: map 'Azeroth' variant 'shadows-Azeroth-morning', entries 114328, payloads 66413 (32 MB arena), hook 0x6AF5F0 patched, resume 0x6AF5F6, detour at 0x........
 fixup: first chunk matched: gy 352 gx 352 key 360800, shadow drawn from arena+........
 fixup: 10000 chunks matched so far, of 114328 entries
 ```

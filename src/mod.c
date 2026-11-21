@@ -63,7 +63,7 @@
 #include <string.h>
 #include "../shadow_dat.h"
 
-#define STAMP "sv2" /* build stamp, printed in every log line: an old build of
+#define STAMP "sv3" /* build stamp, printed in every log line: an old build of
                     * this DLL sitting next to a new .dat is the most common
                     * confusion, so the line says which build made it */
 
@@ -321,14 +321,27 @@ static const unsigned char stub_code[] = {
 static int BuildStub(unsigned fixup_target, unsigned resume_at)
 {
     unsigned char *page;
+    char msg[256];
 
     if (sizeof stub_code != STUB_BYTES) {
         LogMsg(STAMP " build defect: the detour byte table and its slot offsets disagree, refusing to patch");
         return 0;
     }
-    page = (unsigned char *)VirtualAlloc(NULL, 0x1000u, 0x00003000u, 0x00000007u /* READ|WRITE|EXECUTE */);
+    page = (unsigned char *)VirtualAlloc(NULL, 0x1000u, 0x00003000u,
+                                         0x00000040u /* PAGE_EXECUTE_READWRITE from
+                                         <winnt.h>, the same value MinHook asks for
+                                         every trampoline page: this page holds
+                                         machine code the client jumps into. fl
+                                         Protect is a LEVEL from winnt.h's family,
+                                         not a bit-or, so the 0x7 this file had
+                                         before was refused with GetLastError 0x57
+                                         and the store never happened; the arena
+                                         comment above names the whole family. */);
     if (!page) {
-        LogMsg(STAMP " VirtualAlloc for the detour page failed: refusing to patch");
+        snprintf(msg, sizeof msg, STAMP " VirtualAlloc for the detour page failed"
+                 " (asked 0x1000 bytes, alloc 0x3000, protect 0x40), GetLastError"
+                 " %#x: refusing to patch", GetLastError());
+        LogMsg(msg);
         return 0;
     }
     memcpy(page, stub_code, sizeof stub_code);
@@ -498,14 +511,24 @@ static int Install(void)
     free(ent);
 
     /* one resident arena for every payload, allocated once at load: chunks
-     * point INTO it, there is no copy and no eviction. The constants are the
-     * Win32 headers' MEMRESIDENT_(0x1000) | MEMCOMMIT_(0x2000) for the
-     * allocation type and MEMORY_ACCESS_READ_(1) | MEMORY_ACCESS_WRITE__(2)
-     * for the protection; spelled as hex so the line survives any header. */
+     * point INTO it, there is no copy and no eviction. The allocation type is
+     * the headers' MEMRESIDENT_(0x1000) | MEMCOMMIT_(0x2000). The protection is
+     * NOT a bit-or: <winnt.h> gives a LEVEL family -- 0x1 readable, 0x2 write-
+     * combine (written but never read back), 0x4 readable/writable/executable,
+     * 0x40 = PAGE_EXECUTE_READWRITE, the same level over every mapping of the
+     * page -- and every OR of two of them (0x3, 0x7, 0xF) is refused outright
+     * with GetLastError 0x57 "the parameter specified is invalid". 0x4 is the
+     * lowest level that is both readable and writable, which is all an arena of
+     * data needs; the detour page below asks 0x40, the value MinHook passes and
+     * the value this client's own hooks are patched with. Both were spelled as
+     * hex so the line survives any header. */
     arena = (unsigned char *)VirtualAlloc(NULL, (SIZE_T)head.payloadBytes,
-                                          0x00003000u, 0x00000003u);
+                                          0x00003000u, 0x00000004u);
     if (!arena) {
-        LogMsg(STAMP " VirtualAlloc for the shadow arena failed: refusing to patch");
+        snprintf(msg, sizeof msg, STAMP " VirtualAlloc for the shadow arena failed"
+                 " (asked %u bytes, alloc 0x3000, protect 0x4), GetLastError"
+                 " %#x: refusing to patch", head.payloadBytes, GetLastError());
+        LogMsg(msg);
         fclose(f);
         return 0;
     }
@@ -537,7 +560,10 @@ static int Install(void)
      * read-back decides, so a page that was already writable needs no dance
      * and a page that is not cannot leave the client half-patched. */
     page_base = (unsigned char *)((size_t)site & ~(size_t)0xFFFu);
-    perms = VirtualProtect(page_base, 0x1000u, 0x00000007u /* READ|WRITE|EXECUTE */,
+    perms = VirtualProtect(page_base, 0x1000u, 0x00000040u /* PAGE_EXECUTE_READWRITE
+                            from <winnt.h>, the same value MinHook passes for every
+                            hook; 0x7 is refused with GetLastError 0x57 because fl
+                            NewProtect is the same level family as VirtualAlloc's */,
                            (LPDWORD)&old_protect);
     patched[0] = 0xE9; /* jmp rel32 */
     memcpy(patched + 1, &rel, 4);
