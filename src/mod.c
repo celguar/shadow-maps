@@ -28,15 +28,22 @@
  * client's own s_mapName (0xC961A0) at every chunk, so a payload for the
  * wrong map is ignored rather than half-applied.
  *
- * This build, sv9, answers what sv8's mode b settled. That run was decisive
- * again: mode b -- the hook plus ONE EMPTY call per chunk, so the .dat is never
- * opened, nothing is allocated beyond the single detour page, and no chunk
- * header is read or written anywhere -- still crashed entering the world at
- * 0x6B0FB7 reading the same 0x6CF97F32, with the log ending at its two install
- * lines. Nothing this DLL reads or writes is left on that path, so the fault is
- * in the detour itself: the store, the landing, the resume point, or the ESP
- * math the stub does around the call. sv9 adds the two rungs that split those
- * four and one instrument that makes the next crash report name its own chunk:
+ * What the sv9 ladder settled, and what sv10 changes because of it. Four real
+ * runs came back with their install lines and no new crash: mode a (the whole
+ * 34 MB arena resident, no hook), mode c (the store and landing at 0x6AF5F0,
+ * no call) and mode d (the call with its arguments read from [ebp+8] on the
+ * client's own frame) entered the world clean, and mode h and mode f refused
+ * to install at all with "build defect: the detour byte table and its slot
+ * offsets disagree". So the store, the landing, both resume points, the arena
+ * and the .dat read are all proven, and the fault sv8 saw is only b's [esp+48]
+ * argument lookup through pushad/pushfd. sv10 acts on that in three places:
+ * StubShape puts the rungs that do real work (h and f) on d's shape and leaves
+ * b on its own, the slot check stopped assuming every resume was a 0x68 push --
+ * b's resume is the operand of a 0xB8 mov, which is the disagreement that
+ * refused h and f -- and every hooking rung now prints one "first fixup call"
+ * line naming the two pointers it got, so a clean d run means "the call
+ * happened" instead of "nothing happened". Re-running b against these is what
+ * confirms the lookup was the whole difference:
  *   c  the detour ONLY: replay the 6 prologue bytes, push <resume>, ret. No
  *      pushad, no call, no C code on the path at all -- 12 bytes, one patch
  *      slot, and eax/ecx/edx/esp/flags all come back as the client had them,
@@ -62,11 +69,15 @@
  *      ladder section says what each rung proves:
  *   n  inert -- the .dat is not read, nothing is allocated, nothing is patched
  *   a  the .dat and the resident arena, whole -- and NO hook, NO write
- *   b  the hook and an empty call only -- no .dat, no arena, no header read
- *   c  the hook alone, no call -- the stub's store, landing and replay only
- *   d  the same empty call, args taken from the client's own frame
- *   h  the hook and the header audit only -- no .dat, no arena, no write
- *   f  full: .dat, arena, hook, and the matched-chunk writes (shadows draw)
+ *   b  the hook and an empty call only, on b's own [esp+48] frame -- no .dat,
+ *      no arena, no header read
+ *   c  the hook alone at 0x6AF5F0, no call -- the stub's store, landing and
+ *      replay only
+ *   d  the same empty call at 0x6AF5F3, args from the client's own frame
+ *   h  the hook and the header audit only -- no .dat, no arena, no write, and
+ *      riding d's shape now
+ *   f  full: .dat, arena, hook and the matched-chunk writes (shadows draw) --
+ *      d's shape too, so b is the only rung left on b's frame
  *
  * Lifecycle follows ClassicAPI's src/DllMain.cpp. DllMain installs nothing:
  * under VanillaFixes the install runs from the exported `Load` (VF calls
@@ -106,10 +117,10 @@
 #include <string.h>
 #include "../shadow_dat.h"
 
-#define STAMP "sv9" /* build stamp, printed in every log line: an old build of
-                    * this DLL sitting next to a new .dat is the most common
-                    * confusion, so the line says which build made it, and the
-                    * mode line below names which of sv7's four modes ran */
+#define STAMP "sv10" /* build stamp, printed in every log line: an old build of
+                     * this DLL sitting next to a new .dat is the most common
+                     * confusion, so the line says which build made it, and the
+                     * mode line below names which of the seven rungs ran */
 
 /* ---------------------------------------------------------------- pinned **/
 
@@ -237,6 +248,7 @@ static volatile DWORD g_hits;         /* chunks that found a payload        */
 static volatile void *g_last_this;
 static volatile void *g_last_record;
 static volatile DWORD g_chunk_visits; /* chunks that reached the fixup      */
+static int g_first_call;              /* the "the call happened" line is printed once per run, by every hooking rung that calls the fixup at all. It is the cheapest possible proof that a rung's stub reaches the call with a pair of pointers, which is what makes a clean d run mean "the call works" rather than "nothing happened": mode c prints no such line because its landing calls nothing. */
 static int g_handler_logged;          /* the dying-chunk line is logged once */
 static int g_handler_on;              /* the vectored handler is registered  */
 /* UCRT's fread is NOT the standard C three-argument form: <stdio.h> declares
@@ -605,6 +617,22 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
                                       * const-qualified global would then need
                                       * every write casted instead */
     ++g_chunk_visits;
+
+    /* one line per run, and pointers only: nothing here reads the chunk, so a
+     * rung whose arguments were garbage still prints this rather than faulting
+     * inside the fixup. This is what separates "the stub reached the call with
+     * a pair of pointers" from "the stub never called at all" on a run that
+     * entered the world cleanly -- mode c emits no landing call, so mode c
+     * never prints it, and a mode c run that printed everything except this is
+     * exactly what a working store and a working landing look like. */
+    if (!g_first_call) {
+        g_first_call = 1;
+        snprintf(msg, sizeof msg,
+                 STAMP " first fixup call: this %#x record %#x after %#u visits, mode %c -- the hooking rungs print this once, mode c never does",
+                 (unsigned)(size_t)self_, (unsigned)(size_t)record_,
+                 (unsigned)g_chunk_visits, g_mode);
+        LogMsg(msg);
+    }
 
     if (!g_ready || !self_ || !record_)
         return;
@@ -975,6 +1003,24 @@ static const unsigned char stub_code_d[] = {
 #define STUB_D_SLOT_FIXUP    7u
 #define STUB_D_SLOT_RESUME  24u
 
+/* Which detour shape a rung rides. This is the one place the ladder says which
+ * frame is in play, and it changed after real runs: sv8's mode b (the 0x6AF5F0
+ * store, pushad/pushfd and the record read at [esp+48]) crashed entering the
+ * world at 0x6B0FB7, while the sv9 runs of mode c (that same store and landing,
+ * no call) and mode d (the 0x6AF5F3 store, the call, arguments taken from
+ * [ebp+8] on the client's own live frame) BOTH entered the world clean. So the
+ * store, the landing, the replayed prologue and both resume points are proven
+ * good, and the only detour piece still known to be bad is the [esp+48]
+ * lookup through pushad/pushfd -- therefore the rungs that do real work (h and
+ * f) ride d's shape, and only rung b still emits b's shape, so re-running b is
+ * what confirms the lookup was the whole difference. */
+static char StubShape(char rung)
+{
+    if (rung == 'c') return 'c';
+    if (rung == 'b') return 'b';
+    return 'd';
+}
+
 /* Emits the detour into a page of its own: VirtualAlloc with execute rights,
  * the same as MinHook's heap trampolines, and never a rewrite of a file-backed
  * page. The two imm32 slots are patched with the values this process sees now,
@@ -988,35 +1034,47 @@ static int BuildStub(char rung)
     unsigned code_bytes, slot_fixup, slot_resume;
     unsigned fixup_target, resume_at;
     char msg[256];
+    char shape;
+    unsigned resume_prefix;
 
     /* which of the three detour shapes to emit, and where its two imm32 slots
      * are; the sizes and slot offsets are asserted against the tables right
      * here, and verify_dll.py checks the same numbers out of the linked image,
      * so a table edited without its slots (or slots edited without a table) is
      * caught twice, once at install and once before the DLL is ever shipped. */
-    if (rung == 'c') {
+    shape = StubShape(rung);
+    if (shape == 'c') {
         code = stub_code_c;
         code_bytes = STUB_C_BYTES;
         slot_fixup = 0u; /* mode c calls nothing, so there is no fixup slot */
         slot_resume = STUB_C_SLOT_RESUME;
-    } else if (rung == 'd') {
+        /* c and d carry the resume address as the operand of a push, 0x68 */
+        resume_prefix = 0x68u;
+    } else if (shape == 'd') {
         code = stub_code_d;
         code_bytes = STUB_D_BYTES;
         slot_fixup = STUB_D_SLOT_FIXUP;
         slot_resume = STUB_D_SLOT_RESUME;
+        resume_prefix = 0x68u;
     } else {
         code = stub_code;
         code_bytes = STUB_BYTES;
         slot_fixup = STUB_SLOT_FIXUP;
         slot_resume = STUB_SLOT_RESUME;
+        /* b's shape reaches its resume through mov eax,<resume> / jmp eax, so
+         * the byte before its resume slot is 0xB8, not 0x68: the shape decides
+         * the prefix, and a check that assumed the push form refused b's table
+         * at install -- which is what made the sv9 h and f runs print a build
+         * defect instead of installing anything */
+        resume_prefix = 0xB8u;
     }
     /* the table and its slots must agree before any byte is written; verify_dll
      * .py checks the same three (bytes, slots, opcode prefixes) in the linked
      * image, so this is the runtime half of the same rule */
-    if ((size_t)code_bytes != (rung == 'c' ? sizeof stub_code_c
-                               : (rung == 'd' ? sizeof stub_code_d : sizeof stub_code))
+    if ((size_t)code_bytes != (shape == 'c' ? sizeof stub_code_c
+                               : (shape == 'd' ? sizeof stub_code_d : sizeof stub_code))
         || (slot_fixup != 0u && code[slot_fixup - 1u] != 0xB8u)
-        || code[slot_resume - 1u] != 0x68u) {
+        || code[slot_resume - 1u] != (unsigned char)resume_prefix) {
         LogMsg(STAMP " build defect: the detour byte table and its slot offsets disagree, refusing to patch");
         return 0;
     }
@@ -1054,13 +1112,12 @@ static int BuildStub(char rung)
  * checks: a mode-h run that crashes while a mode-n run is clean is proof about
  * this code path, not about anything the shadow write does, and the two modes
  * have to agree on how the store is asked for, attempted and verified. */
-/* `rung` says which detour shape and which site: b, h and f use the 0x6AF5F0
- * store over the 6-byte prologue, c uses the same store with a landing that
- * calls nothing, and d uses the 0x6AF5F3 store, which is the only rung whose
- * resume point is not "the instruction right after the replayed prologue": its
- * 5-byte E9 covers mov eax,[ebp+8] / push ebx / push esi whole and resumes on
- * the 0x57 push edi at 0x6AF5F8. The store is 5 bytes everywhere, so the site
- * and the resume are the whole difference between the rungs. */
+/* Which shape a rung rides, through StubShape: the c rung is the 0x6AF5F0
+ * store with a landing that calls nothing, and the d, h and f rungs are the
+ * 0x6AF5F3 store with a landing that calls the fixup off the client's own
+ * frame. The store is 5 bytes everywhere, so the site and the resume are the
+ * whole difference between the two sites; the pin below is what ties each site
+ * to the same prologue. */
 static int PatchHook(char rung)
 {
     unsigned char *site;
@@ -1070,14 +1127,15 @@ static int PatchHook(char rung)
     long rel;
     int perms;
 
-    if (rung == 'd') {
+    if (StubShape(rung) == 'd') {
+        /* d's shape, which h and f ride too: the E9 spans 0x6AF5F3..0x6AF5F7,
+         * 5 bytes, and resumes on the 0x57 push edi at 0x6AF5F8 that k_prologue_d
+         * pins as the byte right after the span. */
         site = (unsigned char *)(size_t)ADDR_LOAD_D;
-        /* d's E9 spans 0x6AF5F3..0x6AF5F7 = 5 bytes, resume 0x6AF5F8, the byte
-         * after the span and pinned to 0x57 push edi by k_prologue_d below. */
         g_resume = ADDR_LOAD_D + 5u;
         if (memcmp((const void *)(size_t)ADDR_LOAD_D, k_prologue_d,
                    sizeof k_prologue_d) != 0) {
-            LogMsg(STAMP " mode d's site is not the pinned 6 bytes of the same prologue: refusing to patch this client");
+            LogMsg(STAMP " the d shape's site is not the pinned 6 bytes of the same prologue: refusing to patch this client");
             return 0;
         }
     } else {
@@ -1182,17 +1240,14 @@ static int Install(void)
     InstallHandler();
 
     if (g_mode == 'c') {
-        /* the narrowest hook rung there is: the store and the landing only. The
-         * landing replays the 6 prologue bytes and jumps back, and calls nothing
-         * at all, so no C code of this DLL runs on the client's loading path and
-         * the only state that changes is eax/ecx/edx/esp/flags -- all of which
-         * the replay leaves as the client had them. The question this rung asks
-         * is exactly the question sv8's mode b left open, since that run
-         * crashed: did the 5-byte store land, does the landing run, is 0x6AF5F6
-         * the right resume point? A clean c against a crashing b says the frame
-         * math around the call was wrong; a c that crashes at the same 0x6B0FB7
-         * says the store, the landing or the resume point is wrong, and then the
-         * handler line below names the chunk that was being built. */
+        /* the c rung's own verdict, from a real run: it entered the world with
+         * its three install lines and nothing else, no crash and no new shadows,
+         * which is what was still being claimed here about the store, the
+         * landing, the replayed prologue and the resume point. All four are
+         * settled now. What this rung has NOT settled is the call, because its
+         * landing makes no call -- mode d's shape is the same landing plus the
+         * call, and the sv9 d run that entered the world clean is what settled
+         * the call and its [ebp+8] argument lookup. */
         if (!PatchHook('c'))
             return 0;
         g_ready = 0; /* nothing may write, there is nothing to write with anyway */
@@ -1212,10 +1267,12 @@ static int Install(void)
          * covers mov eax,[ebp+8] / push ebx / push esi whole and the resume is
          * the next instruction boundary, 0x6AF5F8. ebp is already the client's
          * own frame there, so the stub reads the record from [ebp+8] and this
-         * from ecx: no ESP displacement is part of finding the arguments, which
-         * is the one thing mode b has not yet separated. If d is clean and b
-         * crashed, the [esp+48] displacement in b's stub was wrong; if d crashes
-         * at 0x6AF5F8+'s own first read instead, the resume point is wrong. */
+         * from ecx: no ESP displacement is part of finding the arguments. This
+         * rung RAN on real client and entered the world clean, with no crash and
+         * no new shadows (it allocates nothing and writes nothing, so no shadows
+         * is the expected look), which is what makes d's shape the one h and f
+         * ride through StubShape and leaves b's [esp+48] lookup as the only
+         * known-bad piece of the detour. */
         if (!PatchHook('d'))
             return 0;
         g_silent = 1;
@@ -1232,17 +1289,18 @@ static int Install(void)
     }
 
     if (g_mode == 'b') {
-        /* the stub rung: the detour and a call per chunk that does NOTHING --
-         * g_silent returns before the audit, before the per-chunk dump, before
-         * looking at the header, so no file is opened and no client byte is
-         * read or written. sv8 ran this and it crashed at 0x6B0FB7 reading 0x6C
-         * F97F32, the same report as every earlier mode, which is what left the
-         * fault inside the detour: the store, the landing, the resume point, or
-         * the ESP math the stub does around the call. The crash report's own
-         * frame was intact, so the remaining suspects are the [esp+48] argument
-         * lookup in this stub and the resume point. modes c and d above are the
-         * two rungs that split those; this rung stays in the ladder because it
-         * is the one the sv8 evidence is quoted from. */
+        /* the one rung left on b's shape, and it is now the ONLY rung on that
+         * shape: h and f ride d's shape instead (StubShape). sv8 ran this and it
+         * crashed at 0x6B0FB7 reading 0x6CF97F32, and the sv9 runs put mode c
+         * (this same store at 0x6AF5F0 and this same resume point, landing that
+         * calls nothing) and mode d (the 0x6AF5F3 store, the call, arguments
+         * from [ebp+8]) both clean entering the world with no new crash. So the
+         * store, the landing, the replayed prologue and both resume points are
+         * proven, and the [esp+48] lookup through pushad/pushfd is the one
+         * piece of the detour still known to be wrong. Re-running b is how that
+         * is confirmed once more: a b that crashes with c and d clean says the
+         * lookup is the whole difference, and that is why nothing that ships
+         * rides this shape any more. */
         if (!PatchHook('b'))
             return 0;
         g_silent = 1;
@@ -1260,18 +1318,24 @@ static int Install(void)
     if (g_mode == 'h') {
         /* the stub plus the call's work: the detour, the first-chunk audit and
          * one compact header dump per chunk, with no .dat opened, nothing
-         * allocated and no chunk header touched. If this crashes where mode b
-         * did not, the fault is in what the call DOES inside Load -- the audit
-         * and its file I/O on the client's own loading path -- and not in the
-         * detour's frame, the memory footprint or the shadow write. */
+         * allocated and no chunk header touched. sv9 tried this on b's shape and
+         * the install refused it -- the slot check expected a 0x68 push before
+         * every resume slot, and b's resume is the operand of a 0xB8 mov, so h
+         * and f logged "build defect" and patched nothing. This rung now rides
+         * d's shape, so the question left open is narrower: does the audit's own
+         * work survive on the client's loading path. A clean h run has to leave
+         * the first fixup call, the audit block and the per-chunk dumps in the
+         * log, not just its install line -- that line is what makes clean mean
+         * the call happened rather than nothing happened. */
         if (!PatchHook('h'))
             return 0;
         g_ready = 1;
         snprintf(msg, sizeof msg,
-                 STAMP " mode h installed: hook 0x6AF5F0 patched, resume 0x6AF5F6,"
-                 " detour at %#x, fixup audits the first chunk whole and dumps"
-                 " every chunk's ofss -- no .dat read, nothing allocated, no"
-                 " chunk header touched (shadows stay stock)",
+                 STAMP " mode h installed: hook 0x6AF5F3 patched, resume 0x6AF5F8"
+                 " (push edi) -- d's shape, the one the clean mode-d run proved,"
+                 " NOT b's [esp+48] frame, detour at %#x, fixup audits the first"
+                 " chunk whole and dumps every chunk's ofss -- no .dat read, nothing"
+                 " allocated, no chunk header touched (shadows stay stock)",
                  (unsigned)(size_t)g_stub);
         LogMsg(msg);
         return 1;
@@ -1408,10 +1472,10 @@ static int Install(void)
      * MEMRESIDENT_ | MEMCOMMIT_, which IS a bit-or, while flProtect takes ONE
      * level from <winnt.h>'s family -- 0x4 for data (0x40 is for the executable
      * detour page), and every OR of two levels (0x3, 0x7, 0xF) is refused with
-     * GetLastError 0x57, which is what sv2's three refusals were. mode a
-     * returns right after this line: its whole job is to say whether this
-     * 34 MB reservation is what pushes a later client allocation over the
-     * limit, with no hook and no write anywhere in the process. */
+     * GetLastError 0x57, which is what sv2's three refusals were. Mode a is the
+     * run that proved this reservation harmless: it holds the whole 34 MB arena
+     * resident and returns before the hook, and a real sv9 run of it entered the
+     * world with no crash, so nothing about the earlier 0xC0000005 is memory. */
     arena = (unsigned char *)VirtualAlloc(NULL, (SIZE_T)head.payloadBytes,
                                           0x00003000u, 0x00000004u);
     if (!arena) {
@@ -1458,7 +1522,8 @@ static int Install(void)
         return 1;
     }
 
-    /* mode f: hook plus writes, the only rung that is expected to draw */
+    /* mode f: hook plus writes, the only rung that is expected to draw. It rides
+     * d's shape now, the one a real sv9 run proved good. */
     g_allow_write = 1;
     if (!PatchHook('f'))
         return 0;
@@ -1467,8 +1532,9 @@ static int Install(void)
     g_ready = 1;
     snprintf(msg, sizeof msg,
              STAMP " mode f installed: map '%s' variant '%s', entries %u,"
-                    " payloads %u, arena %u MB at %#x..%#x, hook 0x6AF5F0"
-                    " patched, resume 0x6AF5F6, detour at %#x; matched chunks"
+                    " payloads %u, arena %u MB at %#x..%#x, hook 0x6AF5F3 patched"
+                    " with resume 0x6AF5F8 -- d's shape, the one the clean mode-d run proved,"
+                    " NOT b's frame, detour at %#x; matched chunks"
                     " get flags |= 1, hdr+0x2c = arena buffer - hdr and"
                     " hdr+0x30 = 512, so the client's own gate, CreateShadowTexture"
                     " and the decoders read live .dat bytes",
