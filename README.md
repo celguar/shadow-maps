@@ -159,8 +159,9 @@ bytes, both i686, both exporting `Load`, both importing only `KERNEL32.dll`,
 both accepted by `verify_dll.py` with zero complaints — i.e. the stub's stack
 math is read from real linked code, not from a comment.
 
-The test payload is `G:\Games\twmoa_1181\shadows-Azeroth-morning.dat`: 34,918,204
-bytes (33.3 MiB), `SHDW` v1, map `Azeroth`, variant `shadows-Azeroth-morning`,
+The test payload sits in the game folder as
+`G:\Games\twmoa_1181\shadowmaps.dat`: 34,918,204 bytes (33.3 MiB), `SHDW` v1,
+map `Azeroth`, variant `shadows-Azeroth-morning`,
 114,328 entries, 66,413 unique payloads (34,003,456 payload bytes), 487 tiles in
 `(22,22)..(44,60)`, chunk grid `(352,352)..(707,975)`, and `124 + entries*8 +
 payloadBytes == filesize`.
