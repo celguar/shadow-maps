@@ -28,18 +28,27 @@
  * client's own s_mapName (0xC961A0) at every chunk, so a payload for the
  * wrong map is ignored rather than half-applied.
  *
- * This build, sv7, can do four different things with ONE binary, picked by the
- * first letter of a shadow-mod.mode file sitting next to the DLL (a missing
- * file means f). The crash is still only pinned to "the client reads an ADT
- * buffer that is not there", and sv6 proved by audit that the header contract
- * holds in the client's own memory, so what is left open is OUR footprint and
- * OUR stub, and the four letters separate those two from each other and from
- * the shadow write:
+ * This build, sv8, is sv7's four-mode ladder plus one rung and one instrument,
+ * both of which the first full run of the ladder asked for. That run was
+ * decisive: mode a (the .dat read, the whole 34 MB arena resident, NO hook, no
+ * call, no write) entered the world clean, and mode h (the hook, the first-chunk
+ * audit, nothing allocated, no chunk header touched) crashed entering the world
+ * at the same 0x6B0FB7 reading the same 0x6CF97F32 as every earlier report. So
+ * neither the footprint nor the shadow write is at fault: the fault is in the
+ * detour's landing or in what the call does inside Load. sv8 adds
+ *   b  the hook and one EMPTY call per chunk -- no read, no log, no write
+ * which separates the stub from the call's own work, and it logs one compact
+ * header dump per chunk, capped, so the LAST line of those in a log names the
+ * chunk whose BuildVertices died: Load runs fixup BEFORE its own body maps the
+ * header it was handed, and the dump prints the eight ofss the resolver is
+ * about to copy into this+0xf14..+0xf30, which says whether the .adt's own
+ * values reached the object or were already junk on disk. README.md's mode
+ * ladder section says what each rung proves:
  *   n  inert -- the .dat is not read, nothing is allocated, nothing is patched
  *   a  the .dat and the resident arena, whole -- and NO hook, NO write
+ *   b  the hook and an empty call only -- no .dat, no arena, no header read
  *   h  the hook and the header audit only -- no .dat, no arena, no write
  *   f  full: .dat, arena, hook, and the matched-chunk writes (shadows draw)
- * README.md's "mode ladder" section says what each outcome proves.
  *
  * Lifecycle follows ClassicAPI's src/DllMain.cpp. DllMain installs nothing:
  * under VanillaFixes the install runs from the exported `Load` (VF calls
@@ -76,7 +85,7 @@
 #include <string.h>
 #include "../shadow_dat.h"
 
-#define STAMP "sv7" /* build stamp, printed in every log line: an old build of
+#define STAMP "sv8" /* build stamp, printed in every log line: an old build of
                     * this DLL sitting next to a new .dat is the most common
                     * confusion, so the line says which build made it, and the
                     * mode line below names which of sv7's four modes ran */
@@ -147,6 +156,11 @@ static const char *k_table_cc[] = {"MCVT", "MCNR", "MCLY", "MCRF", "MCAL",
  * inside the record the header belongs to and reading its fourcc cannot fault;
  * a bigger value is printed, never dereferenced */
 #define AUDIT_OFS_MAX 0x40000u
+/* the per-chunk header dump is capped so a run cannot write an endless log, and
+ * the cap is far above where the crash happens: the LAST such line in the log is
+ * the chunk whose BuildVertices died, because Load calls fixup before its own
+ * body reads the header it was handed */
+#define AUDIT_LOG_MAX 40000u
 
 /* ------------------------------------------------------- runtime state ***/
 
@@ -182,7 +196,10 @@ static int g_log_first;
 static int g_log_hits;                /* how many progress lines were logged */
 static int g_log_field;               /* a probe dword moved: logged once   */
 static int g_log_audit;               /* the first chunk entering Load audited */
-static char g_mode = 'f';             /* sv7's mode letter, see ReadModeFile   */
+static unsigned g_audit_seen;         /* per-chunk header dumps logged so far */
+static int g_silent;                  /* mode b: the call returns before doing
+                                          anything at all, file I/O included */
+static char g_mode = 'f';             /* the mode letter, see ReadModeFile     */
 static int g_allow_write;             /* only mode f lets fixup_chunk write    */
 static int g_diagnostic;              /* installed nothing on purpose: Load returns 4 */
 
@@ -212,7 +229,7 @@ static void LogMsg(const char *text)
 }
 
 /* sv7's mode letter: the first non-blank character of <dir>\shadow-mod.mode,
- * lower-cased, and only n/a/h/f are honoured -- an unreadable, empty or junk
+ * lower-cased, and only n/a/b/h/f are honoured -- an unreadable, empty or junk
  * file means f, so forgetting the file gives the full path, never a silent
  * no-op. A mode FILE rather than four DLLs is what lets the user walk README
  * .md's ladder by editing one letter, with no rebuild between the steps and no
@@ -235,7 +252,7 @@ static char ReadModeFile(void)
             continue;
         if (c >= 'A' && c <= 'Z')
             c += 32;
-        if (c == 'n' || c == 'a' || c == 'h' || c == 'f')
+        if (c == 'n' || c == 'a' || c == 'b' || c == 'h' || c == 'f')
             m = (char)c;
         break;
     }
@@ -345,6 +362,17 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
     if (!g_ready || !self_ || !record_)
         return;
 
+    /* mode b: the hook is in and the call happens, but this returns before
+     * reading anything, before logging a byte, before looking at the header. If
+     * a mode-b run still crashes at 0x6B0FB7 while mode a entered the world
+     * clean, the fault is in the detour itself -- the store, the landing, or the
+     * frame the stub keeps -- and nothing else in this DLL is involved. If mode
+     * b is clean and mode h is not, the fault is in what the call DOES inside
+     * Load, which today means the audit and its file I/O on the client's own
+     * loading path. */
+    if (g_silent)
+        return;
+
     /* the very first chunk to reach Load is audited whole, before the map
      * check and before anything could be written: the crash reports say the
      * MCVT cursor was unreadable on a chunk this DLL never matched, so the
@@ -354,6 +382,49 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
     if (!g_log_audit) {
         g_log_audit = 1;
         AuditHeader(record_, "first chunk");
+    }
+
+    /* every chunk that gets here also gets a one-line dump of the header
+     * values the client is about to read -- ofss relative to hdr = record + 8,
+     * the same values 0x6AF605's resolver copies into this+0xf14..+0xf30, plus
+     * the object's own global chunk coordinates. A crash later in Load has its
+     * chunk named by the LAST line of this kind in the log: Load runs fixup
+     * first, so the chunk whose BuildVertices dereferenced an unreadable MCVT
+     * cursor is the last one this DLL saw, and the line says whether hdr+0x14
+     * really held the .adt's own small ofs (then the cursor in the object was
+     * moved by something other than this DLL) or a big value already (then the
+     * header the client has is not the header the .adt file has). */
+    if (g_audit_seen < AUDIT_LOG_MAX) {
+        ++g_audit_seen;
+        hdr = (unsigned char *)record_ + 8;
+        snprintf(msg, sizeof msg,
+                 "last chunk seen: this %#x record %#x hdr %#x flags %#x indexX"
+                 " %#x indexY %#x, ofs MCVT %#x MCNR %#x MCLY %#x MCRF %#x MCAL"
+                 " %#x MCSH %#x MCSE %#x MCLQ %#x, global col %#x row %#x",
+                 (unsigned)(size_t)self_, (unsigned)(size_t)record_,
+                 (unsigned)(size_t)hdr,
+                 ((const unsigned *)hdr)[0],
+                 ((const unsigned *)hdr)[1],
+                 ((const unsigned *)hdr)[2],
+                 ((const unsigned *)(hdr + 0x14u))[0],
+                 ((const unsigned *)(hdr + 0x18u))[0],
+                 ((const unsigned *)(hdr + 0x1cu))[0],
+                 ((const unsigned *)(hdr + 0x20u))[0],
+                 ((const unsigned *)(hdr + 0x24u))[0],
+                 ((const unsigned *)(hdr + FIELD_MCSH_OFS))[0],
+                 ((const unsigned *)(hdr + 0x58u))[0],
+                 ((const unsigned *)(hdr + 0x60u))[0],
+                 ((const unsigned *)((char *)self_ + FIELD_GLOBAL_COL))[0],
+                 ((const unsigned *)((char *)self_ + FIELD_GLOBAL_ROW))[0]);
+        LogMsg(msg);
+        if (g_audit_seen == AUDIT_LOG_MAX) {
+            snprintf(msg, sizeof msg,
+                     "per-chunk header dump cap reached (%u chunks): no more of these"
+                     " lines will be written, so a chunk that dies after this point"
+                     " is not named by one -- raise AUDIT_LOG_MAX to see further",
+                     (unsigned)AUDIT_LOG_MAX);
+            LogMsg(msg);
+        }
     }
 
     /* modes n and h (and a, which never hooks) arrive with no payload state
@@ -507,17 +578,30 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
  * game had; fixup_chunk is passed (this, record) on the stack, and MSVC gives a
  * static C function like this a PLAIN ret -- opcode c3, no imm16 -- so the
  * caller, not the callee, has to drop the two argument dwords. This is not a
- * mistake a compiler would catch: cleanup off by eight means popad runs at esp-44
- * instead of esp-36, every register comes back from the wrong slot (ecx holds
- * the client's old ebx), and Load's own next act is mov [esi+0x168], eax at
- * 0x6AF5FF with esi = ecx = this -- an ACCESS_VIOLATION on the first chunk
- * loaded, which is exactly what an in-game crash at 0x6AF5FF means. verify_dll.py
- * reads the epilogue out of the linked image and checks this add against it:
- *   -4 -32 -8 (pushfd pushad sub) = esp-44: [esp+48] = entry esp+4 = record
- *   -4 -4 (push eax push ecx), then call: plain ret leaves the args behind, so
- *     the callee returns at esp-52
- *   +16 (add esp,16 = the 8 arg bytes + the 8 scratch bytes), +32 (popad, which
- *     starts at esp-36 where pushad put its first slot), +4 (popfd) = entry esp
+ * mistake a compiler would catch: cleanup off by eight means popad runs 4 bytes
+ * off the window pushad left, so every general register comes back from the
+ * wrong slot -- ebp included, which is what the replay depends on -- and Load
+ * then works from a garbage record. That bug is visible twice in the crash
+ * reports: the sv3 build had `add esp,8` here and faulted at Load's own next
+ * act, mov [esi+0x168], eax at 0x6AF5FF, because esi = ecx came back as the
+ * client's old ebx. sv4 corrected the add to 0x10 -- verify_dll.py now checks
+ * it against the linked image -- and the crash that stays, at 0x6B0FB7 reading
+ * 0x6CF97F32, is what the mode ladder is settling: with mode a (the whole
+ * payload resident, no hook) entering the world clean and mode h (hook, one
+ * empty call per chunk, nothing allocated, no header touched) crashing there,
+ * the fault is in the detour or in what the call does inside Load, not in the
+ * footprint and not in the shadow write. The arithmetic the add must satisfy
+ * (E = entry esp, the value at the E9's landing):
+ *   -4 -32 -8 (pushfd pushad sub) = E-44: [esp+48] = E+4 = record, and the two
+ *     argument dwords sit at [esp+0] and [esp+4] inside the 8 scratch bytes
+ *   -4 -4 -4 (push eax, push ecx, the call's own return address), so esp is
+ *     E-56 when the callee starts; a plain ret pops that return address back
+ *     off, so the callee comes back at E-52 with the args still behind it
+ *   +16 = E-36: this add drops the 8 arg bytes plus the 8 scratch bytes (the
+ *     call's return address is already gone), landing popad on exactly the
+ *     window pushad left -- EDI at [E-36], EBP at [E-28], ESP restored from
+ *     pushad's own saved value E-4, so after popad popfd closes the last dword
+ *     and the entry frame is whole before the replayed prologue pushes ebp
  * The 6 replayed bytes then set up ebp and eax = record exactly as the game
  * expects (ecx is back from pushad), and the jmp resumes Load's own body.
  *
@@ -678,7 +762,8 @@ static int Install(void)
     g_mode = ReadModeFile();
     snprintf(msg, sizeof msg,
              STAMP " mode '%c' read from '%s\\shadow-mod.mode' (no such file means f): n = inert, a = .dat plus"
-             " arena, no hook, h = hook plus audit, no payload, f = full",
+             " arena, no hook, b = hook plus an empty call, h = hook plus audit,"
+             " no payload, f = full",
              g_mode, g_dir);
     LogMsg(msg);
 
@@ -706,21 +791,44 @@ static int Install(void)
         return 0;
     }
 
+    if (g_mode == 'b') {
+        /* the stub rung: the detour and a call per chunk that does NOTHING --
+         * g_silent returns before the audit, before the per-chunk dump, before
+         * looking at the header, so no file is opened and no client byte is
+         * read or written. If a mode-b run still crashes at 0x6B0FB7 while mode
+         * a entered the world clean, the fault is in the detour itself: the
+         * store, the landing, or the frame the stub keeps. This mode is the
+         * narrowest thing that can answer that, and it loads successfully
+         * (Load returns 0), so VanillaFixes says nothing */
+        if (!PatchHook())
+            return 0;
+        g_silent = 1;
+        g_ready = 1;
+        snprintf(msg, sizeof msg,
+                 STAMP " mode b installed: hook 0x6AF5F0 patched, resume 0x6AF5F6,"
+                 " detour at %#x, fixup returns immediately -- no .dat read, nothing"
+                 " allocated, no chunk header read or touched (shadows stay stock;"
+                 " this mode exists to test the stub alone)",
+                 (unsigned)(size_t)g_stub);
+        LogMsg(msg);
+        return 1;
+    }
+
     if (g_mode == 'h') {
-        /* the stub rung: the detour and one empty call per chunk, with no .dat
-         * opened and nothing allocated at all. g_allow_write stays 0, so the
-         * only thing the call does is audit the first chunk's header, which is
-         * what mode f audits too. If this crashes where mode n did not, the
-         * fault is in the stub's own frame math or in the detour landing, not
-         * in the memory footprint and not in the shadow write. */
+        /* the stub plus the call's work: the detour, the first-chunk audit and
+         * one compact header dump per chunk, with no .dat opened, nothing
+         * allocated and no chunk header touched. If this crashes where mode b
+         * did not, the fault is in what the call DOES inside Load -- the audit
+         * and its file I/O on the client's own loading path -- and not in the
+         * detour's frame, the memory footprint or the shadow write. */
         if (!PatchHook())
             return 0;
         g_ready = 1;
         snprintf(msg, sizeof msg,
                  STAMP " mode h installed: hook 0x6AF5F0 patched, resume 0x6AF5F6,"
-                 " detour at %#x, fixup audits the first chunk only -- no"
-                 " .dat read, nothing allocated, no chunk header touched (shadows"
-                 " stay stock; this mode exists to test the stub)",
+                 " detour at %#x, fixup audits the first chunk whole and dumps"
+                 " every chunk's ofss -- no .dat read, nothing allocated, no"
+                 " chunk header touched (shadows stay stock)",
                  (unsigned)(size_t)g_stub);
         LogMsg(msg);
         return 1;
@@ -891,7 +999,7 @@ static int Install(void)
     if (g_mode == 'a') {
         snprintf(msg, sizeof msg,
                  STAMP " mode a installed footprint only: map '%s' variant '%s',"
-                 " entries %u, payloads %u, arena %u KB resident at %#x..%#x."
+                 " entries %u, payloads %u, arena %u MB resident at %#x..%#x."
                  " NO hook, no fixup call, no chunk header touched, so the"
                  " client runs its own code path whole: if it crashes entering"
                  " the world here while mode n was clean, the reservation is"
@@ -916,7 +1024,7 @@ static int Install(void)
     g_ready = 1;
     snprintf(msg, sizeof msg,
              STAMP " mode f installed: map '%s' variant '%s', entries %u,"
-                    " payloads %u, arena %u KB at %#x..%#x, hook 0x6AF5F0"
+                    " payloads %u, arena %u MB at %#x..%#x, hook 0x6AF5F0"
                     " patched, resume 0x6AF5F6, detour at %#x; matched chunks"
                     " get flags |= 1, hdr+0x2c = arena buffer - hdr and"
                     " hdr+0x30 = 512, so the client's own gate, CreateShadowTexture"

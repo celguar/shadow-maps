@@ -222,11 +222,14 @@ def main(argv):
                   " has none): the epilogue form is unchecked here, the two"
                   " build outputs are the ones that decide")
         else:
-            want = 8 if cleaned else 16
-            print("   fixup_chunk epilogue: %s, so the caller must drop %d bytes"
-                  " (args %d + scratch 8)"
-                  % ("ret (caller cleans)" if not cleaned else "ret %#x" % cleaned,
-                     want, want - 8))
+            want = (16 - cleaned) if cleaned else 16
+            if cleaned:
+                print("   fixup_chunk epilogue: ret %#x (the callee already drops"
+                      " %d bytes), so the caller must drop %d" % (cleaned, cleaned, want))
+            else:
+                print("   fixup_chunk epilogue: plain ret, the caller cleans, so the"
+                      " stub's add esp must be 0x10 = the 8 arg bytes + 8 scratch"
+                      " bytes (the call's own return address is already popped)")
             if got != want:
                 bad += 1
                 print("     the stub adds esp,%s: off by %d, popad restores"
