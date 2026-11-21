@@ -1,0 +1,22 @@
+# Build products: a DLL is verified per build (verify_dll.py reads the stub out
+# of the linked image), and a stale one is exactly what the build stamp in the
+# log line exists to catch.
+build/
+out/
+*.obj
+*.lib
+*.exp
+*.map
+*.pdb
+
+# Shadow payloads and shadow-variant archives are shipped by themselves, 33 MB+
+# each: the .dat in a game folder is named shadowmaps.dat whatever the variant
+# inside it is, so a tracked copy would be a different set by definition.
+*.dat
+*.mpq
+
+# the mod's own run log, in the game folder
+*.log.txt
+
+# python's own scratch
+__pycache__/
