@@ -973,6 +973,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         g_self = hModule;
+        /* LogMsg's zero: GetTickCount here is the moment this DLL was loaded,
+         * and every line is stamped relative to it. GetTickCount itself counts
+         * milliseconds since the SYSTEM booted, so its raw value is the same
+         * clock for every client start on one boot and cannot separate runs --
+         * which is how an earlier read of this file attributed eleven lines to
+         * one start. ms-since-load restarts at 0 in each process. */
+        g_t0 = GetTickCount();
         /* Our own directory, from our own handle: GetModuleFileNameA on the
          * HMODULE DllMain was handed gives the full path of this DLL, and
          * cutting at the last backslash leaves the directory it sits in. No
