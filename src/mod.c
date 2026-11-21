@@ -28,6 +28,13 @@
  * client's own s_mapName (0xC961A0) at every chunk, so a payload for the
  * wrong map is ignored rather than half-applied.
  *
+ * This build is the diagnostic step sv6, not the shipping shape: it audits
+ * the first chunk's MCNK header and the first matched chunk's whole sub-
+ * record table into the log, and it points every matched chunk at ONE
+ * 4 KB page instead of the 34 MB arena, so the hook and the shadow write
+ * can be tested without the reservation the crash reports point at.
+ * README.md's "current diagnostic" section says what the run has to prove.
+ *
  * Lifecycle follows ClassicAPI's src/DllMain.cpp. DllMain installs nothing:
  * under VanillaFixes the install runs from the exported `Load` (VF calls
  * GetProcAddress(module,"Load") on the game's main thread after every dlls.txt
@@ -63,9 +70,11 @@
 #include <string.h>
 #include "../shadow_dat.h"
 
-#define STAMP "sv5" /* build stamp, printed in every log line: an old build of
+#define STAMP "sv6" /* build stamp, printed in every log line: an old build of
                     * this DLL sitting next to a new .dat is the most common
-                    * confusion, so the line says which build made it */
+                    * confusion, so the line says which build made it. sv6 is
+                    * the header-audit, one-page diagnostic described in README
+                    * .md's "current diagnostic" section */
 
 /* ---------------------------------------------------------------- pinned **/
 
@@ -114,6 +123,26 @@ static const unsigned k_probe_ofs[] = {0x14u, 0x18u, 0x1cu,
                                        0x20u, 0x24u, 0x58u, 0x60u};
 #define PROBE_COUNT 7u
 
+/* The same table whole, each slot with the fourcc whose sub-record sits at
+ * `hdr + <value in that slot>` -- that is the resolver's own math (`mov
+ * esi,[edx+ofs] / lea esi,[esi+eax+8]`, i.e. hdr + ofs) and the same thing
+ * extract_shadowmaps.py checks inside a real .adt before it writes one entry:
+ * it wants b"MCSH" at hdr + ofsMCSH - 8, so in a stock file the value
+ * addresses the 512-byte BODY, magic+size in front of it, and the header's own
+ * sizeMCSH carries 520. AuditHeader below prints the value, the address it
+ * resolves to and the fourcc found there for all eight slots, which is what
+ * separates a wrong hdr basis from a wrong FIELD_MCSH_OFS and both of those
+ * from a mapping that simply is not there. */
+static const unsigned k_table_ofs[] = {0x14u, 0x18u, 0x1cu, 0x20u, 0x24u,
+                                       0x2cu, 0x58u, 0x60u};
+static const char *k_table_cc[] = {"MCVT", "MCNR", "MCLY", "MCRF", "MCAL",
+                                   "MCSH", "MCSE", "MCLQ"};
+#define TABLE_COUNT 8u
+/* one MCNK record is at most a few tens of KB, so a slot value under this is
+ * inside the record the header belongs to and reading its fourcc cannot fault;
+ * a bigger value is printed, never dereferenced */
+#define AUDIT_OFS_MAX 0x40000u
+
 /* ------------------------------------------------------- runtime state ***/
 
 static HMODULE g_self;
@@ -146,6 +175,7 @@ static int g_log_nomatch;
 static int g_log_first;
 static int g_log_hits;                /* how many progress lines were logged */
 static int g_log_field;               /* a probe dword moved: logged once   */
+static int g_log_audit;               /* the first chunk entering Load audited */
 
 static DWORD WINAPI InitWorker(LPVOID p);
 static int Install(void);
@@ -180,6 +210,62 @@ static int CiEqName(const char *dat, const char *client)
     return 1;
 }
 
+/* a sub-record's fourcc as printable text: a junk magic has to stay readable in
+ * the audit line, so a non-printable byte becomes '.' */
+static void FourccAt(const unsigned char *p, char *out)
+{
+    int i;
+    for (i = 0; i < 4; ++i) {
+        unsigned char c = p[i];
+        out[i] = (c >= 0x20u && c < 0x7fu) ? (char)c : '.';
+    }
+    out[4] = 0;
+}
+
+/* one chunk's header, printed the way this client has it. Two questions have
+ * to be answered from real memory rather than from the file, and this answers
+ * both: is the record Load was handed really an MCNK record (so hdr = record +
+ * 8 is the basis the shadow write's offsets are measured from), and what does
+ * each of the resolver's eight slots resolve to -- the address printed for MCVT
+ * is exactly the cursor whose `mov ecx,[ebx]` at 0x6B0FB7 faulted in the crash
+ * reports, so the line says whether the value in hdr+0x14 is the .adt's own
+ * (a fourcc of 'MCVT' sits at it, and the fault is a mapping the client did
+ * not get) or something this DLL moved. A slot of 0 means the .adt carries no
+ * such sub-record; a value too big to be inside one record is printed but
+ * never dereferenced. */
+static void AuditHeader(const void *record_, const char *who)
+{
+    const unsigned char *hdr;
+    const unsigned char *rec;
+    unsigned v;
+    char cc[5];
+    char line[224];
+    unsigned i;
+
+    rec = (const unsigned char *)record_;
+    hdr = rec + 8;
+    FourccAt(rec, cc);
+    snprintf(line, sizeof line,
+             "audit %s: record %#x fourcc '%s' size %#x, hdr %#x flags %#x"
+             " indexX %#x indexY %#x",
+             who, (unsigned)(size_t)rec, cc, ((const unsigned *)rec)[1],
+             (unsigned)(size_t)hdr, ((const unsigned *)hdr)[0],
+             ((const unsigned *)hdr)[1], ((const unsigned *)hdr)[2]);
+    LogMsg(line);
+
+    for (i = 0; i < TABLE_COUNT; ++i) {
+        v = ((const unsigned *)(hdr + k_table_ofs[i]))[0];
+        cc[0] = 0;
+        if (v != 0 && v < AUDIT_OFS_MAX)
+            FourccAt(hdr + v, cc);
+        snprintf(line, sizeof line,
+                 "audit %s: %s at hdr+%#x is %#x -> hdr+%#x, fourcc there '%s'",
+                 who, k_table_cc[i], k_table_ofs[i], v,
+                 (unsigned)(size_t)(hdr + v), cc);
+        LogMsg(line);
+    }
+}
+
 /* ---------------------------------------------------- the per-chunk fix **/
 
 /* Called by the asm entry with thiscall layout: this in ecx, record on the
@@ -197,6 +283,15 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
 
     if (!g_ready || !self_ || !record_)
         return;
+
+    /* the very first chunk to reach Load is audited whole, before the map
+     * check and before anything could be written: the crash reports say the
+     * MCVT cursor was unreadable on a chunk this DLL never matched, so the
+     * first thing to settle is what its header actually holds in this client */
+    if (!g_log_audit) {
+        g_log_audit = 1;
+        AuditHeader(record_, "first chunk");
+    }
 
     client_map = (const unsigned char *)ADDR_MAP_NAME;
     if (!CiEqName((const char *)g_dat_map, (const char *)client_map)) {
@@ -245,6 +340,8 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
      * record's start, the header fields start after it (0x6AF970: lea
      * edx,[eax+8]). ofsMCSH is relative to hdr, and the game resolves every
      * sub-record as hdr + ofs, so hdr + ofs lands in the arena. */
+    if (!g_log_first)
+        AuditHeader(record_, "first matched");
     hdr = (unsigned char *)record_ + 8;
     for (i = 0; i < PROBE_COUNT; ++i)
         before[i] = ((const unsigned *)(hdr + k_probe_ofs[i]))[0];
@@ -593,24 +690,35 @@ static int Install(void)
     }
     free(ent);
 
-    /* one resident arena for every payload, allocated once at load: chunks
-     * point INTO it, there is no copy and no eviction. The allocation type is
-     * the headers' MEMRESIDENT_(0x1000) | MEMCOMMIT_(0x2000). The protection is
-     * NOT a bit-or: <winnt.h> gives a LEVEL family -- 0x1 readable, 0x2 write-
-     * combine (written but never read back), 0x4 readable/writable/executable,
-     * 0x40 = PAGE_EXECUTE_READWRITE, the same level over every mapping of the
-     * page -- and every OR of two of them (0x3, 0x7, 0xF) is refused outright
-     * with GetLastError 0x57 "the parameter specified is invalid". 0x4 is the
-     * lowest level that is both readable and writable, which is all an arena of
-     * data needs; the detour page below asks 0x40, the value MinHook passes and
-     * the value this client's own hooks are patched with. Both were spelled as
-     * hex so the line survives any header. */
-    arena = (unsigned char *)VirtualAlloc(NULL, (SIZE_T)head.payloadBytes,
-                                          0x00003000u, 0x00000004u);
+    /* sv6, the diagnostic step. sv4's runs died at 0x6B0FB7 -- `mov ecx,[ebx]`
+     * with ebx = this+0xf14, the MCVT cursor the resolver made from hdr+0x14 --
+     * on a chunk that has NO payload in the set, i.e. one this DLL never wrote
+     * to, and every value in that header came straight from the .adt file the
+     * client was reading. The one thing in this DLL that can make the client's
+     * own mapping of an ADT fail is the 34 MB resident arena: this client is
+     * 32-bit and Azeroth alone already asks it for hundreds of MB, so a 34 MB
+     * reservation is exactly the kind of thing that pushes a later allocation
+     * over the limit, and an allocation that failed while the header offsets
+     * still look right is exactly an unreadable MCVT cursor. So this build asks
+     * the same hook, the same shadow write and a real payload at a 4 KB
+     * footprint instead: one page, only the first payload of the .dat read into
+     * it, and every matched chunk pointed at that one payload. The shadows
+     * drawn are wrong from the second matched chunk on -- this build's job is
+     * to answer whether the memory path is safe, not to look right -- and the
+     * audit lines say what the header of a chunk really holds. The page is
+     * still allocated the way the real arena was: MEMRESIDENT_(0x1000) |
+     * MEMCOMMIT_(0x2000), and the protection is a LEVEL from <winnt.h>'s
+     * family, not a bit-or -- 0x1 readable, 0x2 write-combine (written but
+     * never read back, a read of it faults 0xc0000005), 0x4 readable and
+     * writable, 0x40 PAGE_EXECUTE_READWRITE over every mapping, and every OR
+     * of two of them (0x3, 0x7, 0xF) is refused outright with GetLastError
+     * 0x57; an arena of data wants 0x4, the detour page below wants 0x40. */
+    arena = (unsigned char *)VirtualAlloc(NULL, 0x1000u, 0x00003000u,
+                                          0x00000004u);
     if (!arena) {
-        snprintf(msg, sizeof msg, STAMP " VirtualAlloc for the shadow arena failed"
-                 " (asked %u bytes, alloc 0x3000, protect 0x4), GetLastError"
-                 " %#x: refusing to patch", head.payloadBytes, GetLastError());
+        snprintf(msg, sizeof msg, STAMP " VirtualAlloc for the one diagnostic"
+                 " page failed (asked 4096 bytes, alloc 0x3000, protect 0x4),"
+                 " GetLastError %#x: refusing to patch", GetLastError());
         LogMsg(msg);
         fclose(f);
         return 0;
@@ -619,12 +727,19 @@ static int Install(void)
      * the table at 20 million entries x 8 bytes, so this file is well under the
      * 2 GiB ftell limit on either target */
     fseek(f, (long)(SHADOW_DAT_HEADER_BYTES + table_bytes), SEEK_SET);
-    if (ReadBlock(f, arena, (size_t)head.payloadBytes) != (size_t)head.payloadBytes) {
-        LogMsg(STAMP " payload area read failed: refusing to patch");
+    if (ReadBlock(f, arena, SHADOW_DAT_PAYLOAD_BYTES)
+        != SHADOW_DAT_PAYLOAD_BYTES) {
+        LogMsg(STAMP " reading the first payload out of the .dat failed:"
+                   " refusing to patch");
         fclose(f);
         return 0;
     }
     fclose(f);
+    /* every entry now addresses the one payload that was read: the lookup still
+     * proves a chunk is in the set, and the write still hands the client live
+     * arena bytes, which is the whole point of this step */
+    for (i = 0; i < head.entryCount; ++i)
+        g_offs[i] = 0u;
     g_arena = arena;
 
     /* the detour: its own page first, then the E9 that reaches it */
@@ -666,9 +781,12 @@ static int Install(void)
     memcpy(g_dat_map, head.map, 24);
     g_ready = 1;
     snprintf(msg, sizeof msg,
-             STAMP " installed: map '%s' variant '%s', entries %u, payloads %u"
-                   " (%u MB arena at %#x), hook 0x6AF5F0 patched, resume"
-                   " 0x6AF5F6, detour at %#x",
+             STAMP " diagnostic installed: map '%s' variant '%s', entries %u"
+                   " payloads %u, ONE 4 KB page at %#x holds the .dat's first"
+                   " payload, every matched chunk points at it, the %u MB"
+                   " payload area is NOT read: if the client enters the world"
+                   " the 34 MB arena was what broke it. hook 0x6AF5F0 patched,"
+                   " resume 0x6AF5F6, detour at %#x",
              (const char *)head.map, (const char *)head.variant, head.entryCount,
              head.payloadUnique, head.payloadBytes / (1024u * 1024u),
              (unsigned)(size_t)arena, (unsigned)(size_t)g_stub);

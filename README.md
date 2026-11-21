@@ -102,6 +102,21 @@ ofs slot that moved, its value before and after, the arena and the displacement
 that was written — enough to recompute the field — and mutation stops for the
 rest of the run, so the session finishes instead of crashing.
 
+`extract_shadowmaps.py` already proves the same basis from the file side: before
+it writes one `.dat` entry it insists on `b"MCSH"` at `hdr + ofsMCSH - 8`, so in
+a stock `.adt` the header's value addresses the 512-byte body with magic+size in
+front of it, `sizeMCSH` is 520 there, and `hdr + ofs` is the same address the
+client computes. What is therefore *not* settled by reading the file is what the
+client has in memory, and `AuditHeader` prints exactly that: for the first chunk
+to enter `Load`, and for the first chunk with a payload, it logs the record's own
+magic and size, `hdr`, `hdr`'s flags and `indexX`/`indexY`, and for each of the
+eight slots the value, the address `hdr + value` resolves to and the fourcc found
+there. The MCVT line names the address whose read faulted at `0x6B0FB7`, so the
+line says whether the value in `hdr+0x14` is the `.adt`'s own — a mapping the
+client did not get — or something this DLL moved. A slot of 0 means the `.adt`
+carries no such sub-record, and a value too big to be inside one record is
+printed, never dereferenced.
+
 ## Building
 
 Requires CMake (3.10+) and an MSVC toolchain that can target 32-bit Windows.
@@ -210,11 +225,13 @@ any non-zero `Load` with its own generic `was not loaded properly (load
 function failed)` popup — that popup is never the reason, this file is:
 
 ```
-sv5 no shadowmaps.dat where the DLL is: the client keeps stock shadows; looked in 'G:\Games\twmoa_1181\shadowmaps.dat' (rename the variant .dat to that name, it belongs beside the DLL, not beside the game)
-sv5 installed: map 'Azeroth' variant 'shadows-Azeroth-morning', entries 114328, payloads 66413 (32 MB arena at 0x........), hook 0x6AF5F0 patched, resume 0x6AF5F6, detour at 0x........
+sv6 no shadowmaps.dat where the DLL is: the client keeps stock shadows; looked in 'G:\Games\twmoa_1181\shadowmaps.dat' (rename the variant .dat to that name, it belongs beside the DLL, not beside the game)
+sv6 diagnostic installed: map 'Azeroth' variant 'shadows-Azeroth-morning', entries 114328 payloads 66413, ONE 4 KB page at 0x........ holds the .dat's first payload, every matched chunk points at it, the 32 MB payload area is NOT read: if the client enters the world the 34 MB arena was what broke it. hook 0x6AF5F0 patched, resume 0x6AF5F6, detour at 0x........
+audit first chunk: record 0x........ fourcc 'MCNK' size 0x........, hdr 0x........ flags 0x........ indexX 0x.. indexY 0x..
+audit first chunk: MCVT at hdr+0x14 is 0x........ -> hdr+0x........, fourcc there 'MCVT'
+audit first chunk: MCSH at hdr+0x2c is 0x........ -> hdr+0x........, fourcc there 'MCSH'
 fixup: first chunk with no payload: gy 519 gx 439 key 531895 (the bake left it without a shadow map, or its tile is not in this set)
-fixup: first chunk matched: gy 352 gx 352 key 360800, shadow drawn from arena+0, this 0x........ record 0x........ hdr 0x........ arena 0x........, hdr flags 0x........ size 0x200 ofs 0x........, mcvtof 0x........ mcnrof 0x........ mclyof 0x........ mcrof 0x........ mcalof 0x........ mcseof 0x........ mclof 0x........
-fixup: the shadow write moved a sub-record ofs: hdr 0x........ ofs at hdr+0x14 was 0x........ and is 0x........ now, ofs written 0x........ (= arena 0x........ - hdr), FIELD_MCSH_OFS 0x2c is wrong for this client; the ofss are restored and no more chunks are patched so the run finishes
+fixup: first chunk matched: gy 352 gx 352 key 360800, shadow drawn from arena+0, this 0x........ record 0x........ hdr 0x........ arena 0x........, hdr flags 0x........ size 0x200 ofs 0x........, mcvtof 0x........ ... mclof 0x........
 fixup: 10000 chunks matched so far, of 114328 entries
 ```
 
@@ -226,7 +243,39 @@ tiles, so a chunk outside it (`gy 519 gx 439` is tile `27,32`) legitimately logs
 "no payload", and only the `first chunk matched` line proves a payload was drawn.
 That line also dumps the header the write went into — `this`, `record`, `hdr`,
 the arena and all eight sub-record ofss — so the addresses a crash report names
-can be matched against it.
+can be matched against it. The `audit` lines are the same facts for a chunk that
+was never written to, which is what the current build is about.
+
+## Current diagnostic: sv6
+
+The last two runs that installed (sv4) both died at `0x6B0FB7` — the `mov
+ecx,[ebx]` reading the MCVT cursor — on a chunk whose log line says **no
+payload**, i.e. a chunk this DLL never wrote to, whose every header value came
+straight out of the `.adt` the client was reading. And the file side of the same
+question is already settled: `extract_shadowmaps.py` refuses to write a `.dat`
+entry unless `b"MCSH"` sits at `hdr + ofsMCSH - 8`, so the header's value
+addresses the 512-byte body with magic+size in front of it, and `hdr + ofs` is
+the address the client computes. What is left is the one thing this DLL takes
+from a 32-bit client that already maps hundreds of MB for Azeroth: the 34 MB
+resident arena asked for before any chunk loads. A reservation that pushes a
+later client allocation over the limit leaves the offsets intact and the mapping
+behind them missing — exactly an unreadable MCVT cursor.
+
+sv6 isolates that question:
+
+- the hook, the `.dat` validation, the entry table and the audit lines are
+  exactly the shipping build's;
+- ONE 4 KB page holds the `.dat`'s first payload and every matched chunk points
+  at it, so the write path runs at a 4 KB footprint instead of a 34 MB one;
+- the shadows drawn are wrong from the second matched chunk on, on purpose: this
+  build answers "is the path safe", not "does it look right".
+
+| What the run shows | What it means |
+| --- | --- |
+| enters the world, `first chunk matched` logged, some shadow drawn | the hook and the shadow write are right; the 34 MB reservation is what broke sv4, and the shipping build keeps the payload bounded (expand on demand into a small arena) rather than resident |
+| dies at `0x6B0FB7` again | the `audit` lines decide: the MCVT line names the address the fault read. `'MCVT'` there means the `.adt`'s own offset is being read and the mapping is the client's to get; a junk fourcc means `hdr` is not the header the resolver has, so the basis — not `FIELD_MCSH_OFS` — is wrong |
+| dies reading inside the page the install line prints | the page's protection level is the problem, not its size: 0x4 is asked as a `<winnt.h>` level, and a mapping that cannot be read back faults 0xc0000005 exactly like this |
+| no `audit` line at all | `Load` was never called, so the loader, not the hook, is what stopped the mod |
 
 ## Honest limits
 
@@ -234,12 +283,16 @@ can be matched against it.
   from the client's own bytes, not from a screenshot. The `MCNK` header writes
   follow the client's decode chain, but the first real confirmation is someone
   loading it and seeing the shadows.
-- The last runs left the client crashing inside `BuildVertices` — `ACCESS_VIOLATION
-  at 0x6B0FB7`, the `mov ecx,[ebx]` that reads the MCVT floats, `ebx =
-  this+0xf14`, and in both reports the same `0x6CF97F32` while `this` moved. That
-  is a header write landing somewhere other than `hdr+0x2c`, and the probe above
-  is what turns it into a log line naming the field rather than a crash; the next
-  build fixes `FIELD_MCSH_OFS` from that line.
+- The last two installs (sv4) left the client crashing inside `BuildVertices` —
+  `ACCESS_VIOLATION at 0x6B0FB7`, the `mov ecx,[ebx]` that reads the MCVT floats,
+  `ebx = this+0xf14`, and in both reports the same `0x6CF97F32` while `this`
+  moved. Neither run had a `first chunk matched` line, so the chunk that died is
+  one this DLL never wrote to: the header write is no longer the leading suspect,
+  the 34 MB reservation this DLL asks before any chunk loads is. sv6 tests that
+  at a 4 KB footprint; the `audit` lines say whether `hdr` is the header the
+  resolver has and whether the value in `hdr+0x14` is the `.adt`'s own. Until one
+  of those outcomes is real, the shadow payload has still never been seen by the
+  client.
 - A shadow set only says "this chunk's shadow map is these 512 bytes". The
   client's own shadow path still decides the rest: the `MCNK` flag bit and the
   world-wide shadow flag gate it, and `shadowLevel` still picks the 64×64 vs
@@ -256,7 +309,9 @@ can be matched against it.
   match, which is the whole mitigation.
 - The arena is allocated once at `.dat` load and every payload lives in it: no
   copy, no eviction, no per-chunk allocation. A full Azeroth variant is ~33 MB
-  resident; the loader refuses payload areas over 1 GiB.
+  resident; the loader refuses payload areas over 1 GiB. The sv6 diagnostic
+  described above is the exception: it allocates one page and reads one payload,
+  because the reservation itself is the thing it is testing.
 - `tools-check/` headers are stubs: `--check` against them catches C mistakes,
   and `build.py` only consults them when no real SDK exists, because a real
   header sees prototype shapes a stub cannot (UCRT's `fread` carries an
