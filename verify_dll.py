@@ -8,17 +8,22 @@ resolves the entry point with GetProcAddress(module, "Load")), it imports only
 the operating system's own DLLs (built with /MT: a /MD build would demand
 vcruntime140.dll next to the client, which the client's folder has no reason to
 carry), it is an i686 PE (build 5875 is a 32-bit image, an x64 DLL simply
-cannot load into it), and its detour is a 36-byte hand-written stub that has to
-survive the compiler intact. A linker that mangled the export or a build that
-dropped the stub would otherwise ship silently, so this reads the built image
-the way the client's loader would.
+cannot load into it), and its detours are three hand-written byte tables that
+have to survive the compiler intact -- sv9's ladder needs all three, so a build
+that lost one is a build whose ladder cannot run and that ships silently. This
+reads the built image the way the client's loader would.
 
-The stub is NOT inline asm any more, so it is not in .text: stub_code is a
-const array, which MSVC puts in .rdata, and BuildStub copies it into a private
-executable page at install. So the search here covers every section's raw
-bytes, not one named section, and what is matched is the byte table exactly as
-mod.c writes it -- with the two imm32 slots still zero, since install patches
-them with addresses only this process can know:
+The stubs are NOT inline asm any more, so they are not in .text: the detour
+shapes are const arrays, which MSVC puts in .rdata, and BuildStub copies one of
+them into a private executable page at install, choosing which by the mode
+letter. sv9 has three shapes, and this script parses all three out of mod.c and
+requires each to be present exactly once in the image:
+
+    stub_code   mode b/h/f, 36 bytes, slots fixup=12 resume=30
+    stub_code_c mode c,     12 bytes, resume slot 7, calls nothing
+    stub_code_d mode d,     29 bytes, slots fixup=7 resume=24
+
+stub_code, the one that calls the fixup through the client's own arguments:
 
     9c                 pushfd                     fixup and resume slots are
     60                 pushad                        patched at install, so in
@@ -39,20 +44,48 @@ them with addresses only this process can know:
 (`add esp, -8` rather than `sub esp, 8`: x86-32 has no sub-with-imm8 form, and
 mod.c says so; the disassembly below prints it as the unsigned 0xf8.)
 
-The needle is PARSED out of mod.c rather than hardcoded, so the fingerprint
-cannot drift from the source: if someone edits stub_code, this script follows.
-It also cross-checks mod.c's own STUB_BYTES and slot defines against the
-array, which is the same equality BuildStub asserts at runtime.
+stub_code_c, mode c, the detour with no call at all:
 
-One check cannot come from the source at all: the stub's `add esp, 16` after the
+    55 8b ec           push ebp / mov ebp, esp     the 6 replayed prologue
+    8b 45 08           mov  eax, [ebp+8] = record  bytes of 0x6AF5F0
+    68 <imm32>         push <resume>              slot STUB_C_SLOT_RESUME = 7
+    c3                 ret                        -> 0x6AF5F6
+
+stub_code_d, mode d, the store at 0x6AF5F3 and the arguments off the client's
+own frame pointer, so no esp displacement is involved in finding them:
+
+    60                 pushad
+    9c                 pushfd
+    ff 75 08           push dword [ebp+8] = record
+    51                 push ecx  (this)
+    b8 <imm32>         mov  eax, <fixup_chunk>     slot STUB_D_SLOT_FIXUP  = 7
+    ff d0              call eax
+    83 c4 08           add  esp, 8   (the 2 arg dwords: no scratch reserved)
+    9d                 popfd
+    61                 popad
+    8b 45 08 53 56     mov eax,[ebp+8] / push ebx / push esi  the 5 covered bytes
+    68 <imm32>         push <resume>              slot STUB_D_SLOT_RESUME = 24
+    c3                 ret                        -> 0x6AF5F8
+
+The needle is PARSED out of mod.c rather than hardcoded for all three tables, so
+the fingerprint cannot drift from the source: if someone edits a table, this
+script follows. It also cross-checks every table's own _BYTES and slot defines
+against the array, which is the same equality BuildStub asserts at runtime.
+
+One check cannot come from the source at all: the stubs' `add esp,N` after the
 call. MSVC gives a static C function a PLAIN ret (opcode c3) and makes the caller
 drop the arguments, but the optimiser is free to choose `ret imm16` instead, and
 either way the stub must undo exactly what THIS build chose -- an eight-byte
 mistake is silent at compile time and an ACCESS_VIOLATION inside the client at
 runtime, because popad then restores every register from the wrong slot. So the
 sibling map file locates fixup_chunk in the image, its epilogue is disassembled,
-and the stub's add is required to be the matching 8 (callee cleans) or 16
-(caller cleans: 8 argument bytes plus the 8-byte scratch reservation).
+and each calling stub's add is required to be the matching amount for ITS OWN
+argument bytes: b pushes 2 arg dwords and reserves 8 scratch bytes, so its add is
+16 minus what the callee already dropped -- 16 with a plain ret, 8 with a `ret 8`
+-- and d pushes the same 2 arg dwords and reserves nothing, so its add is 8 minus
+the same amount, 8 with a plain ret and 0 with a `ret 8`. The two tables must
+therefore disagree by exactly the 8-byte scratch reservation, and not by more or
+less. mode c calls nothing and has no add, so nothing is checked for it.
 
 Usage
     python verify_dll.py [<ShadowMaps.dll> ...]   (default: out\ShadowMaps.dll)
@@ -76,26 +109,52 @@ OK_IMPORTS = {"ntdll.dll", "kernel32.dll", "kernel32.exe", "user32.dll",
               "advapi32.dll", "shell32.dll", "gdi.dll", "gdiplus.dll",
               "wow.exe"}
 
-# fallback needle, used only if mod.c cannot be read; kept in sync by hand
-FALLBACK_STUB = bytes.fromhex(
-    "9c6083c4f88b4424305051b800000000ffd083c410619d558bec8b4508b800000000ffe0")
-FALLBACK_SLOTS = (12, 30)
+# fallback needles, used only if mod.c cannot be read; kept in sync by hand.
+FALLBACK_STUBS = {
+    "b": ("9c6083c4f88b4424305051b800000000ffd083c410619d558bec"
+          "8b4508b800000000ffe0", 36, 12, 30),
+    "c": ("558bec8b45086800000000c3", 12, 0, 7),
+    "d": ("609cff750851b800000000ffd083c4089d618b45085356"
+          "6800000000c3", 29, 7, 24),
+}
+
+# what each rung is expected to push for the fixup (its add esp,N must be this
+# minus whatever the callee's own `ret imm16` already dropped) and how its last
+# instruction returns to the client: b jumps, c and d use push/ret.
+STUB_SHAPE = {  # rung: (table name, define prefix, arg bytes, tail mnemonic)
+    "b": ("stub_code", "STUB_", 16, "jmp"),
+    "c": ("stub_code_c", "STUB_C_", None, "ret"),
+    "d": ("stub_code_d", "STUB_D_", 8, "ret"),
+}
 
 
-def parse_stub(source_text):
-    """stub_code's bytes and the slot/length defines, straight from mod.c."""
-    body = re.search(r"stub_code\[\]\s*=\s*\{(.*?)\}\s*;", source_text, re.S)
-    if body is None:
-        return None
-    raw = re.sub(r"/\*.*?\*/", "", body.group(1), flags=re.S)
-    data = bytes(int(t, 16) for t in re.findall(r"0[xX][0-9a-fA-F]+", raw))
-
-    defines = {}
-    for name in ("STUB_BYTES", "STUB_SLOT_FIXUP", "STUB_SLOT_RESUME"):
-        hit = re.search(r"#define\s+%s\s+(\d+)u?" % name, source_text)
+def parse_stubs(source_text):
+    """Every detour byte table in mod.c, with its own slot/length defines."""
+    tables = []
+    for rung in ("b", "c", "d"):
+        name, pre, pushed, tail = STUB_SHAPE[rung]
+        body = re.search(r"\b%s\[\]\s*=\s*\{(.*?)\}\s*;" % name, source_text, re.S)
+        if body is None:
+            continue
+        raw = re.sub(r"/\*.*?\*/", "", body.group(1), flags=re.S)
+        data = bytes(int(t, 16) for t in re.findall(r"0[xX][0-9a-fA-F]+", raw))
+        slot_fixup = None if rung == "c" else (12 if rung == "b" else 7)
+        slot_resume = 30 if rung == "b" else 7
+        want = len(data)
+        hit = re.search(r"#define\s+%sBYTES\s+(\d+)u?" % pre, source_text)
         if hit:
-            defines[name] = int(hit.group(1))
-    return data, defines
+            want = int(hit.group(1))
+        if slot_fixup is not None:
+            hit = re.search(r"#define\s+%sSLOT_FIXUP\s+(\d+)u?" % pre, source_text)
+            if hit:
+                slot_fixup = int(hit.group(1))
+        hit = re.search(r"#define\s+%sSLOT_RESUME\s+(\d+)u?" % pre, source_text)
+        if hit:
+            slot_resume = int(hit.group(1))
+        tables.append({"rung": rung, "name": name, "bytes": data, "want": want,
+                       "fixup": slot_fixup, "resume": slot_resume,
+                       "pushed": pushed, "tail": tail})
+    return tables or None
 
 
 def callee_cleanup(path, blob, pe, base, md):
@@ -147,29 +206,60 @@ def main(argv):
 
     try:
         with open(MOD_CPP, "rb") as fh:
-            parsed = parse_stub(fh.read().decode("utf-8", "replace"))
-        if parsed is None:
-            print("mod.c has no stub_code table: falling back to the hardcoded needle")
-            stub, slots = FALLBACK_STUB, FALLBACK_SLOTS
+            tables = parse_stubs(fh.read().decode("utf-8", "replace"))
+        if tables is None:
+            print("mod.c has no stub_code tables: falling back to the hardcoded"
+                  " needles")
+            tables = []
+            for rung in ("b", "c", "d"):
+                hexs, want, fx, rs = FALLBACK_STUBS[rung]
+                name, pre, pushed, tail = STUB_SHAPE[rung]
+                tables.append({"rung": rung, "name": name, "bytes": bytes.fromhex(hexs),
+                               "want": want, "fixup": fx, "resume": rs,
+                               "pushed": pushed, "tail": tail})
         else:
-            stub, defs = parsed
-            slots = (defs.get("STUB_SLOT_FIXUP", 11), defs.get("STUB_SLOT_RESUME", 29))
-            want = defs.get("STUB_BYTES", len(stub))
-            print("stub from mod.c: %d bytes, slots fixup=%d resume=%d"
-                  % (len(stub), slots[0], slots[1]))
-            if want != len(stub):
-                bad += 1
-                print("   STUB_BYTES says %d, the array has %d: BuildStub would "
-                      "refuse to patch at runtime" % (want, len(stub)))
-            for name, where in (("STUB_SLOT_FIXUP", slots[0]), ("STUB_SLOT_RESUME", slots[1])):
-                if stub[where - 1] != 0xB8 or stub[where:where + 4] != b"\x00\x00\x00\x00":
+            have = [t["rung"] for t in tables]
+            for rung in ("b", "c", "d"):
+                if rung not in have:
                     bad += 1
-                    print("   %s=%d does not point at a zeroed mov eax,imm32"
-                          " immediate: install would write the address in the"
-                          " wrong place" % (name, where))
+                    print("   mod.c has no stub_code table for rung %s: sv9's ladder"
+                          " cannot run that rung, so the ladder in README.md would"
+                          " be a lie" % rung)
+        for t in tables:
+            print("stub %s from mod.c: %d bytes (want %d), slots fixup=%s resume=%d,"
+                  " pushes %s arg bytes, tail %s"
+                  % (t["rung"], len(t["bytes"]), t["want"],
+                     ("%d" % t["fixup"]) if t["fixup"] is not None else "none",
+                     t["resume"],
+                     ("%d" % t["pushed"]) if t["pushed"] is not None else "no call",
+                     t["tail"]))
+            if t["want"] != len(t["bytes"]):
+                bad += 1
+                print("   %sBYTES says %d, the array has %d: BuildStub would"
+                      " refuse to patch that rung at runtime"
+                      % (STUB_SHAPE[t["rung"]][1], t["want"], len(t["bytes"])))
+            for label, where in (("SLOT_FIXUP", t["fixup"]), ("SLOT_RESUME", t["resume"])):
+                if where is None:
+                    continue
+                want_pre = 0xB8 if t["bytes"][where - 1] == 0xB8 else 0x68
+                if t["bytes"][where - 1] not in (0xB8, 0x68) or t["bytes"][where:where + 4] != b"\x00\x00\x00\x00":
+                    bad += 1
+                    print("   %s%s=%d does not point at a zeroed imm32 operand:"
+                          " install would write the address into the middle of an"
+                          " instruction" % (STUB_SHAPE[t["rung"]][1], label, where))
+                elif where + 4 > len(t["bytes"]):
+                    bad += 1
+                    print("   %s%s=%d is past the end of the table"
+                          % (STUB_SHAPE[t["rung"]][1], label, where))
     except OSError as exc:
-        print("cannot read mod.c (%s): falling back to the hardcoded needle" % exc)
-        stub, slots = FALLBACK_STUB, FALLBACK_SLOTS
+        print("cannot read mod.c (%s): falling back to the hardcoded needles" % exc)
+        tables = []
+        for rung in ("b", "c", "d"):
+            hexs, want, fx, rs = FALLBACK_STUBS[rung]
+            name, pre, pushed, tail = STUB_SHAPE[rung]
+            tables.append({"rung": rung, "name": name, "bytes": bytes.fromhex(hexs),
+                           "want": want, "fixup": fx, "resume": rs,
+                           "pushed": pushed, "tail": tail})
 
     for path in dlls:
         if not os.path.isfile(path):
@@ -214,70 +304,81 @@ def main(argv):
 
         # ---- the detour's esp math: what the callee actually did -------------
         cleaned = callee_cleanup(path, blob, pe, base, md)
-        call_at = stub.find(b"\xff\xd0")
-        add_at = stub.find(b"\x83\xc4", call_at + 2) if call_at >= 0 else -1
-        got = stub[add_at + 2] if add_at >= 0 and add_at + 3 <= len(stub) else None
         if cleaned is None:
             print("   fixup_chunk not in a sibling map (a copy in the game folder"
                   " has none): the epilogue form is unchecked here, the two"
                   " build outputs are the ones that decide")
         else:
-            want = (16 - cleaned) if cleaned else 16
             if cleaned:
                 print("   fixup_chunk epilogue: ret %#x (the callee already drops"
-                      " %d bytes), so the caller must drop %d" % (cleaned, cleaned, want))
+                      " %d bytes)" % (cleaned, cleaned))
             else:
-                print("   fixup_chunk epilogue: plain ret, the caller cleans, so the"
-                      " stub's add esp must be 0x10 = the 8 arg bytes + 8 scratch"
-                      " bytes (the call's own return address is already popped)")
-            if got != want:
+                print("   fixup_chunk epilogue: plain ret, the caller cleans")
+        for t in tables:
+            if t["pushed"] is None:
+                continue  # mode c calls nothing: there is no add to match
+            want = None if cleaned is None else (t["pushed"] - cleaned)
+            call_at = t["bytes"].find(b"\xff\xd0")
+            add_at = t["bytes"].find(b"\x83\xc4", call_at + 2) if call_at >= 0 else -1
+            got = (t["bytes"][add_at + 2]
+                   if add_at >= 0 and add_at + 3 <= len(t["bytes"]) else None)
+            print("   stub %s calls the fixup with %d pushed bytes, then adds esp,%s"
+                  % (t["rung"], t["pushed"],
+                     "%#x" % got if got is not None else "nothing"))
+            if want is not None and got != want:
                 bad += 1
-                print("     the stub adds esp,%s: off by %d, popad restores"
-                      " every register from the wrong slot and the client"
-                      " faults on the first chunk"
-                      % ("%#x" % got if got is not None else "?", abs(want - (got or 0))))
+                print("     want esp,%#x (%d pushed minus the %d the epilogue"
+                      " already dropped): off by %d, popad restores every"
+                      " register from the wrong slot and the client faults on the"
+                      " first chunk"
+                      % (want, t["pushed"], cleaned,
+                         abs(want - (got if got is not None else 0))))
 
-        # ---- the detour: a const table, so in .rdata or wherever it landed ---
-        found = 0
-        for sec in pe.sections:
-            label = sec.Name.rstrip(b"\0").decode("ascii", "errors")
-            size = sec.SizeOfRawData
-            raw = blob[sec.PointerToRawData:sec.PointerToRawData + size]
-            at = raw.find(stub)
-            if at < 0:
-                continue
-            found += 1
-            va = base + sec.VirtualAddress + at
-            print("   stub table found in %s at %#x (.text/.rdata offsets do not "
-                  "matter: BuildStub copies this table into an executable page "
-                  "of its own at install)" % (label, va))
-            print("     bytes: %s" % " ".join("%02x" % b for b in raw[at:at + len(stub)]))
-            if raw[at + slots[0] - 1] != 0xB8 or raw[at + slots[0]:at + slots[0] + 4] != b"\x00\x00\x00\x00":
+        # ---- the detours: one const table per rung, in .rdata or wherever ----
+        for t in tables:
+            stub, fx, rs = t["bytes"], t["fixup"], t["resume"]
+            found = 0
+            for sec in pe.sections:
+                label = sec.Name.rstrip(b"\0").decode("ascii", "errors")
+                size = sec.SizeOfRawData
+                raw = blob[sec.PointerToRawData:sec.PointerToRawData + size]
+                at = raw.find(stub)
+                if at < 0:
+                    continue
+                found += 1
+                va = base + sec.VirtualAddress + at
+                print("   stub %s (%d bytes) found in %s at %#x (.text/.rdata"
+                      " offsets do not matter: BuildStub copies this table into"
+                      " an executable page of its own at install)"
+                      % (t["rung"], len(stub), label, va))
+                print("     bytes: %s" % " ".join("%02x" % b for b in raw[at:at + len(stub)]))
+                for label2, where in (("fixup", fx), ("resume", rs)):
+                    if where is None:
+                        continue
+                    if raw[at + where - 1] not in (0xB8, 0x68) or raw[at + where:at + where + 4] != b"\x00\x00\x00\x00":
+                        bad += 1
+                        print("     the %s patch slot of stub %s is not a zeroed"
+                              " imm32 operand" % (label2, t["rung"]))
+                ins_list = list(md.disasm(raw[at:at + len(stub)], va))
+                for ins in ins_list:
+                    print("     %#010x: %-22s %s %s"
+                          % (ins.address, ins.bytes.hex(), ins.mnemonic, ins.op_str))
+                if not ins_list or ins_list[-1].mnemonic != t["tail"]:
+                    bad += 1
+                    print("     stub %s does not end in %s: control would fall"
+                          " through into whatever follows the table"
+                          % (t["rung"], t["tail"]))
+            if found == 0:
                 bad += 1
-                print("     the fixup patch slot is not a zeroed mov eax,imm32")
-            if raw[at + slots[1] - 1] != 0xB8 or raw[at + slots[1]:at + slots[1] + 4] != b"\x00\x00\x00\x00":
+                print("   the %d-byte stub %s table is NOT in any section of this"
+                      " image: BuildStub's memcpy has no source to copy for that"
+                      " rung, so its detour is dead (the array was optimised out"
+                      " or the link failed)" % (len(stub), t["rung"]))
+            elif found > 1:
                 bad += 1
-                print("     the resume patch slot is not a zeroed mov eax,imm32")
-            for ins in md.disasm(raw[at:at + len(stub)], va):
-                print("     %#010x: %-22s %s %s"
-                      % (ins.address, ins.bytes.hex(), ins.mnemonic, ins.op_str))
-            last = md.disasm(raw[at + len(stub) - 2:at + len(stub)],
-                             va + len(stub) - 2)
-            tail = list(last)
-            if not tail or tail[-1].mnemonic != "jmp":
-                bad += 1
-                print("     the table does not end in jmp eax: control would "
-                      "fall through into whatever follows")
-        if found == 0:
-            bad += 1
-            print("   the %d-byte stub table is NOT in any section of this image:"
-                  " BuildStub's memcpy has no source to copy, so the detour is"
-                  " dead (the compiler did not rewrite it, this means the"
-                  " array was optimised out or the link failed)" % len(stub))
-        elif found > 1:
-            bad += 1
-            print("   the stub table appears in %d sections: two copies means"
-                  " BuildStub and the shipped bytes could disagree" % found)
+                print("   the stub %s table appears in %d sections: two copies"
+                      " means BuildStub and the shipped bytes could disagree"
+                      % (t["rung"], found))
 
     print("dlls %d" % len(dlls))
     return 1 if bad else 0

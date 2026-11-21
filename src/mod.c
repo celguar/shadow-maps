@@ -28,25 +28,43 @@
  * client's own s_mapName (0xC961A0) at every chunk, so a payload for the
  * wrong map is ignored rather than half-applied.
  *
- * This build, sv8, is sv7's four-mode ladder plus one rung and one instrument,
- * both of which the first full run of the ladder asked for. That run was
- * decisive: mode a (the .dat read, the whole 34 MB arena resident, NO hook, no
- * call, no write) entered the world clean, and mode h (the hook, the first-chunk
- * audit, nothing allocated, no chunk header touched) crashed entering the world
- * at the same 0x6B0FB7 reading the same 0x6CF97F32 as every earlier report. So
- * neither the footprint nor the shadow write is at fault: the fault is in the
- * detour's landing or in what the call does inside Load. sv8 adds
- *   b  the hook and one EMPTY call per chunk -- no read, no log, no write
- * which separates the stub from the call's own work, and it logs one compact
- * header dump per chunk, capped, so the LAST line of those in a log names the
- * chunk whose BuildVertices died: Load runs fixup BEFORE its own body maps the
- * header it was handed, and the dump prints the eight ofss the resolver is
- * about to copy into this+0xf14..+0xf30, which says whether the .adt's own
- * values reached the object or were already junk on disk. README.md's mode
- * ladder section says what each rung proves:
+ * This build, sv9, answers what sv8's mode b settled. That run was decisive
+ * again: mode b -- the hook plus ONE EMPTY call per chunk, so the .dat is never
+ * opened, nothing is allocated beyond the single detour page, and no chunk
+ * header is read or written anywhere -- still crashed entering the world at
+ * 0x6B0FB7 reading the same 0x6CF97F32, with the log ending at its two install
+ * lines. Nothing this DLL reads or writes is left on that path, so the fault is
+ * in the detour itself: the store, the landing, the resume point, or the ESP
+ * math the stub does around the call. sv9 adds the two rungs that split those
+ * four and one instrument that makes the next crash report name its own chunk:
+ *   c  the detour ONLY: replay the 6 prologue bytes, push <resume>, ret. No
+ *      pushad, no call, no C code on the path at all -- 12 bytes, one patch
+ *      slot, and eax/ecx/edx/esp/flags all come back as the client had them,
+ *      so a clean c against a crashing b says the frame math was wrong and a
+ *      crashing c says the store, the landing or the resume point is wrong
+ *   d  the same empty call at a site 3 bytes later, 0x6AF5F3, where the 5-byte
+ *      E9 covers mov eax,[ebp+8] / push ebx / push esi whole and resumes on the
+ *      instruction boundary 0x6AF5F8 (push edi) with no stray byte; the stub
+ *      takes the record from [ebp+8] and this from ecx, i.e. from the client's
+ *      own frame, so no [esp+48] displacement is involved at all
+ *   the instrument: AddVectoredExceptionHandler (resolved from kernel32 at
+ *      runtime, since some of the toolchains this file builds with predate the
+ *      vectored-handler API) plus a handler that logs ONE line for the first
+ *      0xC0000005 -- the exception's address, the address the client
+ *      dereferenced, and the last chunk this DLL saw: this, record, and what
+ *      the object itself holds at this+0xf08..+0xf30, which is the resolver's
+ *      own answer for the same eight ofss. Comparing the faulting address
+ *      against this+0xf14 in that one line says whether the client's resolver
+ *      produced the poison cursor or this file's write did. The handler returns
+ *      EXCEPTION_CONTINUE_SEARCH, so WoW's own reporter still writes its
+ *      normal report, and the per-chunk dump cap drops to 2000 because this
+ *      line, not the log's tail, names the dying chunk. README.md's mode
+ *      ladder section says what each rung proves:
  *   n  inert -- the .dat is not read, nothing is allocated, nothing is patched
  *   a  the .dat and the resident arena, whole -- and NO hook, NO write
  *   b  the hook and an empty call only -- no .dat, no arena, no header read
+ *   c  the hook alone, no call -- the stub's store, landing and replay only
+ *   d  the same empty call, args taken from the client's own frame
  *   h  the hook and the header audit only -- no .dat, no arena, no write
  *   f  full: .dat, arena, hook, and the matched-chunk writes (shadows draw)
  *
@@ -80,12 +98,15 @@
  */
 
 #include <windows.h>
+#include <excpt.h> /* EXCEPTION_CONTINUE_SEARCH: 0 = "keep searching", so after
+                   * the instrument logs its line the SEH walk continues into the
+                   * client's own crash reporter and the usual report is written*/
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "../shadow_dat.h"
 
-#define STAMP "sv8" /* build stamp, printed in every log line: an old build of
+#define STAMP "sv9" /* build stamp, printed in every log line: an old build of
                     * this DLL sitting next to a new .dat is the most common
                     * confusion, so the line says which build made it, and the
                     * mode line below names which of sv7's four modes ran */
@@ -100,6 +121,18 @@
  * replays; the E9 covers the first 5, resume is at +6. */
 static const unsigned char k_prologue[] = {
     0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x08
+};
+/* mode d's site: 3 bytes into the SAME prologue, pinned as 6 bytes because the
+ * 5-byte E9 covers mov eax,[ebp+8] / push ebx / push esi exactly and the 6th
+ * byte is where it resumes -- 0x57 push edi at 0x6AF5F8. Pinning that byte is
+ * what proves the resume is an instruction boundary and not the middle of one:
+ * probe_hooksite.py prints the same window from a real client, and capstone
+ * reads these six bytes as three whole instructions. */
+#define ADDR_LOAD_D      0x6AF5F3u /* CMapChunk::Load, 3 bytes in            */
+static const unsigned char k_prologue_d[] = {
+    0x8B, 0x45, 0x08,             /* mov eax,[ebp+8]  (record) */
+    0x53, 0x56,                   /* push ebx / push esi       */
+    0x57                          /* push edi: the resume byte, not patched */
 };
 /* the whole gate chain, pinned as one run so a mismatch refuses to patch:
  * test [hdr],1 / je off / test [0xc7b2a4],0x40 / je off /
@@ -117,6 +150,22 @@ static const unsigned char k_gate[] = {
 #define FIELD_GLOBAL_ROW 0x90u /* CMapChunk: area base + row (gy)    */
 #define FIELD_MCSH_OFS   0x2Cu /* MCNK header: ofsMCSH               */
 #define FIELD_MCSH_SIZE  0x30u /* MCNK header: sizeMCSH              */
+/* The object's own copy of the same facts, which is what the instrument reads:
+ * the resolver at 0x6AF970 writes hdr at +0xf08 and one ADDRESS per sub-record
+ * slot (+0xf14 MCVT .. +0xf30 MCSE, i.e. hdr + ofs already added), Load stores
+ * the record it was handed at +0x168, and BuildVertices walks the MCVT one at
+ * 0x6B0FB7. A crash report's ebx is one of these fields, so the handler prints
+ * them and the report can be matched against the object without another run. */
+#define FIELD_HDR_OFS    0xf08u /* resolver: lea edx,[record+8] -> hdr        */
+#define FIELD_RECORD     0x168u /* Load: mov [this+0x168],eax = the record    */
+#define FIELD_PTR_MCVT   0xf14u
+#define FIELD_PTR_MCNR   0xf18u
+#define FIELD_PTR_MCSH   0xf1cu
+#define FIELD_PTR_MCLY   0xf20u
+#define FIELD_PTR_MCAL   0xf24u
+#define FIELD_PTR_MCRF   0xf28u
+#define FIELD_PTR_MCLQ   0xf2cu
+#define FIELD_PTR_MCSE   0xf30u
 
 /* The sub-record ofss the client's own resolver (0x6AF970) turns into
  * addresses, every one of them but the shadow slot this file writes:
@@ -156,11 +205,12 @@ static const char *k_table_cc[] = {"MCVT", "MCNR", "MCLY", "MCRF", "MCAL",
  * inside the record the header belongs to and reading its fourcc cannot fault;
  * a bigger value is printed, never dereferenced */
 #define AUDIT_OFS_MAX 0x40000u
-/* the per-chunk header dump is capped so a run cannot write an endless log, and
- * the cap is far above where the crash happens: the LAST such line in the log is
- * the chunk whose BuildVertices died, because Load calls fixup before its own
- * body reads the header it was handed */
-#define AUDIT_LOG_MAX 40000u
+/* the per-chunk header dump is capped so a run cannot write an endless log. It
+ * used to be 40000 because the LAST of these lines was the only way to name the
+ * chunk whose BuildVertices died; sv9's exception handler names that chunk
+ * directly, so this is now only a trail that says how far the walk got, and
+ * 2000 lines is enough for that without a log the size of the run */
+#define AUDIT_LOG_MAX 2000u
 
 /* ------------------------------------------------------- runtime state ***/
 
@@ -178,6 +228,17 @@ static unsigned char *g_stub;         /* the executable page holding the detour 
 static unsigned char g_dat_map[24];   /* header's map name, NUL-terminated  */
 static DWORD g_resume;                /* runtime resume address for the asm */
 static volatile DWORD g_hits;         /* chunks that found a payload        */
+/* what the exception instrument reads (see DyingChunkHandler): the LAST chunk
+ * the fixup was handed. Load runs the fixup before its own body walks the
+ * header it was given, so when a BuildVertices dies the chunk that dies is the
+ * one stored here, and the handler can print the object's own fields off it
+ * without waiting for the log's tail. volatile because any thread that loads a
+ * chunk writes them, and the handler may run on any of them. */
+static volatile void *g_last_this;
+static volatile void *g_last_record;
+static volatile DWORD g_chunk_visits; /* chunks that reached the fixup      */
+static int g_handler_logged;          /* the dying-chunk line is logged once */
+static int g_handler_on;              /* the vectored handler is registered  */
 /* UCRT's fread is NOT the standard C three-argument form: <stdio.h> declares
    size_t fread(void *_Buffer, size_t _ElementSize, size_t _ElementCount,
    FILE *_Stream) and returns BYTES read, so a byte block is (p, 1, n, f). The
@@ -205,7 +266,13 @@ static int g_diagnostic;              /* installed nothing on purpose: Load retu
 
 static DWORD WINAPI InitWorker(LPVOID p);
 static int Install(void);
-static int BuildStub(unsigned fixup_target, unsigned resume_at);
+/* one of the three detour shapes, picked by the rung's letter: BuildStub looks
+ * the table and its two imm32 slot offsets up in mod.c's own defines, so the
+ * caller cannot pair a table with another table's slots */
+static int BuildStub(char rung);
+static int PatchHook(char rung);
+static void InstallHandler(void);
+static DWORD WINAPI DyingChunkHandler(PEXCEPTION_POINTERS info);
 
 /* ------------------------------------------------------------ logging ***/
 
@@ -229,9 +296,9 @@ static void LogMsg(const char *text)
 }
 
 /* sv7's mode letter: the first non-blank character of <dir>\shadow-mod.mode,
- * lower-cased, and only n/a/b/h/f are honoured -- an unreadable, empty or junk
- * file means f, so forgetting the file gives the full path, never a silent
- * no-op. A mode FILE rather than four DLLs is what lets the user walk README
+ * lower-cased, and only n/a/b/c/d/h/f are honoured -- an unreadable, empty or
+ * junk file means f, so forgetting the file gives the full path, never a silent
+ * no-op. A mode FILE rather than several DLLs is what lets the user walk README
  * .md's ladder by editing one letter, with no rebuild between the steps and no
  * risk of shipping an old DLL for the wrong step (every log line still names
  * the build stamp and the mode that ran). */
@@ -252,7 +319,8 @@ static char ReadModeFile(void)
             continue;
         if (c >= 'A' && c <= 'Z')
             c += 32;
-        if (c == 'n' || c == 'a' || c == 'b' || c == 'h' || c == 'f')
+        if (c == 'n' || c == 'a' || c == 'b' || c == 'c' || c == 'd'
+            || c == 'h' || c == 'f')
             m = (char)c;
         break;
     }
@@ -344,6 +412,173 @@ static void AuditHeader(const void *record_, const char *who)
     }
 }
 
+/* The handler's own types. The kernel calls the handler with the same
+ * __stdcall convention every WINAPI export uses, and hands it the EXCEPTION_POINTERS
+ * (excpt.h / winnt.h) pair, so the record's ExceptionInformation is read the
+ * way a debugger reads it: [0] = 0 read / 1 write, [1] = the address. PFN_ADDVEH
+ * is AddVectoredExceptionHandler's own shape, used once by InstallHandler. */
+typedef DWORD (WINAPI *PFN_VEHPTR)(PEXCEPTION_POINTERS);
+/* AddVectoredExceptionHandler answers with a handle to the handler it added, or
+ * NULL when it refused, not with a status code, so the handle is what the
+ * registration check below looks at */
+typedef PVOID (WINAPI *PFN_ADDVEH)(DWORD, PFN_VEHPTR);
+
+/* --------------------------------------------------- the instrument ***/
+
+/* What the crash reports all say is one thing: an ACCESS_VIOLATION at 0x6B0FB7
+ * -- the `mov ecx,[ebx]` inside BuildVertices whose ebx is the MCVT cursor the
+ * resolver put at this+0xf14 -- and until sv9 the only way to know WHICH chunk
+ * died was to trust that the last "last chunk seen" line in the log is it. This
+ * handler does not trust that. On the first 0xC0000005 it prints the exception's
+ * own two facts, the address the client dereferenced and where it did it, plus
+ * the chunk this DLL last saw and what that object itself holds at this+0xf08
+ * ..+0xf30 -- the resolver's answer for the same eight ofss, read off the
+ * object rather than recomputed. Putting the faulting address and this+0xf14 on
+ * one line says whether the client's resolver produced the poison cursor or a
+ * write from this file did, in one run rather than by comparing log tails with
+ * crash reports.
+ *
+ * The handler returns EXCEPTION_CONTINUE_SEARCH (0): it claims nothing, so the
+ * SEH walk continues into the client's own reporter and the usual Errors\*.txt
+ * report is still written. It is registered with AddVectoredExceptionHandler
+ * resolved from kernel32 at runtime rather than called through a header,
+ * because not every <windows.h> this file builds with declares that API -- VC98
+ * 's winbase.h has no vectored-handler declaration at all -- and a missing
+ * registration is logged and not fatal: the run keeps its normal report, only
+ * the direct naming of the dying chunk is lost. */
+static DWORD WINAPI DyingChunkHandler(PEXCEPTION_POINTERS info)
+{
+    PEXCEPTION_RECORD rec;
+    const unsigned char *obj;
+    const unsigned char *recp;
+    const unsigned char *hdr;
+    char msg[1024];
+    unsigned code;
+
+    rec = (info != NULL) ? info->ExceptionRecord : NULL;
+    if (rec == NULL)
+        return EXCEPTION_CONTINUE_SEARCH;
+    code = rec->ExceptionCode;
+    /* only the access violation every report shares, and only its first
+     * occurrence: the client raises other conditions on paths of its own, and
+     * one line is what is needed to know which chunk was being built */
+    if (code != 0xC0000005u || g_handler_logged)
+        return EXCEPTION_CONTINUE_SEARCH;
+    g_handler_logged = 1;
+
+    snprintf(msg, sizeof msg,
+             "handler: ACCESS_VIOLATION %#x at %#x, %s of %#x -- the address the"
+             " client dereferenced. last chunk seen: this %#x record %#x,"
+             " fixup visits %u",
+             code, (unsigned)(size_t)rec->ExceptionAddress,
+             ((rec->NumberParameters > 0u && rec->ExceptionInformation[0] == 1u)
+                  ? "write" : "read"),
+             (unsigned)rec->ExceptionInformation[1],
+             (unsigned)(size_t)g_last_this, (unsigned)(size_t)g_last_record,
+             (unsigned)g_chunk_visits);
+    LogMsg(msg);
+    if (g_last_this == NULL || g_last_record == NULL) {
+        /* the rung that hooks but never calls the fixup (mode c) has nothing to
+         * name: the line above still says which instruction faulted and which
+         * address it read, which is the whole question mode c asks */
+        LogMsg(STAMP " handler: no chunk was captured, the hooked rung calls nothing -- read the crash report's own ecx for this");
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    /* the object's own fields. A fault here is caught by the __except below and
+     * logged, not raised again through the handler chain, so a bad `this` cannot
+     * turn the diagnostic into a second mystery crash. */
+    __try {
+        obj = (const unsigned char *)g_last_this;
+        recp = (const unsigned char *)g_last_record;
+        hdr = recp + 8u;
+        snprintf(msg, sizeof msg,
+                 "handler: the object this chunk carries: hdr@%#x %#x, record"
+                 "@%#x %#x, MCVT@%#x %#x, MCNR@%#x %#x, MCSH@%#x %#x, MCLY@%#x"
+                 " %#x, MCAL@%#x %#x, MCRF@%#x %#x, MCLQ@%#x %#x, MCSE@%#x %#x."
+                 " this+0xf14 %s the address the client read",
+                 (unsigned)FIELD_HDR_OFS,
+                 ((const unsigned *)(obj + FIELD_HDR_OFS))[0],
+                 (unsigned)FIELD_RECORD,
+                 ((const unsigned *)(obj + FIELD_RECORD))[0],
+                 (unsigned)FIELD_PTR_MCVT,
+                 ((const unsigned *)(obj + FIELD_PTR_MCVT))[0],
+                 (unsigned)FIELD_PTR_MCNR,
+                 ((const unsigned *)(obj + FIELD_PTR_MCNR))[0],
+                 (unsigned)FIELD_PTR_MCSH,
+                 ((const unsigned *)(obj + FIELD_PTR_MCSH))[0],
+                 (unsigned)FIELD_PTR_MCLY,
+                 ((const unsigned *)(obj + FIELD_PTR_MCLY))[0],
+                 (unsigned)FIELD_PTR_MCAL,
+                 ((const unsigned *)(obj + FIELD_PTR_MCAL))[0],
+                 (unsigned)FIELD_PTR_MCRF,
+                 ((const unsigned *)(obj + FIELD_PTR_MCRF))[0],
+                 (unsigned)FIELD_PTR_MCLQ,
+                 ((const unsigned *)(obj + FIELD_PTR_MCLQ))[0],
+                 (unsigned)FIELD_PTR_MCSE,
+                 ((const unsigned *)(obj + FIELD_PTR_MCSE))[0],
+                 (((const unsigned *)(obj + FIELD_PTR_MCVT))[0]
+                      == (unsigned)rec->ExceptionInformation[1]) ? "==" : "!=");
+        LogMsg(msg);
+        snprintf(msg, sizeof msg,
+                 "handler: the dying chunk's header: hdr %#x flags %#x indexX"
+                 " %#x indexY %#x, ofs MCVT %#x MCNR %#x MCLY %#x MCRF %#x MCAL"
+                 " %#x MCSH %#x MCSE %#x MCLQ %#x, global col %#x row %#x",
+                 (unsigned)(size_t)hdr,
+                 ((const unsigned *)hdr)[0],
+                 ((const unsigned *)hdr)[1],
+                 ((const unsigned *)hdr)[2],
+                 ((const unsigned *)(hdr + 0x14u))[0],
+                 ((const unsigned *)(hdr + 0x18u))[0],
+                 ((const unsigned *)(hdr + 0x1cu))[0],
+                 ((const unsigned *)(hdr + 0x20u))[0],
+                 ((const unsigned *)(hdr + 0x24u))[0],
+                 ((const unsigned *)(hdr + FIELD_MCSH_OFS))[0],
+                 ((const unsigned *)(hdr + 0x58u))[0],
+                 ((const unsigned *)(hdr + 0x60u))[0],
+                 ((const unsigned *)(obj + FIELD_GLOBAL_COL))[0],
+                 ((const unsigned *)(obj + FIELD_GLOBAL_ROW))[0]);
+        LogMsg(msg);
+    } __except(1) {
+        LogMsg(STAMP " handler: the dying chunk's fields could not be read (the handler faulted inside itself, caught here), so only the line above is usable");
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* Registering it. AddVectoredExceptionHandler is a kernel32 export, resolved
+ * here rather than called through a header for the reason above. CALL_FIRST (1)
+ * is what makes it first in the vectored chain, i.e. asked before the SEH
+ * handlers the client's own modules carry, which is the only way to see the
+ * fault before something else swallows it. */
+static void InstallHandler(void)
+{
+    HMODULE k;
+    PVOID tag;
+    PFN_ADDVEH adder;
+    char msg[256];
+
+    k = GetModuleHandleA("kernel32.dll");
+    if (k == NULL) {
+        LogMsg(STAMP " handler: no kernel32 to resolve AddVectoredExceptionHandler from, the dying-chunk instrument stays off");
+        return;
+    }
+    adder = (PFN_ADDVEH)GetProcAddress(k, "AddVectoredExceptionHandler");
+    if (adder == NULL) {
+        LogMsg(STAMP " handler: kernel32 does not export AddVectoredExceptionHandler, the dying-chunk instrument stays off");
+        return;
+    }
+    tag = adder(1u, DyingChunkHandler);
+    if (tag == NULL) {
+        snprintf(msg, sizeof msg, STAMP " handler: AddVectoredExceptionHandler refused"
+                 " (GetLastError %#x), the dying-chunk instrument stays off",
+                 GetLastError());
+        LogMsg(msg);
+        return;
+    }
+    g_handler_on = 1;
+    LogMsg(STAMP " handler: first-chance vectored handler registered, so the next access violation logs the chunk that was being built and the address the client read (the client's own report is still written afterwards)");
+}
+
 /* ---------------------------------------------------- the per-chunk fix **/
 
 /* Called by the asm entry with thiscall layout: this in ecx, record on the
@@ -359,17 +594,30 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
     unsigned char *hdr;
     char msg[768];
 
+    /* the instrument's capture, before every gate: whichever rung calls this,
+     * the chunk named here is the chunk Load is building, and DyingChunkHandler
+     * reads it when an access violation happens further inside Load. The store
+     * is two volatile pointer writes, no read of the chunk and no I/O, so it
+     * costs nothing on a path that runs once per loaded chunk. */
+    g_last_this = self_;
+    g_last_record = (void *)record_; /* the const drops here only: the handler
+                                      * reads it through a volatile void*, and a
+                                      * const-qualified global would then need
+                                      * every write casted instead */
+    ++g_chunk_visits;
+
     if (!g_ready || !self_ || !record_)
         return;
 
-    /* mode b: the hook is in and the call happens, but this returns before
-     * reading anything, before logging a byte, before looking at the header. If
-     * a mode-b run still crashes at 0x6B0FB7 while mode a entered the world
-     * clean, the fault is in the detour itself -- the store, the landing, or the
-     * frame the stub keeps -- and nothing else in this DLL is involved. If mode
-     * b is clean and mode h is not, the fault is in what the call DOES inside
-     * Load, which today means the audit and its file I/O on the client's own
-     * loading path. */
+    /* mode b and mode d: the hook is in and the call happens, but this returns
+     * before reading anything, before logging a byte, before looking at the
+     * header. The capture above still happened, so even these rungs name the
+     * chunk that dies. If a mode-b run still crashes at 0x6B0FB7 while mode a
+     * entered the world clean, the fault is in the detour itself -- the store,
+     * the landing, or the frame the stub keeps -- and nothing else in this DLL
+     * is involved. If mode b is clean and mode h is not, the fault is in what
+     * the call DOES inside Load, which today means the audit and its file I/O
+     * on the client's own loading path. */
     if (g_silent)
         return;
 
@@ -567,11 +815,10 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
 
 /* --------------------------------------------------------- the detour ***/
 
-/* The detour, as bytes: the one hand-written x86-32 stub the E9 at 0x6AF5F0
- * lands in, emitted once at install into a private executable page with the
- * two absolute addresses below patched into its two imm32 slots. It is why
- * this DLL needs no assembler, and its stack math is checked against real
- * bytes by verify_dll.py.
+/* The detour, as bytes: three hand-written x86-32 stubs, one per rung, emitted
+ * once at install into a private executable page with the absolute addresses
+ * below patched into their imm32 slots. It is why this DLL needs no assembler,
+ * and its stack math is checked against real bytes by verify_dll.py.
  *
  * Stack on entry: [esp]=ret, [esp+4]=record, [esp+8]=first; `this` is in ecx
  * (the client's Load is thiscall). pushfd/pushad preserve every register the
@@ -604,6 +851,22 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
  *     and the entry frame is whole before the replayed prologue pushes ebp
  * The 6 replayed bytes then set up ebp and eax = record exactly as the game
  * expects (ecx is back from pushad), and the jmp resumes Load's own body.
+ *
+ * The c stub (12 bytes, same hook) does no call at all: push ebp / mov ebp,esp
+ * / mov eax,[ebp+8] then push <resume> / ret. Nothing on the stack is left
+ * between entry and exit -- the push is popped by the ret at the same level --
+ * so eax and flags are what the client's own first three instructions left and
+ * ecx/ebx/edx/esp never moved at all, which is exactly what a clean c proves
+ * about the client's state at 0x6AF5F6 with no call of this DLL involved.
+ *
+ * The d stub (29 bytes, hook at 0x6AF5F3) has the frame math above in its
+ * simplest form: entry E -> pushad E-36 -> pushfd E-40 -> the two args E-48 and
+ * E-44 -> the call's return address at E-52, so esp is E-52 when fixup_chunk
+ * starts; a plain ret pops the return address back to E-48 and the add has to
+ * drop only what the pushad/pushfd block did NOT already drop, 8 bytes of args,
+ * landing popad on E-40 -- the window pushad left. And the record is read from
+ * [ebp+8] on the client's own frame, so no esp displacement is part of finding
+ * the arguments at all -- the one thing that can make b crash and d not.
  *
  * Encoding note: x86-32 has no `sub r/m32, imm8` -- the one-byte-immediate
  * group (opcode 83) only covers add/or/adc/sbb/and/xor/cmp, and its reg field
@@ -648,18 +911,112 @@ static const unsigned char stub_code[] = {
 #define STUB_SLOT_FIXUP  12u
 #define STUB_SLOT_RESUME 30u
 
+/* sv9's other two detour shapes, same page, same patch rule.
+ *
+ * stub_code_c is mode c: the landing replays the prologue and jumps back, and
+ * NOTHING else -- no pushad, no call, no C code on the path -- so the question
+ * this rung asks is only "did the 5-byte store at 0x6AF5F0 land, does the
+ * landing run, is 0x6AF5F6 the right resume point". At the landing esp is the
+ * function's own entry esp E, since nothing has been pushed yet at 0x6AF5F0;
+ * the replayed push ebp takes esp to E-4, which is exactly what 0x6AF5F6
+ * expects, and `push <resume> / ret` is the jmp form that leaves eax = record,
+ * ecx = this, edx and the flags alone, which jmp eax would not (it would take
+ * the resume address in eax). 12 bytes, one imm32 slot at +7, the operand of
+ * the 0x68 push.
+ *
+ * stub_code_d is mode d: the same empty call, but the store moved to 0x6AF5F3,
+ * three bytes into the same prologue, where ebp is already the client's own
+ * frame and esp is E-4 -- push ebp made it E-4 and the frame pointer points
+ * there. So the record comes from [ebp+8] and `this` from ecx, and no ESP
+ * displacement is part of finding the arguments at all: mode d is what
+ * separates a wrong [esp+48] displacement from a wrong store site. esp then
+ * walks E-4 -32 -4 (pushad, pushfd) = E-40, -4 (push [ebp+8]) = E-44, -4 (push
+ * ecx) = E-48, so the callee starts at E-52 with [esp+4] = this and [esp+8] =
+ * record; a plain ret comes back to E-48, and add esp,8 lands on the pushfd
+ * dword at E-40. popfd closes it, popad restores the eight registers and esp
+ * from the 32-byte window pushad left at E-36, which ends at E-4 = the esp at
+ * the landing. The replay of mov eax,[ebp+8] / push ebx / push esi then leaves
+ * esp at E-12 and eax = record, exactly what the client has at 0x6AF5F8 after
+ * executing those three instructions, and push <resume> / ret jumps there
+ * without touching eax. 29 bytes: slots at +7 (b8's imm32) and +24 (68's).
+ *
+ * Encoding note: capstone reads pushal/popal for 0x60/0x61 and prints the
+ * imm32 of `add esp, -8` as 0xfffffff8; both tables above are checked against
+ * the linked image by verify_dll.py, including these slot offsets. */
+static const unsigned char stub_code_c[] = {
+    0x55,                         /* push ebp        -- replayed */
+    0x8B, 0xEC,                   /* mov  ebp, esp     prologue  */
+    0x8B, 0x45, 0x08,             /* mov  eax, [ebp+8] = record  */
+    0x68, 0x00, 0x00, 0x00, 0x00, /* push <resume>               */
+    0xC3                          /* ret                           */
+};
+#define STUB_C_BYTES        12u
+#define STUB_C_SLOT_RESUME   7u
+
+static const unsigned char stub_code_d[] = {
+    0x60,                         /* pushad                      */
+    0x9C,                         /* pushfd                      */
+    0xFF, 0x75, 0x08,             /* push dword [ebp+8] = record */
+    0x51,                         /* push ecx  (this)            */
+    0xB8, 0x00, 0x00, 0x00, 0x00, /* mov  eax, <fixup_chunk>     */
+    0xFF, 0xD0,                   /* call eax                    */
+    0x83, 0xC4, 0x08,             /* add  esp, 8 (the 2 arg dwords the
+                                        callee left: no scratch bytes
+                                        are reserved in this shape) */
+    0x9D,                         /* popfd                       */
+    0x61,                         /* popad                       */
+    0x8B, 0x45, 0x08,             /* replay: mov  eax, [ebp+8]   */
+    0x53,                         /* replay: push ebx            */
+    0x56,                         /* replay: push esi            */
+    0x68, 0x00, 0x00, 0x00, 0x00, /* push <resume>               */
+    0xC3                          /* ret                           */
+};
+#define STUB_D_BYTES        29u
+#define STUB_D_SLOT_FIXUP    7u
+#define STUB_D_SLOT_RESUME  24u
+
 /* Emits the detour into a page of its own: VirtualAlloc with execute rights,
  * the same as MinHook's heap trampolines, and never a rewrite of a file-backed
  * page. The two imm32 slots are patched with the values this process sees now,
  * which is what lets the DLL relocate: fixup_target is fixup_chunk's address in
  * the relocated image, resume_at is a client address (the client never
  * relocates, so it is a plain constant). */
-static int BuildStub(unsigned fixup_target, unsigned resume_at)
+static int BuildStub(char rung)
 {
     unsigned char *page;
+    const unsigned char *code;
+    unsigned code_bytes, slot_fixup, slot_resume;
+    unsigned fixup_target, resume_at;
     char msg[256];
 
-    if (sizeof stub_code != STUB_BYTES) {
+    /* which of the three detour shapes to emit, and where its two imm32 slots
+     * are; the sizes and slot offsets are asserted against the tables right
+     * here, and verify_dll.py checks the same numbers out of the linked image,
+     * so a table edited without its slots (or slots edited without a table) is
+     * caught twice, once at install and once before the DLL is ever shipped. */
+    if (rung == 'c') {
+        code = stub_code_c;
+        code_bytes = STUB_C_BYTES;
+        slot_fixup = 0u; /* mode c calls nothing, so there is no fixup slot */
+        slot_resume = STUB_C_SLOT_RESUME;
+    } else if (rung == 'd') {
+        code = stub_code_d;
+        code_bytes = STUB_D_BYTES;
+        slot_fixup = STUB_D_SLOT_FIXUP;
+        slot_resume = STUB_D_SLOT_RESUME;
+    } else {
+        code = stub_code;
+        code_bytes = STUB_BYTES;
+        slot_fixup = STUB_SLOT_FIXUP;
+        slot_resume = STUB_SLOT_RESUME;
+    }
+    /* the table and its slots must agree before any byte is written; verify_dll
+     * .py checks the same three (bytes, slots, opcode prefixes) in the linked
+     * image, so this is the runtime half of the same rule */
+    if ((size_t)code_bytes != (rung == 'c' ? sizeof stub_code_c
+                               : (rung == 'd' ? sizeof stub_code_d : sizeof stub_code))
+        || (slot_fixup != 0u && code[slot_fixup - 1u] != 0xB8u)
+        || code[slot_resume - 1u] != 0x68u) {
         LogMsg(STAMP " build defect: the detour byte table and its slot offsets disagree, refusing to patch");
         return 0;
     }
@@ -680,9 +1037,14 @@ static int BuildStub(unsigned fixup_target, unsigned resume_at)
         LogMsg(msg);
         return 0;
     }
-    memcpy(page, stub_code, sizeof stub_code);
-    memcpy(page + STUB_SLOT_FIXUP, &fixup_target, 4);
-    memcpy(page + STUB_SLOT_RESUME, &resume_at, 4);
+    memcpy(page, code, code_bytes);
+    fixup_target = (unsigned)(size_t)fixup_chunk;
+    resume_at = g_resume;
+    /* mode c has no fixup slot: its imm32 is only the resume address, and the
+     * 4 bytes it would have patched stay as they are in the table */
+    if (slot_fixup != 0u)
+        memcpy(page + slot_fixup, &fixup_target, 4);
+    memcpy(page + slot_resume, &resume_at, 4);
     g_stub = page;
     return 1;
 }
@@ -692,17 +1054,37 @@ static int BuildStub(unsigned fixup_target, unsigned resume_at)
  * checks: a mode-h run that crashes while a mode-n run is clean is proof about
  * this code path, not about anything the shadow write does, and the two modes
  * have to agree on how the store is asked for, attempted and verified. */
-static int PatchHook(void)
+/* `rung` says which detour shape and which site: b, h and f use the 0x6AF5F0
+ * store over the 6-byte prologue, c uses the same store with a landing that
+ * calls nothing, and d uses the 0x6AF5F3 store, which is the only rung whose
+ * resume point is not "the instruction right after the replayed prologue": its
+ * 5-byte E9 covers mov eax,[ebp+8] / push ebx / push esi whole and resumes on
+ * the 0x57 push edi at 0x6AF5F8. The store is 5 bytes everywhere, so the site
+ * and the resume are the whole difference between the rungs. */
+static int PatchHook(char rung)
 {
-    unsigned char *site = (unsigned char *)(size_t)ADDR_LOAD;
+    unsigned char *site;
     unsigned char *page_base;
     unsigned char patched[8];
     DWORD old_protect;
     long rel;
     int perms;
 
-    g_resume = ADDR_LOAD + 6u; /* after the 6 replayed bytes, 0x6AF5F6 */
-    if (!BuildStub((unsigned)(size_t)fixup_chunk, g_resume))
+    if (rung == 'd') {
+        site = (unsigned char *)(size_t)ADDR_LOAD_D;
+        /* d's E9 spans 0x6AF5F3..0x6AF5F7 = 5 bytes, resume 0x6AF5F8, the byte
+         * after the span and pinned to 0x57 push edi by k_prologue_d below. */
+        g_resume = ADDR_LOAD_D + 5u;
+        if (memcmp((const void *)(size_t)ADDR_LOAD_D, k_prologue_d,
+                   sizeof k_prologue_d) != 0) {
+            LogMsg(STAMP " mode d's site is not the pinned 6 bytes of the same prologue: refusing to patch this client");
+            return 0;
+        }
+    } else {
+        site = (unsigned char *)(size_t)ADDR_LOAD;
+        g_resume = ADDR_LOAD + 6u; /* after the 6 replayed bytes, 0x6AF5F6 */
+    }
+    if (!BuildStub(rung))
         return 0;
     rel = (long)((size_t)g_stub - ((size_t)site + 5u));
     /* E9 rel32 reaches the whole 4 GB space, so the DLL's own base and the
@@ -762,8 +1144,9 @@ static int Install(void)
     g_mode = ReadModeFile();
     snprintf(msg, sizeof msg,
              STAMP " mode '%c' read from '%s\\shadow-mod.mode' (no such file means f): n = inert, a = .dat plus"
-             " arena, no hook, b = hook plus an empty call, h = hook plus audit,"
-             " no payload, f = full",
+             " arena, no hook, b = hook plus an empty call, c = the detour alone"
+             " with no call at all, d = the same call from the client's own frame"
+             " at 0x6AF5F3, h = hook plus audit, no payload, f = full",
              g_mode, g_dir);
     LogMsg(msg);
 
@@ -791,16 +1174,76 @@ static int Install(void)
         return 0;
     }
 
+    /* the instrument comes up BEFORE the hook is patched, so a fault inside the
+     * detour itself -- the thing sv8's mode b produced -- is already named by the
+     * time the store exists, and a fault in a mode-a run's own allocation is too.
+     * It claims nothing and returns EXCEPTION_CONTINUE_SEARCH, so the only
+     * visible effect is one extra line in this log per first 0xC0000005. */
+    InstallHandler();
+
+    if (g_mode == 'c') {
+        /* the narrowest hook rung there is: the store and the landing only. The
+         * landing replays the 6 prologue bytes and jumps back, and calls nothing
+         * at all, so no C code of this DLL runs on the client's loading path and
+         * the only state that changes is eax/ecx/edx/esp/flags -- all of which
+         * the replay leaves as the client had them. The question this rung asks
+         * is exactly the question sv8's mode b left open, since that run
+         * crashed: did the 5-byte store land, does the landing run, is 0x6AF5F6
+         * the right resume point? A clean c against a crashing b says the frame
+         * math around the call was wrong; a c that crashes at the same 0x6B0FB7
+         * says the store, the landing or the resume point is wrong, and then the
+         * handler line below names the chunk that was being built. */
+        if (!PatchHook('c'))
+            return 0;
+        g_ready = 0; /* nothing may write, there is nothing to write with anyway */
+        snprintf(msg, sizeof msg,
+                 STAMP " mode c installed: hook 0x6AF5F0 patched, resume 0x6AF5F6,"
+                 " detour at %#x, the landing replays the prologue and returns"
+                 " without calling anything -- no .dat read, nothing allocated,"
+                 " no chunk header read or touched (shadows stay stock;"
+                 " this mode exists to test the store and the landing alone)",
+                 (unsigned)(size_t)g_stub);
+        LogMsg(msg);
+        return 1;
+    }
+
+    if (g_mode == 'd') {
+        /* mode b's call, moved 3 bytes into the prologue so that the 5-byte E9
+         * covers mov eax,[ebp+8] / push ebx / push esi whole and the resume is
+         * the next instruction boundary, 0x6AF5F8. ebp is already the client's
+         * own frame there, so the stub reads the record from [ebp+8] and this
+         * from ecx: no ESP displacement is part of finding the arguments, which
+         * is the one thing mode b has not yet separated. If d is clean and b
+         * crashed, the [esp+48] displacement in b's stub was wrong; if d crashes
+         * at 0x6AF5F8+'s own first read instead, the resume point is wrong. */
+        if (!PatchHook('d'))
+            return 0;
+        g_silent = 1;
+        g_ready = 1;
+        snprintf(msg, sizeof msg,
+                 STAMP " mode d installed: hook 0x6AF5F3 patched (the 5-byte E9"
+                 " covers mov eax,[ebp+8] / push ebx / push esi), resume 0x6AF5F8"
+                 " (push edi), detour at %#x, fixup returns immediately -- no .dat"
+                 " read, nothing allocated, no chunk header read or touched (shadows"
+                 " stay stock; this mode exists to test the stub's argument lookup)",
+                 (unsigned)(size_t)g_stub);
+        LogMsg(msg);
+        return 1;
+    }
+
     if (g_mode == 'b') {
         /* the stub rung: the detour and a call per chunk that does NOTHING --
          * g_silent returns before the audit, before the per-chunk dump, before
          * looking at the header, so no file is opened and no client byte is
-         * read or written. If a mode-b run still crashes at 0x6B0FB7 while mode
-         * a entered the world clean, the fault is in the detour itself: the
-         * store, the landing, or the frame the stub keeps. This mode is the
-         * narrowest thing that can answer that, and it loads successfully
-         * (Load returns 0), so VanillaFixes says nothing */
-        if (!PatchHook())
+         * read or written. sv8 ran this and it crashed at 0x6B0FB7 reading 0x6C
+         * F97F32, the same report as every earlier mode, which is what left the
+         * fault inside the detour: the store, the landing, the resume point, or
+         * the ESP math the stub does around the call. The crash report's own
+         * frame was intact, so the remaining suspects are the [esp+48] argument
+         * lookup in this stub and the resume point. modes c and d above are the
+         * two rungs that split those; this rung stays in the ladder because it
+         * is the one the sv8 evidence is quoted from. */
+        if (!PatchHook('b'))
             return 0;
         g_silent = 1;
         g_ready = 1;
@@ -821,7 +1264,7 @@ static int Install(void)
          * did not, the fault is in what the call DOES inside Load -- the audit
          * and its file I/O on the client's own loading path -- and not in the
          * detour's frame, the memory footprint or the shadow write. */
-        if (!PatchHook())
+        if (!PatchHook('h'))
             return 0;
         g_ready = 1;
         snprintf(msg, sizeof msg,
@@ -1017,7 +1460,7 @@ static int Install(void)
 
     /* mode f: hook plus writes, the only rung that is expected to draw */
     g_allow_write = 1;
-    if (!PatchHook())
+    if (!PatchHook('f'))
         return 0;
 
     memcpy(g_dat_map, head.map, 24);
