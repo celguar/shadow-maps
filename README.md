@@ -154,7 +154,7 @@ before starting the noon one.
 | `src/mod.c` | the hook DLL: loads the `.dat`, installs the detour, rewrites `MCNK` headers |
 | `shadow_dat.h` | the `.dat` layout, shared by the DLL and documented here |
 | `shadowmaps.def` | the export list: `Load`, the entry point VanillaFixes calls |
-| `shadow-mod.mode` | **not in this repo**: the one-letter mode file that lives next to the shipped DLL, see the mode ladder; a missing file means `f` |
+| `shadow-mod.mode` | **not in this repo**: the mode file that lives next to the shipped DLL — see the mode ladder and the Logging section. Its first rung letter (`n`/`a`/`b`/`c`/`d`/`h`/`f`) picks the rung and a `v` anywhere in it turns the diagnostic lines on; a missing file means `f` with quiet logging, which is what ships |
 | `CMakeLists.txt`, `CMakePresets.json` | the canonical build (mirrors ClassicAPI's project) |
 | `build.py`, `build.ps1` | the no-CMake fallback: names every missing toolchain piece |
 | `verify_dll.py` | confirms a built DLL carries what `src/mod.c` claims |
@@ -338,6 +338,15 @@ table's `add esp,N` matched against the epilogue `fixup_chunk` actually got from
 this link (`b` 16 and `d` 8 with a plain `ret`; 8 and 0 with a `ret 8`; `c` calls
 nothing so it has no add to match).
 
+The two paths are not equally quiet about the same source, and that is a flag
+difference, not a code difference: `build.py` passes `/D_CRT_SECURE_NO_WARNINGS`
+and compiles with `/W3`, so it prints nothing about this file's `fopen` calls,
+while the CMake preset carries no warning-level or deprecation flags at all and
+answers one `C4996` line per `fopen` in the source — four of them now, three in
+sv12. `ClassicAPI`'s own `CMakeLists.txt` sets neither flag either, so the list
+here stays the honest one and the notes are read as what they are: the deprecation
+nag, on calls whose behaviour `verify_dll.py` and the runs both confirm.
+
 ## Install
 
 1. Install VanillaFixes if it isn't already.
@@ -350,7 +359,10 @@ nothing so it has no add to match).
    way.
 5. Launch the game with `VanillaFixes.exe`.
 
-Swapping shadow sets is one file: replace `shadowmaps.dat` and restart. The
+There is no mode file to write and no logging decision to make: with only the two files
+above, the mod installs the full rung and `shadow-mod.log.txt` gets one line per launch —
+see the Logging section for what that line is and for what a `v` in a `shadow-mod.mode`
+adds. Swapping shadow sets is one file: replace `shadowmaps.dat` and restart. The
 `.dll` never changes between sets.
 
 `Load` answers VanillaFixes with ClassicAPI's convention: **0 = installed**,
@@ -391,13 +403,14 @@ build chose, so an off-by-eight is a build failure, not an in-game crash.
 
 ## What this machine produces
 
-`out\ShadowMaps.dll` 144,896 bytes and `build\Release\ShadowMaps.dll` 146,432
-bytes, both i686, both exporting `Load`, both importing only `KERNEL32.dll`,
-both accepted by `verify_dll.py` with zero complaints — i.e. the stub's stack
-math is read from real linked code, not from a comment.
+`out\ShadowMaps.dll` 146,944 bytes and `build\Release\ShadowMaps.dll` 147,968
+bytes, both i686, both exporting `Load` (at RVA `0x2530` and `0x2760`), both
+importing only `KERNEL32.dll`, both accepted by `verify_dll.py` with zero
+complaints — i.e. the stub's stack math is read from real linked code, not from
+a comment.
 
-What sits in the game folder today is the shipping trio: `ShadowMaps.dll` (the
-sv12 image, 146,432 bytes), `shadow-mod.mode` (`f`) and `shadowmaps.dat` — now the
+What sits in the game folder today is the shipping **pair**: `ShadowMaps.dll` (the
+sv13 image, 147,968 bytes) and `shadowmaps.dat` — now the
 multi-map file: 21,797,872 bytes, `SHDW` v1, `mapCount 12`, header map word `MULTI`,
 variant `patch-S`, 76,547 entries, 40,779 payloads (20,878,848 payload bytes), 309 tiles,
 and `124 + 12*28 + 76547*12 + 20878848 == filesize`, its 12 runs being Azeroth 38,257,
@@ -414,6 +427,13 @@ re-tested by renaming back) and `shadowmaps-Kalimdor.dat` (7,818,452 bytes, Kali
 8-byte rule, which is the point of `mapCount 0`: swapping between the two shapes is one
 file rename, no rebuild.
 
+There is **no `shadow-mod.mode` in the folder**, which is the whole point of the sv13 image
+sitting there: the state being tested is the state a user gets, and a launch from it writes
+one line. Beside it are `shadow-mod.log.txt` (1,575,875 bytes, what sv10 and sv12 left, and
+what the next load's `TrimLogFile` rewrites as one banner line plus its newest 64 KB) and
+`shadow-mod.log.sv12.txt`, the whole file copied aside so none of those runs' evidence is
+lost. Writing `f v` into `shadow-mod.mode` brings back the whole trail the block below shows.
+
 The log walkthrough below was made with the **morning** set's legacy `.dat`
 (34,918,204 bytes, `mapCount 0`, map `Azeroth`, variant `shadows-Azeroth-morning`,
 114,328 entries, 66,413 payloads, 487 tiles in `(22,22)..(44,60)`, chunk grid
@@ -424,7 +444,12 @@ Expected log lines, in `shadow-mod.log.txt` next to the DLL. The loader's own
 lines carry the build stamp, so an old DLL is never read as a new one. A refusal
 line is the whole story of a run that did not install, and VanillaFixes answers
 any non-zero `Load` with its own generic `was not loaded properly (load
-function failed)` popup — that popup is never the reason, this file is:
+function failed)` popup — that popup is never the reason, this file is. The block
+below is sv10's real runs, which had no levels; it is what an sv13 run prints once
+its mode file carries a `v` (or runs a rung other than `f`), and it is more than an
+sv13 launch from the shipping state prints — that one writes its install line and nothing
+else unless something went wrong, and the install line says which of the two levels ran,
+so a one-line log is never mistaken for a broken one; see the Logging section:
 
 ```
 [12 ms after this DLL was loaded] sv10 mode 'h' read from 'G:\Games\twmoa_1181\shadow-mod.mode' (no such file means f): n = inert, a = .dat plus arena, no hook, b = hook plus an empty call, c = the detour alone with no call at all, d = the same call from the client's own frame at 0x6AF5F3, h = hook plus audit, no payload, f = full
@@ -493,21 +518,60 @@ was never written to, and the sv10 mode-`h` run printed them whole: all eight
 slots resolved on their own fourcc, beside a record size that is exactly where
 the next `MCNK` sits.
 
-## Mode ladder (sv10 ladder, sv12 build)
+## Logging (sv13)
+
+Two levels, one file, one writer, and the quiet one is what ships: **no `shadow-mod.mode`
+file at all** means mode `f` with quiet logging, and a launch that worked writes exactly
+**one** line — its install line, naming the `.dat`'s runs, the arena, the hook and the fact
+that logging is quiet. `shadow-mod.mode` is not part of the shipping pair above, it is the
+debug switch, and a `v` in it is the half that turns the rest of the log on.
+
+Always written, whatever the mode:
+
+- one line per thing that **went wrong**: every refusal (client build mismatch, no or
+  malformed or wrong-size `.dat`, out of memory), the mode-`n` line, a client map the payload
+  has no run for, and the field contract moving under a shadow write — the things a player
+  would otherwise see nothing about, since all they notice is stock shadows.
+- the exception instrument's capture of a launch that was already dying: its `ACCESS_VIOLATION`
+  line and the two object/header dumps. They only ever fire on a run that crashed anyway, so
+  keeping them on the always level costs a clean launch nothing, and a crash stays diagnosable
+  at any level.
+
+Diagnostic level, turned on by a `v` **anywhere** in the mode file (`f v` = the shipping rung
+with the whole trail sv12 printed) and turned on by itself for every rung but `f`, since
+walking the ladder means the log is what you are reading: the long mode legend, the `b`/`c`/`d`/`h`
+install lines, the handler-registration lines, the first-chunk audit block, the per-chunk
+`last chunk seen` dump and its cap line, `first fixup call`, `first chunk matched`, the
+no-payload line and the progress lines.
+
+`TrimLogFile` runs once per process, before the mode file is read: past `LOG_MAX_BYTES` 512 KB
+the file is rewritten as one banner line — naming both sizes and how many bytes of the old
+file it kept — plus its newest `LOG_KEEP_BYTES` 64 KB, cut at the next newline rather than
+mid-line. Under the limit the file is left whole, so a previous launch's lines are still there
+to compare a new run against. That is what stops a session of verbose launches from leaving a
+log the size of the session: the 1.5 MB the sv10 and sv12 runs left is cut on the next load.
+
+## Mode ladder (sv10 ladder, sv13 build)
 
 Five rungs of the ladder have been run on the real client — `c` and `d` on the sv9
 build, `h`, `f` and `b` on this one — and the shipping path works.
 
-The ladder did not move between sv10, sv11 and sv12: same seven rungs, same stub shapes,
-same 5-byte store and resume points, same `MCNK` header writes, so every fact in the
-table below is sv10's real runs and reads the same from an sv11 or sv12 log — the stamp
-slot just says `sv12`. What sv11 changed is only the `.dat`'s chunk addressing above, and
-what sv12 changed is only where the payload-area read seeks (the paragraph above). `verify_dll.py`
-accepts both sv12 images with the same three detour tables at the same sizes (`b` 36, `c` 12,
-`d` 29), the same `add esp` pairing and the same plain-`ret` `fixup_chunk` epilogue. What an
-sv11 run of this file showed in game: shadows came on the ground, but every chunk's was the
-mix that paragraph above describes — mirrored-and-rotated shapes in about the right places —
-so the hook, the header write and the run gate all ran and only the arena's fill was wrong.
+The ladder did not move between sv10, sv11, sv12 and sv13: same seven rungs, same stub shapes,
+same 5-byte store and resume points, same `MCNK` header writes, so every fact in the table
+below is sv10's real runs and reads the same from an sv11, sv12 or sv13 log — the stamp
+slot just says `sv13`. What sv11 changed is only the `.dat`'s chunk addressing above, what
+sv12 changed is only where the payload-area read seeks, and what sv13 changed is only which
+level each line is written at: the rungs, their writes and their bytes are untouched, so a
+ladder rung prints the same lines it printed in sv10 as long as its mode file carries a `v`.
+`verify_dll.py` accepts both sv13 images with the same three detour tables at the same sizes
+(`b` 36, `c` 12, `d` 29), the same `add esp` pairing and the same plain-`ret` `fixup_chunk`
+epilogue. What an sv11 run of this file showed in game: shadows came on the ground, but every
+chunk's was the mix that paragraph above describes — mirrored-and-rotated shapes in about the
+right places — so the hook, the header write and the run gate all ran and only the arena's fill
+was wrong. An sv12 run of the same file has been done, and it answered what that left open: the
+twelve-run set entered the world and drew its shadows, and the ground matched the legacy cut it
+replaced. What has not been re-run since is the ladder on an sv13 image, which is what the `v`
+in the commands below is for.
 An sv12 run of the same file has not been done yet.
 
 sv9's `c` (the store and landing at `0x6AF5F0`, a landing that **calls
@@ -548,7 +612,8 @@ one rung that must not print it.
 
 Seven rungs, the first letter of a `shadow-mod.mode` file **next to the DLL** (next
 to `ShadowMaps.dll` and `shadowmaps.dat`, not next to the sources). A missing file
-means `f`.
+means `f` with quiet logging — the shipped state — and a `v` anywhere in the file turns
+the diagnostic lines on, which every rung but `f` does by itself.
 
 | Letter | What runs | What it separates |
 | --- | --- | --- |
@@ -625,21 +690,24 @@ low enough that the whole first screen of loading prints, high enough that the l
 stays readable.
 
 Read the rungs in order and stop at the first one that changes the outcome.
-Delete `shadow-mod.log.txt` between rungs: the log is appended and every line is
-stamped with milliseconds **since this DLL was loaded**, so a fresh run's block
-starts near 0 — but only a fresh file makes the blocks obvious. `GetTickCount`
+Delete `shadow-mod.log.txt` between rungs to make each run's block obvious: the log
+is appended and every line is stamped with milliseconds **since this DLL was loaded**,
+so a fresh run's block starts near 0. Deleting is no longer *required* — sv13's
+`TrimLogFile` cut the 1.5 MB these runs left to its newest 64 KB on the next load —
+but it is still the clearest way to read one run at a time. The `v` in the commands
+below is sv13's: it puts the diagnostics on for a mode-`f` run, and every other rung
+turns them on by itself, so these lines printed in sv9 and sv10 without it. `GetTickCount`
 counts milliseconds since the **system** booted, which is why an older log's raw
 numbers look like hours and cannot be used to count client starts.
 
 ```
-echo n > G:\Games\twmoa_1181\shadow-mod.mode      # ran: clean
-del G:\Games\twmoa_1181\shadow-mod.log.txt        # between rungs
-echo a > G:\Games\twmoa_1181\shadow-mod.mode      # ran: clean
-echo c > G:\Games\twmoa_1181\shadow-mod.mode      # ran (sv9): clean, entered the world
-echo d > G:\Games\twmoa_1181\shadow-mod.mode      # ran (sv9): clean, entered the world
-echo h > G:\Games\twmoa_1181\shadow-mod.mode      # ran (sv10): clean, printed the audit
-echo f > G:\Games\twmoa_1181\shadow-mod.mode      # ran (sv10): drew the baked set
-echo b > G:\Games\twmoa_1181\shadow-mod.mode      # ran (sv8, sv10): crashed by its jmp eax
+echo n  > G:\Games\twmoa_1181\shadow-mod.mode     # ran: clean
+echo a v > G:\Games\twmoa_1181\shadow-mod.mode    # ran: clean
+echo c v > G:\Games\twmoa_1181\shadow-mod.mode    # ran (sv9): clean, entered the world
+echo d v > G:\Games\twmoa_1181\shadow-mod.mode    # ran (sv9): clean, entered the world
+echo h v > G:\Games\twmoa_1181\shadow-mod.mode    # ran (sv10): clean, printed the audit
+echo f v > G:\Games\twmoa_1181\shadow-mod.mode    # ran (sv10): drew the baked set
+echo b v > G:\Games\twmoa_1181\shadow-mod.mode    # ran (sv8, sv10): crashed by its jmp eax
 ```
 
 | What the run shows | What it means |
@@ -668,13 +736,19 @@ that ships rides this shape** |
 
 ## Honest limits
 
-- **The shipping path is confirmed in game: sv10's mode `f` loaded the world and drew the
-  baked morning set**, with `fixup: first chunk matched: gy 517 gx 448 key 529856, shadow
-  drawn from arena+0` in the log and the shadows visible on the ground. What has *not* been
-  checked is every chunk: that run walked the chunks around one spawn point, so it matched
-  fewer than the `.dat`'s 114,328 entries — it never reached a `10000 chunks matched so far`
-  line — and its per-chunk dump hit the 2000-chunk cap. A whole-continent walk is still only
-  implied by the coverage the `.dat` states (487 tiles, chunk grid `(352,352)..(707,975)`)
+- **The shipping path is confirmed in game twice: sv10's mode `f` loaded the world and drew
+  the baked morning set** (legacy single-map `.dat`, 114,328 entries), with `fixup: first chunk
+  matched: gy 517 gx 448 key 529856, shadow drawn from arena+0` in the log and the shadows visible
+  on the ground — and the **sv12 image on the twelve-run multi-map file loaded the world and drew
+  its shadows, matching the legacy cut it replaced**, so the map table, the run gate and the 12-byte
+  entries are proven in game too. What has *not* been checked in either run is every chunk: each
+  walked the chunks around one spawn point, so neither matched all of its file's entries, neither
+  reached a `10000 chunks matched so far` line, and both hit the 2000-chunk per-chunk cap. A whole-
+  continent walk is still only implied by the coverage the `.dat` states (487 tiles in the morning
+  set, chunk grid `(352,352)..(707,975)`; 309 tiles in the folder's `patch-S` file)
+- **The sv13 image's own in-game run has not been done yet** — it is the same hook, the same stub
+  shapes, the same writes and the same `.dat` as the sv12 image that did run, plus one level switch
+  in the writer and one log trim at load, so what is unproven about it is those two, not the contract
 - **The crash every earlier build produced is now fully explained, and it was never in the
   `.adt`.** Every hooked run died at `0x6B0FB7`, the `mov ecx,[ebx]` that reads the MCVT
   floats, reading `0x6CF97F32` while `this` moved. The sv10 mode-`b` handler dump names the

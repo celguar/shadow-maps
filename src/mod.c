@@ -74,6 +74,26 @@
  * over the head of the next. A legacy file has mapCount 0, so rec_bytes is 0
  * and both reads agree: that is why nothing older than the multi-map shape
  * ever showed this. One seek changed.
+ *
+ * What sv13 adds: the diagnostics behind a letter, so the log stops growing.
+ *   Shipping is the default, and it is the state users get: no shadow-mod.mode
+ *   file at all means mode f with quiet logging, and a run that worked writes
+ *   ONE line, its install line naming the .dat, the arena, the hook and the
+ *   logging level. Lines that say something went wrong stay on that level in
+ *   every mode: a refusal (wrong client build, missing or malformed .dat, out
+ *   of memory), the field contract moving under the shadow write, a client map
+ *   the payload has no run for, and the exception instrument's capture of a
+ *   launch that was already dying -- those are the things a player would
+ *   otherwise see nothing about. The audit block, the per-chunk header dump,
+ *   the first-match and progress lines and the long mode legend move to the
+ *   diagnostic level, which a v anywhere in the mode file turns on ("f v" is
+ *   the full run with sv12's whole trail), and which every rung but f turns on
+ *   by itself, since walking the ladder means the log is what you are reading.
+ *   TrimLogFile at load cuts the file to its newest 64 KB once it is past 512
+ *   KB, on a line boundary rather than mid-line, so a verbose run cannot leave
+ *   a file the size of the session and the previous launch's lines are still
+ *   there to compare a new run against.
+ *
  * runs came back with their install lines and no new crash: mode a (the whole
  * 34 MB arena resident, no hook), mode c (the store and landing at 0x6AF5F0,
  * no call) and mode d (the call with its arguments read from [ebp+8] on the
@@ -162,7 +182,7 @@
 #include <string.h>
 #include "../shadow_dat.h"
 
-#define STAMP "sv12" /* build stamp, printed in every log line: an old build of
+#define STAMP "sv13" /* build stamp, printed in every log line: an old build of
                      * this DLL sitting next to a new .dat is the most common
                      * confusion, so the line says which build made it, and the
                      * mode line below names which of the seven rungs ran. sv11
@@ -171,9 +191,11 @@
                      * at, and neither touches the hook, the stubs or the writes
                      * -- so an sv10, sv11 or sv12 log line means the same thing
                      * about the hook and differs only in which .dat shape built
-                     * it. sv11's multi-map run drew the WRONG payloads (see the
-                     * note at the top of this file), so a mirrored-and-rotated
-                     * ground under an sv11 line is that seek, not the bake. */
+                     * it. sv13 changes neither the hook nor the format: it moves
+                     * the diagnostics behind a letter, so an sv13 log is nearly
+                     * empty by default and holds sv12's lines once the mode file
+                     * carries a v. A mirrored-and-rotated ground under an sv11
+                     * line is that seek, not the bake. */
 
 /* ---------------------------------------------------------------- pinned **/
 
@@ -275,6 +297,14 @@ static const char *k_table_cc[] = {"MCVT", "MCNR", "MCLY", "MCRF", "MCAL",
  * directly, so this is now only a trail that says how far the walk got, and
  * 2000 lines is enough for that without a log the size of the run */
 #define AUDIT_LOG_MAX 2000u
+/* sv13 keeps the log bounded so several launches cannot leave a file the size of
+ * the run: at load, a log already past LOG_MAX_BYTES is cut to its newest LOG_KEEP
+ * _BYTES, and the cut starts at a newline so a line is never split in half. A log
+ * under LOG_MAX_BYTES is left whole, which is what keeps the previous launch's one
+ * quiet line there to read. 2000 audit lines are ~600 KB on their own, so a
+ * verbose run still grows inside one launch and is cut at the start of the next */
+#define LOG_MAX_BYTES  (512u * 1024u)
+#define LOG_KEEP_BYTES (64u * 1024u)
 
 /* ------------------------------------------------------- runtime state ***/
 
@@ -330,6 +360,11 @@ static size_t ReadBlock(FILE *f, void *p, size_t n)
     return fread(p, 1u, n, f);
 }
 
+/* one-shot log flags, fixup is hot: each of these prints at most one line per
+   * run. sv13 splits them by level: g_log_mismatch (this map has no run in the
+   * payload) and g_log_field (the write moved something) stay on the always-
+   * written level because both say why the ground looks stock; the rest are the
+   * diagnostic level and are only ever set when the diagnostics are on */
 static int g_log_mismatch;            /* one-shot log flags, fixup is hot   */
 static int g_log_nomatch;
 static int g_log_first;
@@ -340,6 +375,10 @@ static unsigned g_audit_seen;         /* per-chunk header dumps logged so far */
 static int g_silent;                  /* mode b: the call returns before doing
                                           anything at all, file I/O included */
 static char g_mode = 'f';             /* the mode letter, see ReadModeFile     */
+static int g_verbose;                 /* sv13: the diagnostic level is on. Set by
+                                         ReadModeFile from a v in the mode file and
+                                         forced on by every rung but f, so a shipping
+                                         run (no file at all) keeps it off */
 static int g_allow_write;             /* only mode f lets fixup_chunk write    */
 static int g_diagnostic;              /* installed nothing on purpose: Load returns 4 */
 
@@ -363,7 +402,9 @@ static DWORD WINAPI DyingChunkHandler(PEXCEPTION_POINTERS info);
  * earlier read of this file went wrong, attributing lines to eleven starts.
  * ms-since-load restarts at 0 in every process, so a run's block is obvious and
  * the stamp plus the mode letter names both the build and the rung that made
- * the line. The user is asked to delete the log between the rungs anyway. */
+ * the line. sv13 no longer asks the user to delete the file between runs: the
+ * default writes one line per launch, and TrimLogFile below cuts the file to its
+ * newest bytes at load once a verbose run left it big. */
 static void LogMsg(const char *text)
 {
     FILE *f = fopen(g_logPath, "a");
@@ -374,13 +415,88 @@ static void LogMsg(const char *text)
     fclose(f);
 }
 
-/* sv7's mode letter: the first non-blank character of <dir>\shadow-mod.mode,
- * lower-cased, and only n/a/b/c/d/h/f are honoured -- an unreadable, empty or
- * junk file means f, so forgetting the file gives the full path, never a silent
- * no-op. A mode FILE rather than several DLLs is what lets the user walk README
- * .md's ladder by editing one letter, with no rebuild between the steps and no
- * risk of shipping an old DLL for the wrong step (every log line still names
- * the build stamp and the mode that ran). */
+/* sv13's two levels, both writing through that one writer. LogMsg is the level a
+ * shipping user can ever see, and it is deliberately only about things that need
+ * a reader: the install line that says what the DLL loaded and patched, every
+ * refusal (wrong client build, missing or malformed .dat, out of memory, the
+ * field contract moving), the mode-n line, and the exception instrument's
+ * capture, which only ever runs on a launch that was already dying. LogVerb is
+ * the diagnostic level: the audits, the per-chunk header dump, the first-match
+ * and progress lines, the long mode legend and the ladder rungs' own verdicts,
+ * i.e. everything that exists to be read against the client rather than watched
+ * while playing. A good mode-f run with no mode file writes ONE line, so the log
+ * stays a few hundred bytes across launches instead of the ~600 KB the 2000
+ * audit lines used to cost every launch. */
+static void LogVerb(const char *text)
+{
+    if (!g_verbose)
+        return;
+    LogMsg(text);
+}
+
+/* Called once per process, before the mode file is read: a log already past LOG_
+ * MAX_BYTES is cut to its newest LOG_KEEP_BYTES. Both tables stay, the bytes in
+ * the middle are what grew. The window is read into memory, then the file is
+ * rewritten as one banner line plus the whole lines that survive, so the cut never
+ * starts in the middle of a line and the newest run's evidence is still readable.
+ * A log under the limit is left alone, which keeps the previous launch's quiet
+ * install line in the file to compare against. */
+static void TrimLogFile(void)
+{
+    FILE *f;
+    long size;
+    unsigned char *buf;
+    size_t got, start;
+
+    f = fopen(g_logPath, "rb");
+    if (!f)
+        return;
+    fseek(f, 0, SEEK_END);
+    size = ftell(f);
+    if (size < 0 || (unsigned long)size <= LOG_MAX_BYTES) {
+        fclose(f);
+        return;
+    }
+    buf = (unsigned char *)malloc(LOG_KEEP_BYTES);
+    if (!buf) {
+        fclose(f);
+        return;
+    }
+    fseek(f, (long)((unsigned long)size - LOG_KEEP_BYTES), SEEK_SET);
+    got = ReadBlock(f, buf, LOG_KEEP_BYTES);
+    fclose(f);
+    start = 0;
+    while (start < got && buf[start] != '\n')
+        ++start;
+    if (start < got)
+        ++start; /* the bytes up to and including this newline are the partial
+                   * line the window cut in half: keep from the next one */
+    f = fopen(g_logPath, "wb");
+    if (!f) {
+        free(buf);
+        return;
+    }
+    fprintf(f, "[%u ms after this DLL was loaded] sv13 shadow-mod.log.txt was %u"
+               " bytes at load, past the %u byte limit: the newest %u bytes are"
+               " kept, older lines are gone\n",
+            (unsigned)(GetTickCount() - g_t0), (unsigned)size,
+            (unsigned)LOG_MAX_BYTES, (unsigned)got);
+    if (got > start)
+        fwrite(buf + start, 1, got - start, f);
+    fclose(f);
+    free(buf);
+}
+
+/* sv13's mode file: <dir>\shadow-mod.mode may name both the rung and the logging
+ * level. The FIRST letter that is one of n/a/b/c/d/h/f is the rung, and a v
+ * anywhere in the file turns the diagnostics on, so "f" ships quietly and "f v"
+ * (or "v f") is the same full run with sv12's whole trail. Letters are lower-
+ * cased, blanks skipped and anything else ignored. A missing, empty or junk file
+ * means f with quiet logging: shipping is the default, so users get no file at
+ * all, and the file is what a debug session adds. A rung other than f implies
+ * verbose -- those rungs exist to be read against the client, so walking the
+ * README ladder does not have to remember the v, and every ladder log keeps
+ * saying the same thing an sv10..sv12 ladder log said. */
 static char ReadModeFile(void)
 {
     char path[MAX_PATH];
@@ -398,10 +514,16 @@ static char ReadModeFile(void)
             continue;
         if (c >= 'A' && c <= 'Z')
             c += 32;
+        if (c == 'v') {
+            g_verbose = 1;
+            continue;
+        }
         if (c == 'n' || c == 'a' || c == 'b' || c == 'c' || c == 'd'
-            || c == 'h' || c == 'f')
-            m = (char)c;
-        break;
+            || c == 'h' || c == 'f') {
+            if (!m)
+                m = (char)c; /* the first rung letter wins; later ones are junk
+                               * the file cannot mean */
+        }
     }
     fclose(f);
     return m ? m : 'f';
@@ -450,7 +572,9 @@ static void FourccAt(const unsigned char *p, char *out)
  * is byte-reversed against ASCII -- an MCNK record reads 'KNCM' here, and that
  * is the same reversed spelling top_chunks() in extract_shadowmaps.py uses on
  * disk. A slot of 0 means the .adt carries no such sub-record; a value too big
- * to be inside one record is printed but never dereferenced. */
+ * to be inside one record is printed but never dereferenced. sv13: the whole
+ * audit is on the diagnostic level, so a shipping run prints none of it and a
+ * mode file with a v prints the same block sv10..sv12 printed. */
 static void AuditHeader(const void *record_, const char *who)
 {
     const unsigned char *hdr;
@@ -469,7 +593,7 @@ static void AuditHeader(const void *record_, const char *who)
              who, (unsigned)(size_t)rec, cc, ((const unsigned *)rec)[1],
              (unsigned)(size_t)hdr, ((const unsigned *)hdr)[0],
              ((const unsigned *)hdr)[1], ((const unsigned *)hdr)[2]);
-    LogMsg(line);
+    LogVerb(line);
 
     for (i = 0; i < TABLE_COUNT; ++i) {
         v = ((const unsigned *)(hdr + k_table_ofs[i]))[0];
@@ -487,7 +611,7 @@ static void AuditHeader(const void *record_, const char *who)
                  " '%s'",
                  who, k_table_cc[i], k_table_ofs[i], v,
                  (unsigned)(size_t)(hdr + v), cc);
-        LogMsg(line);
+        LogVerb(line);
     }
 }
 
@@ -628,7 +752,10 @@ static DWORD WINAPI DyingChunkHandler(PEXCEPTION_POINTERS info)
  * here rather than called through a header for the reason above. CALL_FIRST (1)
  * is what makes it first in the vectored chain, i.e. asked before the SEH
  * handlers the client's own modules carry, which is the only way to see the
- * fault before something else swallows it. */
+ * fault before something else swallows it. sv13: the lines about REGISTERING are
+ * diagnostic level, so a shipping run does not print that the instrument is up;
+ * the lines the handler itself writes when a launch dies are always on, which is
+ * what keeps a crash diagnosable whatever the level is. */
 static void InstallHandler(void)
 {
     HMODULE k;
@@ -638,12 +765,12 @@ static void InstallHandler(void)
 
     k = GetModuleHandleA("kernel32.dll");
     if (k == NULL) {
-        LogMsg(STAMP " handler: no kernel32 to resolve AddVectoredExceptionHandler from, the dying-chunk instrument stays off");
+        LogVerb(STAMP " handler: no kernel32 to resolve AddVectoredExceptionHandler from, the dying-chunk instrument stays off");
         return;
     }
     adder = (PFN_ADDVEH)GetProcAddress(k, "AddVectoredExceptionHandler");
     if (adder == NULL) {
-        LogMsg(STAMP " handler: kernel32 does not export AddVectoredExceptionHandler, the dying-chunk instrument stays off");
+        LogVerb(STAMP " handler: kernel32 does not export AddVectoredExceptionHandler, the dying-chunk instrument stays off");
         return;
     }
     tag = adder(1u, DyingChunkHandler);
@@ -651,11 +778,11 @@ static void InstallHandler(void)
         snprintf(msg, sizeof msg, STAMP " handler: AddVectoredExceptionHandler refused"
                  " (GetLastError %#x), the dying-chunk instrument stays off",
                  GetLastError());
-        LogMsg(msg);
+        LogVerb(msg);
         return;
     }
     g_handler_on = 1;
-    LogMsg(STAMP " handler: first-chance vectored handler registered, so the next access violation logs the chunk that was being built and the address the client read (the client's own report is still written afterwards)");
+    LogVerb(STAMP " handler: first-chance vectored handler registered, so the next access violation logs the chunk that was being built and the address the client read (the client's own report is still written afterwards)");
 }
 
 /* ---------------------------------------------------- the per-chunk fix **/
@@ -692,13 +819,13 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
      * entered the world cleanly -- mode c emits no landing call, so mode c
      * never prints it, and a mode c run that printed everything except this is
      * exactly what a working store and a working landing look like. */
-    if (!g_first_call) {
+    if (g_verbose && !g_first_call) {
         g_first_call = 1;
         snprintf(msg, sizeof msg,
                  STAMP " first fixup call: this %#x record %#x after %#u visits, mode %c -- the hooking rungs print this once, mode c never does",
                  (unsigned)(size_t)self_, (unsigned)(size_t)record_,
                  (unsigned)g_chunk_visits, g_mode);
-        LogMsg(msg);
+        LogVerb(msg);
     }
 
     if (!g_ready || !self_ || !record_)
@@ -721,8 +848,9 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
      * MCVT cursor was unreadable on a chunk this DLL never matched, so the
      * first thing to settle is what its header actually holds in this client.
      * It is audited in EVERY mode that hooks, so the same block of lines is
-     * what mode h and mode f print. */
-    if (!g_log_audit) {
+     * what mode h and mode f print -- sv13: with the diagnostics on, which is
+     * automatic for h and needs a v in the mode file for f. */
+    if (g_verbose && !g_log_audit) {
         g_log_audit = 1;
         AuditHeader(record_, "first chunk");
     }
@@ -736,8 +864,12 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
      * cursor is the last one this DLL saw, and the line says whether hdr+0x14
      * really held the .adt's own small ofs (then the cursor in the object was
      * moved by something other than this DLL) or a big value already (then the
-     * header the client has is not the header the .adt file has). */
-    if (g_audit_seen < AUDIT_LOG_MAX) {
+     * header the client has is not the header the .adt file has). sv13: this
+     * dump is on the diagnostic level, so the quiet path skips the block whole
+     * rather than formatting 300 characters per chunk and dropping them, and
+     * what names a dying chunk on the quiet level is the exception handler, not
+     * this line's tail. */
+    if (g_verbose && g_audit_seen < AUDIT_LOG_MAX) {
         ++g_audit_seen;
         hdr = (unsigned char *)record_ + 8;
         snprintf(msg, sizeof msg,
@@ -759,14 +891,14 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
                  ((const unsigned *)(hdr + 0x60u))[0],
                  ((const unsigned *)((char *)self_ + FIELD_GLOBAL_COL))[0],
                  ((const unsigned *)((char *)self_ + FIELD_GLOBAL_ROW))[0]);
-        LogMsg(msg);
+        LogVerb(msg);
         if (g_audit_seen == AUDIT_LOG_MAX) {
             snprintf(msg, sizeof msg,
                      "per-chunk header dump cap reached (%u chunks): no more of these"
                      " lines will be written, so a chunk that dies after this point"
                      " is not named by one -- raise AUDIT_LOG_MAX to see further",
                      (unsigned)AUDIT_LOG_MAX);
-            LogMsg(msg);
+            LogVerb(msg);
         }
     }
 
@@ -828,12 +960,12 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
             hi = mid - 1;
     }
     if (hit < 0) {
-        if (!g_log_nomatch) {
+        if (g_verbose && !g_log_nomatch) {
             g_log_nomatch = 1;
             snprintf(msg, sizeof msg,
                      "fixup: first chunk with no payload: gy %u gx %u key %u (the bake left it without a shadow map, or its tile is not in this set)",
                      gy, gx, key);
-            LogMsg(msg);
+            LogVerb(msg);
         }
         return;
     }
@@ -842,7 +974,7 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
      * record's start, the header fields start after it (0x6AF970: lea
      * edx,[eax+8]). ofsMCSH is relative to hdr, and the game resolves every
      * sub-record as hdr + ofs, so hdr + ofs lands in the arena. */
-    if (!g_log_first)
+    if (g_verbose && !g_log_first)
         AuditHeader(record_, "first matched");
     hdr = (unsigned char *)record_ + 8;
     for (i = 0; i < PROBE_COUNT; ++i)
@@ -892,15 +1024,21 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
     /* one progress line every 10000 matched chunks, capped at 60 lines: cheap
      * enough for a path that runs once per loaded chunk, and it is the in-game
      * evidence that the arena is what is being drawn (g_entryCount is the
-     * ceiling, so the last line under it names the tiles the set does not cover) */
-    if ((g_hits % 10000u) == 0u && g_log_hits < 60) {
+     * ceiling, so the last line under it names the tiles the set does not
+     * cover). sv13: diagnostic level, so the shipping run writes none of them
+     * and never takes the modulo either */
+    if (g_verbose && (g_hits % 10000u) == 0u && g_log_hits < 60) {
         ++g_log_hits;
         snprintf(msg, sizeof msg, "fixup: %u chunks matched so far, of %u entries",
                  (unsigned)g_hits, g_entryCount);
-        LogMsg(msg);
+        LogVerb(msg);
     }
 
-    if (!g_log_first) {
+    /* the one line that says the write landed and where in the arena the
+     * payload came from -- sv13: diagnostic level, so the shipping run's
+     * evidence that shadows were drawn is what the ground shows, and this
+     * line is what a debug session reads with a v in the mode file */
+    if (g_verbose && !g_log_first) {
         g_log_first = 1;
         snprintf(msg, sizeof msg,
                  "fixup: first chunk matched: gy %u gx %u key %u, shadow drawn"
@@ -920,7 +1058,7 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
                  ((const unsigned *)(hdr + 0x24u))[0],
                  ((const unsigned *)(hdr + 0x58u))[0],
                  ((const unsigned *)(hdr + 0x60u))[0]);
-        LogMsg(msg);
+        LogVerb(msg);
     }
 }
 
@@ -1296,23 +1434,35 @@ static int Install(void)
     int fresh; /* the entry loop: 1 at a run's first entry */
     unsigned char *arena;
     unsigned char *site = (unsigned char *)(size_t)ADDR_LOAD;
-    char msg[512];
+    char msg[1024]; /* sv13's mode-f line now also names the logging level, so
+                      * the longest line Install writes is a little longer; snprintf
+                      * caps at the buffer either way */
 
     snprintf(g_datPath, sizeof g_datPath, "%s\\shadowmaps.dat", g_dir);
     snprintf(g_logPath, sizeof g_logPath, "%s\\shadow-mod.log.txt", g_dir);
 
+    /* sv13 trims the log before anything of this run is written to it, so a
+     * launch that follows a verbose one cannot leave a file the size of the run */
+    TrimLogFile();
+
     /* the mode first, before anything else can happen: the letter decides how
      * much of this function runs at all, and the line names it so a log can
      * never be read as "which DLL did this" again -- stamp plus mode, on every
-     * step */
+     * step. sv13 adds the level: a v anywhere in the same file turns the
+     * diagnostics on, and every rung but f is a ladder step, whose whole point
+     * is the log, so its diagnostics come on whether or not the file says v.
+     * No file at all means f and quiet logging, which is what ships. */
     g_mode = ReadModeFile();
+    if (g_mode != 'f')
+        g_verbose = 1;
     snprintf(msg, sizeof msg,
              STAMP " mode '%c' read from '%s\\shadow-mod.mode' (no such file means f): n = inert, a = .dat plus"
              " arena, no hook, b = hook plus an empty call, c = the detour alone"
              " with no call at all, d = the same call from the client's own frame"
-             " at 0x6AF5F3, h = hook plus audit, no payload, f = full",
+             " at 0x6AF5F3, h = hook plus audit, no payload, f = full; a v"
+             " anywhere in the file also turns the diagnostic lines on",
              g_mode, g_dir);
-    LogMsg(msg);
+    LogVerb(msg);
 
     if (g_mode == 'n') {
         /* the inert rung: the .dat is not opened, nothing is allocated, the
@@ -1364,7 +1514,7 @@ static int Install(void)
                  " no chunk header read or touched (shadows stay stock;"
                  " this mode exists to test the store and the landing alone)",
                  (unsigned)(size_t)g_stub);
-        LogMsg(msg);
+        LogVerb(msg);
         return 1;
     }
 
@@ -1390,7 +1540,7 @@ static int Install(void)
                  " read, nothing allocated, no chunk header read or touched (shadows"
                  " stay stock; this mode exists to test the stub's argument lookup)",
                  (unsigned)(size_t)g_stub);
-        LogMsg(msg);
+        LogVerb(msg);
         return 1;
     }
 
@@ -1420,7 +1570,7 @@ static int Install(void)
                  " allocated, no chunk header read or touched (shadows stay stock;"
                  " this mode exists to test the stub alone)",
                  (unsigned)(size_t)g_stub);
-        LogMsg(msg);
+        LogVerb(msg);
         return 1;
     }
 
@@ -1447,7 +1597,7 @@ static int Install(void)
                  " chunk whole and dumps every chunk's ofss -- no .dat read, nothing"
                  " allocated, no chunk header touched (shadows stay stock)",
                  (unsigned)(size_t)g_stub);
-        LogMsg(msg);
+        LogVerb(msg);
         return 1;
     }
 
@@ -1756,7 +1906,7 @@ static int Install(void)
             }
         }
     }
-    LogMsg(msg);
+    LogVerb(msg);
 
     if (g_mode == 'a') {
         snprintf(msg, sizeof msg,
@@ -1772,14 +1922,17 @@ static int Install(void)
                  (unsigned)(head.payloadBytes / (1024u * 1024u)),
                  (unsigned)(size_t)arena,
                  (unsigned)(size_t)((size_t)arena + (size_t)head.payloadBytes));
-        LogMsg(msg);
+        LogVerb(msg);
         g_diagnostic = 1;
         return 1;
     }
 
     /* mode f: hook plus writes, the only rung that is expected to draw -- and the
      * sv10 run of it did: the world loaded, the baked morning set showed on the
-     * ground, the first match logged "shadow drawn from arena+0", and the run
+     * ground, the first match logged "shadow drawn from arena+0" (sv13: that
+     * line, and every other audit line, is on the diagnostic level now, so an
+     * sv13 mode-f run without a v in the mode file says all of this by showing
+     * it on the ground and writes exactly one install line), and the run
      * ended with a chunk the set legitimately has no payload for. It rides d's
      * shape, the one the clean mode-d run proved, not b's return form. */
     g_allow_write = 1;
@@ -1795,13 +1948,15 @@ static int Install(void)
                     " NOT b's frame, detour at %#x; matched chunks"
                     " get flags |= 1, hdr+0x2c = arena buffer - hdr and"
                     " hdr+0x30 = 512, so the client's own gate, CreateShadowTexture"
-                    " and the decoders read live .dat bytes",
+                    " and the decoders read live .dat bytes. logging: %s (add a v"
+                    " to '%s\\shadow-mod.mode' for the audit and per-chunk trail)",
              (const char *)head.map, (const char *)head.variant, head.entryCount,
              head.payloadUnique,
              (unsigned)(head.payloadBytes / (1024u * 1024u)),
              (unsigned)(size_t)arena,
              (unsigned)(size_t)((size_t)arena + (size_t)head.payloadBytes),
-             (unsigned)(size_t)g_stub);
+             (unsigned)(size_t)g_stub,
+             (g_verbose ? "verbose" : "quiet"), g_dir);
     LogMsg(msg);
     return 1;
 }
