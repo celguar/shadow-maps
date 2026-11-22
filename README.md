@@ -24,6 +24,69 @@ Nothing here edits a `.adt`, an MPQ or a saved game. The client's own shadow
 decoder runs unchanged; only the `ofsMCSH`/`sizeMCSH` pair in the `MCNK` header
 and the `MCNK` flag bit are written before the client reads them.
 
+## Reading an archive that Salmiak did not write
+
+`extract_shadowmaps.py` reads any MPQ that carries `MCSH` blocks, not only Salmiak's
+own exports, and this machine's own files are the proof: `Data\patch-3.mpq` and
+`Data\patch-6.mpq` (Blizzard's writers, 16,470 and 3,903 files) and `patch-S.mpq`
+(219 MB, 350 files, written by another tool) all extract, and re-extracting
+`shadows-Azeroth-morning.mpq` after these reader changes still gives the same set as
+before it — 487 tiles, 114,328 chunks, 66,413 payloads after dedupe, 34,918,204 bytes.
+(`shadowmaps.dat` next to the DLL is the **blizzlike** variant: 470 tiles, 107,752
+entries, 59,695 payloads, 31,425,980 bytes.) What a foreign writer does differently is
+named by libmpq's flag set (`cmangos/classic/dep/libmpq/libmpq/mpq-internal.h`):
+
+- a hash slot whose block index is `0xFFFFFFFE` is a **deleted** entry, not a used one:
+  stock tools rewrite an archive by deleting, and counting those as used makes a table
+  of 352 files look like thousands of them and makes the table-decryption sanity check
+  refuse the whole archive. This is what `patch-S.mpq` needed first.
+- `LIBMPQ_FLAG_ENCRYPTED` (bit 16): the file's sector-offset table and every one of its
+  sectors are WEP-encrypted. The seed is recovered the libmpq way — the table's first
+  decrypted dword is its own byte size, and the next must sit at most one sector ahead —
+  then the table decrypts with `seed - 1` and sector `s` with `seed + s`. `patch-S.mpq`'s
+  `(listfile)` is one of these, so without this its names never resolve at all.
+- `LIBMPQ_FLAG_SINGLE` (bit 24): the file is one run of bytes and its table is the two
+  entries of its own, not a table on disk.
+- `LIBMPQ_FLAG_EXTRA` (bit 26): the table carries one more entry, which the sector walk
+  never reaches.
+- the `.adt`s in these archives open with a small `MVER`/`MHDR` prefix and keep a
+  `WOT`-style body (`MCIN`/`MTEX`/`MMDX`/`MWMO`/`MDDF`/`MODF`/`MH2O`) ahead of their
+  256 `MCNK`s; the walk follows the file's own top-level chunk list, so those come and go
+  without any special case here.
+- fourccs are stored as dwords, so an `MCNK` is spelled `KNCM` on disk — which is also
+  what Salmiak's own exports and Blizzard's patches do. A writer that stored the plain
+  ASCII spelling is read the same way: `fourcc()` matches the raw bytes against
+  `KNOWN_MAGICS` before it reverses them, and the `MCSH` header test accepts both
+  spellings, so neither convention silently yields zero chunks.
+- a hash entry whose block index is out of range, and a `(listfile)` name that resolves
+  to nothing, are reported (`N of M listfile names have no hash entry`) instead of being
+  guessed at; a tile whose bytes cannot be read is skipped and named
+  (`unreadable <name>: <why>`) so one odd file in one archive does not end the run.
+
+One archive can also carry **several maps**: `patch-S.mpq` holds tiles of 12 of them
+(Azeroth 174 tiles, Kalimdor 125, and nine smaller ones). A `.dat` is keyed to one map —
+the DLL compares its map field against the client's own `s_mapName` (`0xC961A0`) and
+ignores the payload while they differ — so the extractor groups tiles by the map folder
+in the name, case-insensitively (`World\Maps\Azeroth` and `World\maps\azeroth` are one
+map, which is how `Data\patch-3.mpq` and `Data\patch-6.mpq` merge into one 178-tile set),
+and writes **one `.dat` per map**: `shadowmaps-Azeroth.dat`, `shadowmaps-Kalimdor.dat`,
+… . `--map NAME` takes one map and writes it to `-o` as named, which is what ships: the
+DLL only ever looks at the fixed name `shadowmaps.dat` beside it, so the map you want
+gets renamed to that.
+
+The three archives above were extracted side by side, with the numbers each one printed:
+
+| archive | files | tiles | `MCSH` chunks | payloads after dedupe | `.dat` bytes |
+| --- | --- | --- | --- | --- | --- |
+| `shadows-Azeroth-morning.mpq` (Salmiak) | 490 | 487 | 114,328 | 66,413 | 34,918,204 |
+| `patch-S.mpq` (another tool), Azeroth only | 350 | 174 | 38,257 | 21,372 | 11,248,644 |
+| `Data\patch-3.mpq` + `Data\patch-6.mpq`, Azeroth | 20,373 | 178 | 15,684 | 9,715 | 5,099,676 |
+
+The stock pair has far fewer chunks than tiles × 256 because most of their chunks carry
+no `MCSH` at all: the stock 1.12.1 ADTs in a patch MPQ are not shadow-carrying everywhere.
+Those chunks get no entry, which is the documented behaviour — the DLL leaves the client's
+own shadow state alone for them rather than forcing the flag on with nothing to draw.
+
 ## Which bake to run: the sun presets
 
 A shadow set is only meaningful together with the sun that cast it, and Salmiak
@@ -66,7 +129,7 @@ before starting the noon one.
 | `CMakeLists.txt`, `CMakePresets.json` | the canonical build (mirrors ClassicAPI's project) |
 | `build.py`, `build.ps1` | the no-CMake fallback: names every missing toolchain piece |
 | `verify_dll.py` | confirms a built DLL carries what `src/mod.c` claims |
-| `extract_shadowmaps.py` | shadow-variant archives → `shadowmaps.dat` |
+| `extract_shadowmaps.py` | shadow-variant archives → one `shadowmaps.dat` per map, foreign archives included |
 | `probe_hooksite.py` | re-checks the hook sites against a real client `WoW.exe` |
 | `tools-check/` | labelled stub headers, used **only** by `build.py --check` |
 

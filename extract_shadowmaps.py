@@ -17,30 +17,39 @@ Usage
                 whose shadows land in the .dat.
 
     -o OUT.dat  Output file. Default: shadowmaps.dat in the current directory.
-    --map NAME          Forces the map name. Default: read from the archive's
-                        World\<MAP>.wdt names, which is what the DLL compares
-                        against the client's own s_mapName.
+                When the archives carry more than one map, one file is written per
+                map and the map name is put in the stem: shadowmaps-Azeroth.dat,
+                shadowmaps-Kalimdor.dat, so the DLL can be given the one it wants.
+    --map NAME          Only takes tiles of that map, case-insensitive against the
+                        name in the tile's path. Default: every map the archives
+                        carry, each into its own .dat.
     --variant NAME      Label stored in the header only, for your own records.
                         Default: the archive's file stem.
     --no-dedupe         Keep every payload even when several chunks share the same
                         512 bytes. Only useful for debugging the dedupe step.
+    --probe NAME        Read one file, print its chunk walk and its MCSH bodies,
+                        and stop: the way to check an archive you were handed.
 
 Example
+    python extract_shadowmaps.py "G:\Games\twmoa_1181\patch-S.mpq" ^
+        --map Azeroth -o "G:\Games\twmoa_1181\shadows-Azeroth.dat"
     python extract_shadowmaps.py "G:\Games\twmoa_1181\shadows-Azeroth-morning.mpq" ^
         -o "G:\Games\twmoa_1181\shadows-Azeroth-morning.dat"
 
 What it prints
-    The map name, the tile bounds, how many chunks were read per tile, and how many
-    bytes the .dat ended up being after dedupe. A full Azeroth set is 741 tiles times
-    256 chunks; dedupe usually keeps it near 25 MB, which is why the .dat is not a
-    340 MB archive.
+    Per map: the map name, the tile bounds, how many chunks were read per tile, and
+    how many bytes the .dat ended up being after dedupe. A full Azeroth set is 741
+    tiles times 256 chunks; dedupe usually keeps it near 25 MB, which is why the .dat
+    is not a 340 MB archive.
 
 Reading an archive
     Salmiak's own exports are unencrypted, sectored zlib, sector shift 3, and carry a
-    (listfile). Other archives written by stock tools are usually readable too:
-    stored files, sectored zlib and PKWARE DCL are handled. Files compressed with
-    implode or bzip2 are refused with a message, because this script's job is to read
-    Salmiak's exports, not to be a whole MPQ library.
+    (listfile). Archives written by other tools are read the same way: stock writers
+    leave deleted hash slots, mark a file encrypted (its sector-offset table and its
+    sectors are then WEP-encrypted, and the seed is recovered from the table's known
+    first dword), mark a file as one single sector, and use PKWARE DCL sectors. Files
+    compressed with implode or bzip2 are refused with a message, because this script's
+    job is to read shadow archives, not to be a whole MPQ library.
 
 The .dat layout is specified in shadow_dat.h and README.md.
 """
@@ -111,6 +120,56 @@ def decrypt_block(words, key):
     return words
 
 
+# an empty slot, and a deleted one: stock tools leave 0xFFFFFFFE where they removed a
+# file, and a probe chain walks past those, so they are neither "used" nor "free"
+HASH_EMPTY = 0xFFFFFFFF
+HASH_DELETED = 0xFFFFFFFE
+
+# block-table flags, named as libmpq names them (its mpq-internal.h is the reference
+# that spells the bits out): a writer that encrypts a file's bytes WEP-encrypts the
+# sector-offset table first and then every sector, a "single" file is one run of bytes
+# with only the two table entries of its own, and "extra" is a table with one more
+# entry, which the sector walk never reads
+FLAG_ENCRYPTED = 0x00010000
+FLAG_SINGLE = 0x01000000
+FLAG_EXTRA = 0x04000000
+
+
+def find_seed(words, plain0, block_size):
+    """Undo libmpq's libmpq__decrypt_key: an encrypted sector table starts with its own
+    byte size, and one known dword plus "the next offset is at most one sector away" is
+    enough to pin the seed, which is the same seed the file's sectors then decrypt with.
+    """
+    if len(words) < 2:
+        return None
+    temp = ((words[0] ^ plain0) - 0xEEEEEEEE) & M32
+    for i in range(0x100):
+        seed1 = (temp - CRYPT_TABLE[0x400 + i]) & M32
+        seed2 = (0xEEEEEEEE + CRYPT_TABLE[0x400 + (seed1 & 0xFF)]) & M32
+        ch = (words[0] ^ ((seed1 + seed2) & M32)) & M32
+        if ch != plain0:
+            continue
+        saveseed1 = (seed1 + 1) & M32
+        seed1 = ((((~seed1 & M32) << 0x15) + 0x11111111) & M32) | (seed1 >> 0x0B)
+        seed2 = (ch + seed2 + ((seed2 << 5) + 3)) & M32
+        seed2 = (seed2 + CRYPT_TABLE[0x400 + (seed1 & 0xFF)]) & M32
+        ch2 = (words[1] ^ ((seed1 + seed2) & M32)) & M32
+        if ((ch2 - ch) & M32) <= block_size:
+            return saveseed1
+    return None
+
+
+def crypt_words(piece, key):
+    """WEP one way over whole dwords, which is how libmpq decrypts a sector: bytes
+    past the last whole dword are left alone, so a tail is never invented here."""
+    n = len(piece) // 4
+    if n == 0:
+        return piece
+    words = list(struct.unpack("<%dI" % n, piece[: n * 4]))
+    decrypt_block(words, key)
+    return b"".join(struct.pack("<I", w) for w in words) + piece[n * 4:]
+
+
 NAME_TABLE = {
     # probe hash type, hashA type, hashB type. Salmiak shifts the classic set by one.
     "classic": (2, 0, 1),
@@ -143,6 +202,8 @@ class Mpq:
             print("   note: %s header block entries %d, file size says %d" % (path, hdr_block, self.block_count))
         if self.hash_count <= 0 or self.block_count <= 0:
             raise MpqError("%s has no tables" % path)
+        self.unreadable = []
+        self.unresolved = 0
         self._read_tables()
         self._read_listfile()
 
@@ -159,8 +220,12 @@ class Mpq:
             bw = list(struct.unpack("<%dI" % (self.block_count * 4), bb))
             decrypt_block(hw, hash_string("(hash table)", 3))
             decrypt_block(bw, hash_string("(block table)", 3))
-            # a free slot is 0xFFFFFFFF in the block-index word
-            used = sum(1 for i in range(self.hash_count) if hw[i * 4 + 3] != 0xFFFFFFFF)
+            # a free slot is 0xFFFFFFFF and a deleted one is 0xFFFFFFFE in the block
+            # index word: stock writers delete entries when they rewrite an archive, so
+            # counting the deleted ones as used makes a table of 352 files look like
+            # thousands of them, and the sane check below rejects the whole decryption
+            used = sum(1 for i in range(self.hash_count)
+                       if hw[i * 4 + 3] not in (HASH_EMPTY, HASH_DELETED))
             sane = 0 < used <= self.block_count and used <= self.hash_count
             hit = self._slot("(listfile)", hw, probe_t, a_t, b_t) if sane else None
             score = (1 if sane else 0) + (1 if hit is not None else 0)
@@ -177,9 +242,14 @@ class Mpq:
         probe = hash_string(name, probe_t) % self.hash_count
         ha = hash_string(name, a_t)
         hb = hash_string(name, b_t)
+        # the chain ends at the first free slot, and a deleted slot is skipped rather
+        # than matched, which is how the client walks a table another tool edited
         i = probe
         while True:
-            if hw[i * 4 + 3] != 0xFFFFFFFF and hw[i * 4] == ha and hw[i * 4 + 1] == hb:
+            blk = hw[i * 4 + 3]
+            if blk == HASH_EMPTY:
+                return None
+            if blk != HASH_DELETED and hw[i * 4] == ha and hw[i * 4 + 1] == hb:
                 return i
             i = (i + 1) % self.hash_count
             if i == probe:
@@ -193,7 +263,9 @@ class Mpq:
         i = probe
         while True:
             e = self.hash_entries[i]
-            if e[3] != 0xFFFFFFFF and e[0] == ha and e[1] == hb:
+            if e[3] == HASH_EMPTY:
+                return None
+            if e[3] != HASH_DELETED and e[0] == ha and e[1] == hb:
                 return e[3]
             i = (i + 1) % self.hash_count
             if i == probe:
@@ -213,15 +285,42 @@ class Mpq:
         # FlagExists|FlagCompress pair, and a sector it cannot shrink is written as
         # bare bytes with no 0x00 prefix, unlike stock writers
         salmiak_style = flags == 0x80000200
-        n = max(1, (raw + self.sector - 1) // self.sector)
-        offs = list(struct.unpack("<%dI" % (n + 1), blob[: (n + 1) * 4]))
+        # a single-sector file has no table on disk beyond its own two entries, and the
+        # walk never splits it, so its one run of bytes is the whole file; that also
+        # leaves nothing to recover an encryption seed from, which is libmpq's own
+        # limit: it only decrypts a file whose table it actually read
+        single = bool(flags & FLAG_SINGLE)
+        n = 1 if single else max(1, (raw + self.sector - 1) // self.sector)
+        words = n + 1 + (1 if flags & FLAG_EXTRA else 0)
+        seed = None
+        if single:
+            offs = [0, comp]
+        else:
+            offs = list(struct.unpack_from("<%dI" % words, blob, 0))
+            if len(offs) < words:
+                raise MpqError("%s: block %d wants %d table words, its %d bytes hold %d"
+                               % (self.path, index, words, len(blob), len(offs)))
+            if offs[0] != words * 4:
+                # the table is encrypted: recover its seed and decrypt it, which is also
+                # the seed every sector of this file is encrypted with
+                seed = find_seed(offs, words * 4, self.sector)
+                if seed is None:
+                    raise MpqError("%s: block %d has an encrypted table whose seed is not recoverable"
+                                   % (self.path, index))
+                offs = decrypt_block(offs, (seed - 1) & M32)
+                if offs[0] != words * 4:
+                    raise MpqError("%s: block %d decrypts to a table that disagrees with its size"
+                                   % (self.path, index))
         out = bytearray()
         for s in range(n):
-            want = min(self.sector, raw - s * self.sector)
+            want = raw if single else min(self.sector, raw - s * self.sector)
             start, end = offs[s], offs[s + 1]
             if end <= start or start >= len(blob):
                 raise MpqError("%s: sector %d of %d is missing" % (self.path, s, n))
-            out += self._decode_sector(blob[start:end], want, salmiak_style)
+            piece = blob[start:end]
+            if seed is not None:
+                piece = crypt_words(piece, (seed + s) & M32)
+            out += self._decode_sector(piece, want, salmiak_style)
         return bytes(out[:raw])
 
     def _decode_sector(self, piece, want, salmiak_style):
@@ -260,6 +359,7 @@ class Mpq:
 
     def _read_listfile(self):
         self.by_name = {}
+        self.unresolved = 0
         data = None
         for candidate in ("(listfile)", "(Listfile)", "(LISTFILE)"):
             index = self._lookup(candidate)
@@ -271,42 +371,73 @@ class Mpq:
         text = data.decode("latin1")
         for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
             line = line.strip()
-            if line:
-                self.by_name[line] = self._lookup(line)
+            if not line:
+                continue
+            index = self._lookup(line)
+            # a name the hash table does not carry is not a file: an archive edited by
+            # another tool can list a name whose entry it deleted, and it stays counted
+            # here so a wrong name-table guess cannot pass silently
+            self.by_name[line] = index
+            if index is None:
+                self.unresolved += 1
 
     def tiles(self):
-        """Every tile ADT as (tileX, tileY, bytes, name)."""
+        """Every tile ADT as (map name, tileX, tileY, bytes, name).
+
+        The map is the folder the tile sits in, because that is the name the client
+        keeps in s_mapName and the one the DLL compares the .dat's map field against.
+        The tile-name prefix is only a fallback for writers that flattened the path.
+        A tile whose bytes this script cannot read is left out and named in
+        self.unreadable, so one file written by one tool does not end an archive.
+        """
         out = []
+        self.unreadable = []
         for name in self.by_name:
             m = TILE_RE.match(name)
             if not m:
                 continue
-            data = self.file_data(name)
+            parts = name.split("\\")
+            mp = parts[-2] if len(parts) >= 2 and parts[-2] else parts[-1].rsplit("_", 2)[0]
+            try:
+                data = self.file_data(name)
+            except MpqError as e:
+                self.unreadable.append((name, str(e)))
+                continue
             if data is None:
                 continue
-            out.append((int(m.group(1)), int(m.group(2)), data, name))
+            out.append((mp, int(m.group(1)), int(m.group(2)), data, name))
         return out
 
     def map_names(self):
-        """The maps this archive carries, from its World\\<MAP>.wdt and tile names."""
+        """Map names this archive declares through its World\\<MAP>.wdt files."""
         out = []
         for name in self.by_name:
             if WDT_RE.match(name):
                 out.append(name.split("\\")[-1].split(".")[0])
         return out
 
-    def tile_maps(self):
-        """Map names taken from tile file names, as a fallback when no WDT is present."""
-        out = []
-        for name in self.by_name:
-            m = TILE_RE.match(name)
-            if m:
-                out.append(name.split("\\")[-1].rsplit("_", 2)[0])
-        return out
-
 
 TILE_RE = re.compile(r"^world\\.+?_(\d+)_(\d+)\.adt$", re.IGNORECASE)
 WDT_RE = re.compile(r"^world\\.+?\.wdt$", re.IGNORECASE)
+
+
+# fourccs this codebase names, in ASCII. The 1.12.1 client writes them onto disk as
+# dwords, so an ADT it produced spells 'MVER' as the bytes REVM and the reversed-ASCII
+# spelling is what the walk sees. A tool that wrote the plain ASCII spelling is still
+# read correctly: the raw bytes are matched against this set before they are reversed,
+# so both conventions land on the same name
+KNOWN_MAGICS = {
+    b"MVER", b"MHDR", b"MCIN", b"MTEX", b"MMDX", b"MMID", b"MWMO", b"MWID",
+    b"MDDF", b"MODF", b"MH2O", b"MCNK", b"MCCT", b"MCSH", b"MCLY", b"MLYI",
+    b"MSTA", b"MFBO", b"MHHF", b"PORT", b"TIME",
+}
+
+
+def fourcc(raw):
+    """A fourcc's bytes as the ASCII name, either spelling it is stored in."""
+    if raw in KNOWN_MAGICS or raw[::-1] not in KNOWN_MAGICS:
+        return raw.decode("latin1")
+    return bytes(reversed(raw)).decode("latin1")
 
 
 def top_chunks(data):
@@ -324,7 +455,7 @@ def top_chunks(data):
         size = int.from_bytes(data[pos + 4:pos + 8], "little")
         if pos + 8 + size > len(data):
             break
-        out.append((bytes(reversed(raw)).decode("latin1"), pos, size))
+        out.append((fourcc(raw), pos, size))
         pos += 8 + size
     return out
 
@@ -353,7 +484,7 @@ def adt_chunks(data):
             continue  # not a packed 1.12 shadow map
         if ofs + 512 > size:
             continue
-        if data[hdr + ofs - 8:hdr + ofs - 4] != b"MCSH"[::-1]:
+        if data[hdr + ofs - 8:hdr + ofs - 4] not in (b"MCSH", b"MCSH"[::-1]):
             continue  # ofsMCSH does not land on an MCSH sub-chunk header
         out.append((index_x, index_y, data[hdr + ofs:hdr + ofs + 512]))
     return out
@@ -363,7 +494,8 @@ def main(argv):
     ap = argparse.ArgumentParser(add_help=True, description="Salmiak shadow archives -> shadowmaps.dat")
     ap.add_argument("archives", nargs="+", help=".mpq files or directories containing them")
     ap.add_argument("-o", "--out", default="shadowmaps.dat")
-    ap.add_argument("--map", default=None, help="override the map name")
+    ap.add_argument("--map", default=None,
+                    help="only take tiles of this map; default: every map the archives carry")
     ap.add_argument("--variant", default=None, help="label stored in the header only")
     ap.add_argument("--no-dedupe", action="store_true")
     ap.add_argument("--probe", metavar="NAME", default=None, help="print one file's ADT walk and stop")
@@ -398,11 +530,15 @@ def main(argv):
             print("  chunk %d,%d  %d texels set of %d" % (ix, iy, sum(bin(x).count("1") for x in b), 4096))
         return
 
-    maps_seen, variant_seen = [], []
-    payloads = {}
-    tiles_seen = set()
-    missing = 0
-    per_tile = {}
+    variant_seen = []
+    # one gather per map name: a tool-built archive such as a stock patch MPQ carries
+    # several maps' tiles side by side, and the .dat the DLL reads is keyed to one map
+    # (it checks the map field against the client's own s_mapName), so each map gets
+    # its own payloads, its own tile bounds and its own output file. Later archives
+    # still win over earlier ones, per map, the way the client resolves a name
+    gathered = {}
+    seen_maps = set()
+    display_name = {}
 
     for path in paths:
         try:
@@ -411,40 +547,73 @@ def main(argv):
             print("!! %s" % e)
             continue
         print("-- %s  %d files  names %s" % (path, len(arc.by_name), arc.mapping_name))
-        maps_seen.extend(arc.map_names())
-        maps_seen.extend(arc.tile_maps())
+        if arc.unresolved:
+            print(
+                "   %d of %d listfile names have no hash entry: the archive was edited by "
+                "a tool after it was written" % (arc.unresolved, len(arc.by_name))
+            )
+        wdts = arc.map_names()
+        if wdts:
+            print("   World\\<MAP>.wdt present for: %s" % " ".join(sorted(set(wdts))))
         variant_seen.append(os.path.splitext(os.path.basename(path))[0])
         read = 0
-        for (tx, ty, data, name) in arc.tiles():
+        tiles_here = set()
+        for (mp, tx, ty, data, name) in arc.tiles():
+            seen_maps.add(mp)
+            # the same map can be spelled differently across archives: one patch says
+            # World\Maps\Azeroth and another World\maps\azeroth, and that is one map, so
+            # the group is keyed case-insensitively and keeps the first spelling it saw
+            key = mp.lower()
+            if args.map and key != args.map.lower():
+                continue
+            display_name.setdefault(key, mp)
+            payloads, tiles_seen, per_tile, missing = gathered.setdefault(
+                key, ({}, set(), {}, [0])
+            )
             tiles_seen.add((tx, ty))
+            tiles_here.add((tx, ty))
             chunks = adt_chunks(data)
             per_tile[(tx, ty)] = len(chunks)
             for (ix, iy, body) in chunks:
                 gx, gy = tx * 16 + ix, ty * 16 + iy
                 payloads[(gy << 10) | gx] = body
             read += len(chunks)
-            missing += 256 - len(chunks)
-        print("   tiles %d  chunks %d" % (len(tiles_seen), read))
+            missing[0] += 256 - len(chunks)
+        print("   tiles %d  chunks %d" % (len(tiles_here), read))
+        for (nm, why) in arc.unreadable[:8]:
+            print("   unreadable %s: %s" % (nm, why))
+        if len(arc.unreadable) > 8:
+            print("   ... %d more unreadable tiles" % (len(arc.unreadable) - 8))
 
-    if not payloads:
+    if not gathered and seen_maps:
+        raise SystemExit(
+            "no tile of map %s in these archives: they carry %s"
+            % (args.map, ", ".join(sorted(seen_maps)))
+        )
+    if not any(payloads for (payloads, _, _, _) in gathered.values()):
         raise SystemExit("no MCSH blocks found in any archive")
 
-    name = args.map
-    if not name:
-        counts = defaultdict(int)
-        for m in maps_seen:
-            counts[m] += 1
-        if not counts:
-            raise SystemExit("the archives carry no World\\<MAP>.wdt, so pass --map")
-        name = max(counts, key=counts.get)
-    variant = args.variant or (variant_seen[-1] if variant_seen else "set")
+    if len(gathered) > 1:
+        print(
+            "these archives carry %d maps with tiles, so one .dat is written per map: "
+            "the DLL reads one .dat and ignores it while the client's s_mapName differs"
+            % len(gathered)
+        )
 
-    groups = None
-    if not args.no_dedupe:
-        groups = {}
-        for body in payloads.values():
-            groups[body] = groups.get(body, 0) + 1
-    _write_dat(args.out, name, variant, payloads, groups, tiles_seen, missing, per_tile)
+    base, ext = os.path.splitext(args.out)
+    for key in sorted(gathered, key=lambda k: (-len(gathered[k][0]), k)):
+        payloads, tiles_seen, per_tile, missing = gathered[key]
+        if not payloads:
+            continue
+        name = display_name[key]
+        variant = args.variant or (variant_seen[-1] if variant_seen else "set")
+        out = args.out if len(gathered) == 1 else "%s-%s%s" % (base, name, ext)
+        groups = None
+        if not args.no_dedupe:
+            groups = {}
+            for body in payloads.values():
+                groups[body] = groups.get(body, 0) + 1
+        _write_dat(out, name, variant, payloads, groups, tiles_seen, missing[0], per_tile)
 
 
 def _write_dat(out, name, variant, payloads, groups, tiles_seen, missing, per_tile):
