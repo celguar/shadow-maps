@@ -94,6 +94,66 @@
  *   a file the size of the session and the previous launch's lines are still
  *   there to compare a new run against.
  *
+ * What sv14 adds: the sun travels an arc, and which arc is the clock's own.
+ *  Everything above stays -- the hook, the stubs, the writes, the arena and
+ *  the .dat are sv13's byte for byte -- and one thing is added: the DLL also
+ *  writes the client's own sun key tables, the four tracks the day-night file
+ *  builds at 0xce8d90 (the lighting sun's azimuth), 0xce8db0 (its polar angle),
+ *  0xce8d4c (the sun disc's azimuth) and 0xce8d64 (its polar angle), and that
+ *  its own evaluator 0x6cf6c0 then reads every frame (benilla-re lighting/
+ *  celestial.md#static-tracks; docs/sun-lighting-analysis.md, on the main
+ *  checkout, is the chain that shows terrain and object shading follow these
+ *  runtime values rather than a separate constant). The stock tables cannot
+ *  make an arc: the lighting azimuth is 1.25pi on all four keys and the disc
+ *  azimuth is 0.25pi on all three, so the sun rocks between two polar angles
+ *  on one fixed bearing -- a vertical wheel, it rises and sets on the same
+ *  bearing -- and the world's shading never turns. sv14 writes key sets whose
+ *  azimuth completes 360 deg over the day, monotonically through the wrap, so
+ *  what the client interpolates is one continuous forward rotation rather than
+ *  a backwards sweep or a jump at midnight (0x6cf6c0 lerps in value space and
+ *  its cyclic search wraps in time, celestial.md#tracks), and whose polar
+ *  angle goes through the horizon; the disc azimuth is kept the antipode of
+ *  the light azimuth so the shading direction and the visible sun agree. The
+ *  key COUNTS are the edx to 0x6cf6c0 and the tracks are adjacent -- 0xce8d90
+ *  + 0x20 is 0xce8db0, 0xce8d4c + 0x18 is 0xce8d64 -- so a preset that added a
+ *  key would run into its neighbour and every preset keeps 4 / 4 / 3 / 5.
+ *
+ *  Which set gets written is the client's own clock's decision, and the DLL
+ *  never makes a clock of its own: the day-night state at 0xce9b60 holds the
+ *  game clock word, the time of day in [0,1) and the day count at +0, +4 and
+ *  +8, stamped every rendered world frame (benilla-re lighting/daynight.md
+ *  #light-state), and the light table build reads that same float at 0xce9b64
+ *  while turning it into half-minutes. sv14 turns it the same way -- round(tod
+ *  * 2880), 2880 being the half-minutes in a day -- and picks the preset whose
+ *  window of half-minutes holds it: the day is cut into five hours-long
+ *  windows, arc-high at 00:00, arc-long at 05:00, arc-low at 10:00, arc-west
+ *  at 15:00 and arc-stock at 20:00, so the hour the world was entered at names
+ *  the arc, and arc-stock is the stock sun, which asks for nothing at all. An
+ *  unstamped block reads 0, which is midnight and arc-high's window, so the
+ *  first chunk visit already writes an arc and every visit after it reads the
+ *  clock again -- the choice settles as soon as the world stamps the block.
+ *  The applied line prints
+ *  the clock as the game reads it, the preset, and the arc's own numbers off
+ *  the table that was just written, so the run says what was written rather
+ *  than what a reader hoped for.
+ *
+ *  The clock is read and the keys are written at the per-chunk fixup, the one
+ *  place this DLL already runs on every loaded chunk: that is where the world
+ *  frames have started stamping the block, and the re-assert at every visit
+ *  after it is also what puts a key set back if the day-night file rebuilt its
+ *  tracks behind the guard bits at 0x6d3a10 and 0x6d3b80 after install
+ *  (celestial.md#static-tracks builds them once, at first use, out of the
+ *  static initializers at 0x6ce4a0 and 0x6ce560). A rung that never carries it
+ *  -- n, a and c never call the fixup, and b and d return above it, silent --
+ *  says so in the install lines, and h and f carry the arc. Before any write the four tracks are pinned against
+ *  the stock values, or against an all-zero track whose builder has not run:
+ *  a track holding neither is not the shape the sun state reads, and the sun
+ *  is left alone with one log line while the shadows keep working. shadow-mod
+ *  .sun, next to the mode file, overrides the clock with off or a preset name,
+ *  which is how one arc is watched without waiting for the hour. docs/sun-arc-
+ *  note.md, next to this branch, is what the arc does in game and what it
+ *  deliberately leaves alone.
+ *
  * runs came back with their install lines and no new crash: mode a (the whole
  * 34 MB arena resident, no hook), mode c (the store and landing at 0x6AF5F0,
  * no call) and mode d (the call with its arguments read from [ebp+8] on the
@@ -182,7 +242,7 @@
 #include <string.h>
 #include "../shadow_dat.h"
 
-#define STAMP "sv13" /* build stamp, printed in every log line: an old build of
+#define STAMP "sv14" /* build stamp, printed in every log line: an old build of
                      * this DLL sitting next to a new .dat is the most common
                      * confusion, so the line says which build made it, and the
                      * mode line below names which of the seven rungs ran. sv11
@@ -195,7 +255,15 @@
                      * the diagnostics behind a letter, so an sv13 log is nearly
                      * empty by default and holds sv12's lines once the mode file
                      * carries a v. A mirrored-and-rotated ground under an sv11
-                     * line is that seek, not the bake. */
+                     * line is that seek, not the bake. sv14 adds the sun: the
+                     * client's own sun key tables are rewritten so the sun
+                     * travels an arc rather than rocking on one bearing, and
+                     * which arc gets written is picked from the client's own
+                     * in-game clock -- see the sun state below, docs/sun-arc-
+                     * note.md says what the arc does and what it does not do.
+                     * The hook, the stubs, the writes and the .dat are sv13's
+                     * unchanged, so an sv14 line about a shadow is an sv13
+                     * line about the same shadow. */
 
 /* ---------------------------------------------------------------- pinned **/
 
@@ -372,8 +440,8 @@ static int g_log_hits;                /* how many progress lines were logged */
 static int g_log_field;               /* a probe dword moved: logged once   */
 static int g_log_audit;               /* the first chunk entering Load audited */
 static unsigned g_audit_seen;         /* per-chunk header dumps logged so far */
-static int g_silent;                  /* mode b: the call returns before doing
-                                          anything at all, file I/O included */
+static int g_silent;                  /* modes b and d: the call returns before
+                                          doing anything at all, file I/O included */
 static char g_mode = 'f';             /* the mode letter, see ReadModeFile     */
 static int g_verbose;                 /* sv13: the diagnostic level is on. Set by
                                          ReadModeFile from a v in the mode file and
@@ -785,6 +853,387 @@ static void InstallHandler(void)
     LogVerb(STAMP " handler: first-chance vectored handler registered, so the next access violation logs the chunk that was being built and the address the client read (the client's own report is still written afterwards)");
 }
 
+/* ------------------------------------------------------- the sun's arc **/
+
+/* sv14. The day-night file builds four static key tables that its sun state
+ * reads every rendered frame through one evaluator, 0x6cf6c0 (keys, count,
+ * phase), and derives the sun's position as (cos a sin p, sin a sin p, cos p)
+ * of the same phase (benilla-re systems/lighting/celestial.md#static-tracks
+ * and #sun-direction). The stock tables make no arc: the lighting azimuth is
+ * 225 deg on all four keys and the disc azimuth 45 deg on all three, so the
+ * sun rocks between two polar angles on one fixed bearing -- a wheel in a
+ * vertical plane, rising and setting on the same bearing -- and the world's
+ * shading never turns. What is written here are key sets that obey the two
+ * rules the evaluator imposes: the azimuth runs monotonically through the
+ * wrap and completes exactly 360 deg over the cycle, because 0x6cf6c0 lerps in
+ * VALUE space and its cyclic search wraps in TIME, so a value that wraps back
+ * is a backwards sweep and a value that leaves a gap is a jump at midnight;
+ * and the light azimuth is kept the disc azimuth plus 180 with the light
+ * polar the disc polar subtracted from 180, so the direction the shading comes
+ * from and the sun you can see are the same sun all day. The count is the
+ * edx to the evaluator, not a length inside the block, and the blocks are
+ * adjacent -- 0xce8d90 + 0x20 is the polar light track, 0xce8d4c + 0x18 is the
+ * disc polar one -- so the key times sit right after the values at kv + n and
+ * a preset that added a key would write over its neighbour: every preset keeps
+ * the stock 4 / 4 / 3 / 5.
+ *
+ * The azimuths are left unwrapped (495 deg, not 135) because wrapping is what
+ * reverses the sweep; sin and cos read them the same either way. */
+#define SUN_TOD_STATE  0xce9b60u   /* the day-night state's block of globals */
+#define SUN_TOD_OFF    0x04u       /* +4: time of day, kept in [0,1)         */
+#define SUN_HMIN_DAY   2880u       /* half-minutes in a day, the unit the     */
+                                   /* LightParams records are keyed by        */
+#define SUN_EVAL_ADDR  0x6cf6c0u   /* named only in a log line               */
+
+/* the four tracks, and their stock keys in degrees. The counts are the
+ * evaluator's own: 4 / 4 for the lighting sun, 3 / 5 for the disc. */
+static const unsigned int sun_addr[4] = { 0xce8d90u, 0xce8db0u, 0xce8d4cu, 0xce8d64u };
+static const unsigned int sun_n[4] = { 4, 4, 3, 5 };
+static const float sun_stock_v[4][5] = {
+    { 225.0f, 225.0f, 225.0f, 225.0f },
+    { 127.0f, 110.0f, 127.0f, 110.0f },
+    {  45.0f,  45.0f,  45.0f },
+    { 100.0f,   5.0f,   5.0f,   5.0f, 100.0f }
+};
+static const float sun_stock_t[4][5] = {
+    { 0.0f, 0.25f, 0.5f, 0.75f },
+    { 0.0f, 0.25f, 0.5f, 0.75f },
+    { 0.2291667f, 0.5f, 0.8958333f },
+    { 0.2291667f, 0.5f, 0.5f, 0.5f, 0.8958333f }
+};
+
+/* A sun preset: the key times and values for one shape, and the window of the
+ * day it answers for, in half-minutes. Times are the fraction of the cycle the
+ * clock's phase means; angles are degrees, which SunPut turns into the
+ * radians the client's floats hold. Every arc rises and sets with its
+ * polar angle ending just below the horizon (100 deg, the stock's own end
+ * value) and passing the zenith side of the sky, and every light track is the
+ * disc's antipode, so the four tracks of one preset are one sun. */
+static const struct SunPreset {
+    const char name[16];
+    unsigned short h0, h1;                 /* the clock's window             */
+    float az_l[4], pol_l[4];               /* the lighting sun's keys        */
+    float az_d[3], pol_d[5];               /* the sun disc's keys            */
+    float t_az_l[4], t_pol_l[4];           /* their key times                */
+    float t_az_d[3], t_pol_d[5];
+} sun_presets[] = {
+    { "arc-high",       0, 600,
+      { 495.0f, 585.0f, 675.0f, 675.0f }, {  80.0f, 150.0f, 175.0f,  80.0f },
+      { 315.0f, 405.0f, 495.0f },         { 100.0f,  30.0f,   5.0f,  30.0f, 100.0f },
+      { 0.2291667f, 0.5f, 0.8958333f, 0.8958333f },
+      { 0.2291667f, 0.3645833f, 0.5f, 0.8958333f },
+      { 0.2291667f, 0.5f, 0.8958333f },
+      { 0.2291667f, 0.3645833f, 0.5f, 0.6354167f, 0.8958333f } },
+    { "arc-long",     600, 1200,
+      { 450.0f, 585.0f, 720.0f, 720.0f }, {  80.0f, 150.0f, 175.0f,  80.0f },
+      { 270.0f, 405.0f, 540.0f },         { 100.0f,  30.0f,   5.0f,  30.0f, 100.0f },
+      { 0.125f, 0.5f, 0.9583333f, 0.9583333f },
+      { 0.125f, 0.3125f, 0.5f, 0.9583333f },
+      { 0.125f, 0.5f, 0.9583333f },
+      { 0.125f, 0.3125f, 0.5f, 0.6875f, 0.9583333f } },
+    { "arc-low",     1200, 1800,
+      { 405.0f, 495.0f, 585.0f, 585.0f }, {  80.0f, 120.0f, 145.0f,  80.0f },
+      { 225.0f, 315.0f, 405.0f },         { 100.0f,  60.0f,  35.0f,  60.0f, 100.0f },
+      { 0.3333333f, 0.5f, 0.6666667f, 0.6666667f },
+      { 0.3333333f, 0.4166667f, 0.5f, 0.6666667f },
+      { 0.3333333f, 0.5f, 0.6666667f },
+      { 0.3333333f, 0.4166667f, 0.5f, 0.5833333f, 0.6666667f } },
+    { "arc-west",    1800, 2400,
+      { 360.0f, 450.0f, 540.0f, 540.0f }, {  80.0f, 140.0f, 170.0f,  80.0f },
+      { 180.0f, 270.0f, 360.0f },         { 100.0f,  40.0f,  10.0f,  40.0f, 100.0f },
+      { 0.25f, 0.5f, 0.75f, 0.75f },
+      { 0.25f, 0.375f, 0.5f, 0.75f },
+      { 0.25f, 0.5f, 0.75f },
+      { 0.25f, 0.375f, 0.5f, 0.625f, 0.75f } },
+    { "arc-stock",   2400, SUN_HMIN_DAY,
+      { 225.0f, 225.0f, 225.0f, 225.0f }, { 127.0f, 110.0f, 127.0f, 110.0f },
+      {  45.0f,  45.0f,  45.0f },         { 100.0f,   5.0f,   5.0f,   5.0f, 100.0f },
+      { 0.0f, 0.25f, 0.5f, 0.75f },
+      { 0.0f, 0.25f, 0.5f, 0.75f },
+      { 0.2291667f, 0.5f, 0.8958333f },
+      { 0.2291667f, 0.5f, 0.5f, 0.5f, 0.8958333f } }
+};
+#define SUN_PRESETS ((unsigned)(sizeof sun_presets / sizeof sun_presets[0]))
+#define SUN_STOCK_PRESET (SUN_PRESETS - 1u) /* the last one writes nothing  */
+
+/* pi/180 and 180/pi as the float the client's own constants round to. The DLL
+ * carries no math library (it links kernel32 and ntdll only), and the sun's
+ * sine and cosine are the client's: all this does is turn degrees into the
+ * radians the key floats hold. */
+#define SUN_D2R 0.01745329251994329186404805098050064450281532733429333166503906250f
+#define SUN_R2D 57.2957795130823246137866726764679354908450925425769347584686279296875
+
+static int g_sun_forced = -1;     /* shadow-mod.sun's name, -1 is the clock  */
+static int g_sun_off;             /* shadow-mod.sun said off                */
+static int g_sun_pin;             /* 0 not checked, 1 pinned, -1 not pinned */
+static int g_sun_applied = -1;    /* preset index last written              */
+static unsigned g_sun_said_preset;  /* one line per preset applied, bit per  */
+                                    /* index: a clock crossing says so once  */
+static int g_sun_said_stock;
+static int g_sun_said_off;
+static int g_sun_said_back;
+
+/* the clock, in the unit the presets' windows use. The DLL never makes a
+ * clock of its own: this is the float the client stamps every rendered world
+ * frame at 0xce9b64, the same one the light table build at 0x6d2210 reads
+ * while turning it into half-minutes. An all-zero block reads 0, which is
+ * midnight and arc-high's window, so the first chunk visit already writes an
+ * arc and every visit after it reads the clock again: a 0 float is read the
+ * same as midnight, so the difference between "not stamped yet" and "midnight"
+ * is not visible here and does not need to be -- the keys are written either
+ * way, and a visit whose clock arrived later corrects the choice. */
+static unsigned SunHalfMinute(unsigned *clock_out)
+{
+    const float *st = (const float *)(size_t)SUN_TOD_STATE;
+    float tod;
+    unsigned hmin;
+    tod = st[SUN_TOD_OFF / 4u];
+    if (!(tod >= 0.0f) || tod >= 1.0f)
+        tod = 0.0f;
+    if (clock_out) {
+        *clock_out = (unsigned)(tod * 10000.0f + 0.5f);
+        if (*clock_out > 9999u)
+            *clock_out = 9999u;
+    }
+    hmin = (unsigned)(tod * (float)SUN_HMIN_DAY + 0.5f);
+    if (hmin >= SUN_HMIN_DAY)
+        hmin = SUN_HMIN_DAY - 1u;
+    return hmin;
+}
+
+static int SunPick(unsigned hmin)
+{
+    unsigned i;
+    for (i = 0; i < SUN_PRESETS; ++i)
+        if (hmin >= sun_presets[i].h0 && hmin < sun_presets[i].h1)
+            return (int)i;
+    return -1;
+}
+
+/* do the four tracks still hold the stock keys, within the degree a float
+ * rounds to? also says whether an arc's own keys were lost since, which is
+ * what a rebuilt day-night file looks like */
+static int SunHoldsStock(void)
+{
+    unsigned tr, i;
+    const float *kv;
+    int same = 1;
+    for (tr = 0; tr < 4u; ++tr) {
+        kv = (const float *)(size_t)sun_addr[tr];
+        for (i = 0; i < sun_n[tr]; ++i) {
+            double deg = (double)kv[i] * SUN_R2D;
+            if (deg < (double)sun_stock_v[tr][i] - 0.02 ||
+                deg > (double)sun_stock_v[tr][i] + 0.02)
+                same = 0;
+            if (kv[sun_n[tr] + i] < sun_stock_t[tr][i] - 0.0001f ||
+                kv[sun_n[tr] + i] > sun_stock_t[tr][i] + 0.0001f)
+                same = 0;
+        }
+    }
+    return same;
+}
+
+/* the tracks must be the ones this whole block was read from before anything
+ * is written: stock values, or an all-zero block the sun state has not built
+ * yet, since 0x6d3a10 and 0x6d3b80 build these at first use behind the guard
+ * bits at 0x6d3b44 and 0x6d3ba4 and that is after this DLL was loaded. A
+ * track holding neither is not the shape 0x6cf6c0 names, and the sun is left
+ * alone. */
+static int SunPin(void)
+{
+    unsigned tr, i;
+    int same, zero;
+    const float *kv;
+    char msg[384];
+    for (tr = 0; tr < 4u; ++tr) {
+        same = 1;
+        zero = 1;
+        kv = (const float *)(size_t)sun_addr[tr];
+        for (i = 0; i < sun_n[tr]; ++i) {
+            double deg = (double)kv[i] * SUN_R2D;
+            if (deg < (double)sun_stock_v[tr][i] - 0.02 ||
+                deg > (double)sun_stock_v[tr][i] + 0.02)
+                same = 0;
+            if (kv[sun_n[tr] + i] < sun_stock_t[tr][i] - 0.0001f ||
+                kv[sun_n[tr] + i] > sun_stock_t[tr][i] + 0.0001f)
+                same = 0;
+            if (kv[i] != 0.0f || kv[sun_n[tr] + i] != 0.0f)
+                zero = 0;
+        }
+        if (!same && !zero) {
+            snprintf(msg, sizeof msg,
+                     STAMP " sun: the track at %#x holds neither the stock keys this build was"
+                            " read from nor an unbuilt zero block, so it is not the shape the"
+                            " sun state reads: the sun key tables are left as they are and the"
+                            " shadows keep working",
+                     sun_addr[tr]);
+            LogMsg(msg);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* one preset into the client's own shapes: values first, then the same count
+ * of times, which is where the next track begins and why a preset that added
+ * a key would write over its neighbour. */
+static void SunPut(unsigned tr, const float *t, const float *deg)
+{
+    float *kv = (float *)(size_t)sun_addr[tr];
+    unsigned i;
+    for (i = 0; i < sun_n[tr]; ++i) {
+        kv[i] = deg[i] * SUN_D2R;
+        kv[sun_n[tr] + i] = t[i];
+    }
+}
+
+static void SunWrite(unsigned which)
+{
+    const struct SunPreset *p = &sun_presets[which];
+    SunPut(0u, p->t_az_l,  p->az_l);
+    SunPut(1u, p->t_pol_l, p->pol_l);
+    SunPut(2u, p->t_az_d,  p->az_d);
+    SunPut(3u, p->t_pol_d, p->pol_d);
+}
+
+/* shadow-mod.sun, next to the mode file: absent or clock means the clock
+ * decides, which is the concept; off means leave the stock sun alone; a
+ * preset name forces that one, which is how a preset is watched without
+ * waiting for the clock to come round to it. */
+static void SunReadChoice(void)
+{
+    char path[MAX_PATH];
+    char tok[24];
+    FILE *f;
+    int c, n = 0;
+    unsigned i;
+
+    snprintf(path, sizeof path, "%s\\shadow-mod.sun", g_dir);
+    f = fopen(path, "r");
+    if (!f)
+        return;
+    while (n < 23 && (c = fgetc(f)) != EOF) {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            if (n)
+                break;
+            continue;
+        }
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '-' ||
+            (c >= '0' && c <= '9'))
+            tok[n++] = (char)c;
+    }
+    fclose(f);
+    tok[n] = 0;
+    if (!n)
+        return;
+    if (CiEqName(tok, "off") || CiEqName(tok, "stock")) {
+        g_sun_off = 1;
+        return;
+    }
+    if (CiEqName(tok, "clock"))
+        return;
+    for (i = 0; i < SUN_PRESETS; ++i) {
+        if (CiEqName(tok, sun_presets[i].name)) {
+            g_sun_forced = (int)i;
+            return;
+        }
+    }
+    LogMsg(STAMP " sun: shadow-mod.sun says something that is not clock, off or one of the"
+           " preset names, so the clock decides");
+}
+
+/* keep the arc up. The preset is picked from the client's own clock at every
+ * chunk visit, so it settles onto the real clock as soon as the world frames
+ * start stamping the block, and the visit is also what puts the key set back
+ * if the day-night file rebuilt its tracks behind the guard bits after
+ * install. The clock crossing a window boundary applies the next preset and
+ *  says so once per preset: a chunk visit is hot, so nothing here logs twice
+ * for the same preset. */
+static void SunKeepArc(void)
+{
+    unsigned hmin, clock = 0, which;
+    char msg[1024]; /* the applied line names the clock, the preset and the arc's
+                      * own numbers, and runs past 600 bytes */
+
+    if (g_sun_off) {
+        if (!g_sun_said_off) {
+            g_sun_said_off = 1;
+            LogMsg(STAMP " sun: shadow-mod.sun said off, so the stock sun key tables are left"
+                   " alone and the world keeps its fixed 45 deg bearing");
+        }
+        return;
+    }
+    if (!g_sun_pin)
+        g_sun_pin = SunPin() ? 1 : -1;
+    if (g_sun_pin < 0)
+        return;
+    hmin = SunHalfMinute(&clock);
+    if (g_sun_forced >= 0)
+        which = (unsigned)g_sun_forced;
+    else {
+        int w = SunPick(hmin);
+        if (w < 0)
+            w = (int)SUN_STOCK_PRESET;
+        which = (unsigned)w;
+    }
+    if (which >= SUN_STOCK_PRESET) {
+        if (!g_sun_said_stock) {
+            g_sun_said_stock = 1;
+            snprintf(msg, sizeof msg,
+                     STAMP " sun: the client's clock at 0x%x+%x reads %02u:%02u (the float is 0.%04u,"
+                            " half-minute %u of %u), which is %s's window: that preset is the stock sun, so"
+                            " nothing is written and the world keeps its stock sun. enter at another hour"
+                            " and the same line names the arc that gets written",
+                     SUN_TOD_STATE, SUN_TOD_OFF, hmin / 120u, (hmin % 120u) / 2u, clock, hmin, SUN_HMIN_DAY,
+                     sun_presets[which].name);
+            LogMsg(msg);
+        }
+        return;
+    }
+    if ((int)which == g_sun_applied) {
+        if (!SunHoldsStock())
+            return;
+        /* the tracks are back to the stock keys under a preset that is not
+         * stock: the day-night file built its tracks after install. One line,
+         * then the keys are put back, and the arc carries on. */
+        if (!g_sun_said_back) {
+            g_sun_said_back = 1;
+            snprintf(msg, sizeof msg,
+                     STAMP " sun: the key tables at 0x%x and 0x%x hold the stock keys again"
+                            " under %s, so the day-night file built its tracks after install:"
+                            " the keys are written again here, and the next chunk visit keeps"
+                            " them, so a stock sun in game after this line is that rebuild",
+                     sun_addr[0], sun_addr[2], sun_presets[which].name);
+            LogMsg(msg);
+        }
+        SunWrite(which);
+        return;
+    }
+    SunWrite(which);
+    g_sun_applied = (int)which;
+    if (!(g_sun_said_preset & (1u << which))) {
+        g_sun_said_preset |= (1u << which);
+        snprintf(msg, sizeof msg,
+                 STAMP " sun arc: the client's clock at 0x%x+%x reads %02u:%02u (the float is 0.%04u,"
+                        " half-minute %u of %u), so %s is the preset written into the client's own key"
+                        " tables at 0x%x (light azimuth and polar), 0x%x (disc azimuth) and"
+                        " 0x%x (disc polar): the disc's azimuth runs from %u deg to %u deg,"
+                        " %u deg over the day, and its polar angle goes from %u deg through"
+                        " %u deg back to %u deg, so the sun crosses the horizon at both ends"
+                        " instead of rocking on one bearing; the light tracks are the disc's"
+                        " antipode, so the shading follows the sun you can see, and 0x%x"
+                        " interpolates it every frame. re-asserted at every chunk visit",
+                 SUN_TOD_STATE, SUN_TOD_OFF, hmin / 120u, (hmin % 120u) / 2u, clock, hmin, SUN_HMIN_DAY,
+                 sun_presets[which].name, sun_addr[0], sun_addr[2], sun_addr[3],
+                 /* the arc's own numbers, read off the table so the line can be checked */
+                 (unsigned)sun_presets[which].az_d[0], (unsigned)sun_presets[which].az_d[2],
+                 (unsigned)(sun_presets[which].az_d[2] - sun_presets[which].az_d[0]),
+                 (unsigned)sun_presets[which].pol_d[0], (unsigned)sun_presets[which].pol_d[2],
+                 (unsigned)sun_presets[which].pol_d[4], SUN_EVAL_ADDR);
+        LogMsg(msg);
+    }
+}
+
 /* ---------------------------------------------------- the per-chunk fix **/
 
 /* Called by the asm entry with thiscall layout: this in ecx, record on the
@@ -842,6 +1291,15 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
      * on the client's own loading path. */
     if (g_silent)
         return;
+
+    /* sv14's sun, before the map check and before the header is read: the
+     * arc only writes the client's own key tables, so it does not care which
+     * map or payload this chunk belongs to, and it runs in every rung that
+     * reaches here at all -- h and f; b and d returned just above, and n, a and
+     * c never call the fixup. Cheap on the hot path: one float read off the
+     * client's day-night state, a window compare, and a dozen float writes when
+     * the preset changed or the keys were lost. */
+    SunKeepArc();
 
     /* the very first chunk to reach Load is audited whole, before the map
      * check and before anything could be written: the crash reports say the
@@ -1463,6 +1921,21 @@ static int Install(void)
              " anywhere in the file also turns the diagnostic lines on",
              g_mode, g_dir);
     LogVerb(msg);
+
+    /* sv14's sun choice, read next to the mode file and before any mode can
+     * return: absent or clock means the clock written at the first chunk visit
+     * decides, which is the concept; off leaves the stock sun alone; a preset
+     * name forces that arc, which is how one arc is watched without waiting for
+     * the day to come round to it. Only h and f reach the sun write: n, a and c
+     * never call the fixup, and b and d return above it, so those five say so
+     * here -- the clock is only worth reading once the world is stamping it. */
+    SunReadChoice();
+    if (g_mode != 'h' && g_mode != 'f')
+        LogVerb(STAMP " sun arc: this rung cannot carry the arc -- n, a and c never call the per-chunk"
+                " fixup, and b and d return before it -- so the client's own sun key tables at"
+                " 0xce8d90, 0xce8db0, 0xce8d4c and 0xce8d64 stay as the day-night file built them."
+                " mode h needs no .dat and prints the clock, the preset and the arc it wrote, so"
+                " h is the rung to test the sun on; f carries the arc too");
 
     if (g_mode == 'n') {
         /* the inert rung: the .dat is not opened, nothing is allocated, the
