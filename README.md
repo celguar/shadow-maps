@@ -248,7 +248,7 @@ build chose, so an off-by-eight is a build failure, not an in-game crash.
 
 ## What this machine produces
 
-`out\ShadowMaps.dll` 138,752 bytes and `build\Release\ShadowMaps.dll` 139,776
+`out\ShadowMaps.dll` 142,848 bytes and `build\Release\ShadowMaps.dll` 144,384
 bytes, both i686, both exporting `Load`, both importing only `KERNEL32.dll`,
 both accepted by `verify_dll.py` with zero complaints — i.e. the stub's stack
 math is read from real linked code, not from a comment.
@@ -267,27 +267,33 @@ any non-zero `Load` with its own generic `was not loaded properly (load
 function failed)` popup — that popup is never the reason, this file is:
 
 ```
-[12 ms after this DLL was loaded] sv9 mode 'f' read from 'G:\Games\twmoa_1181\shadow-mod.mode' (no such file means f): n = inert, a = .dat plus arena, no hook, b = hook plus an empty call, c = the detour alone with no call at all, d = the same call from the client's own frame at 0x6AF5F3, h = hook plus audit, no payload, f = full
-sv9 no shadowmaps.dat where the DLL is: the client keeps stock shadows; looked in 'G:\Games\twmoa_1181\shadowmaps.dat' (rename the variant .dat to that name, it belongs beside the DLL, not beside the game)
-sv9 mode n: nothing read, allocated or patched, the client is untouched; shadows stay stock, the popup is expected
-sv9 handler: first-chance vectored handler registered, so the next access violation logs the chunk that was being built and the address the client read (the client's own report is still written afterwards)
+[12 ms after this DLL was loaded] sv10 mode 'h' read from 'G:\Games\twmoa_1181\shadow-mod.mode' (no such file means f): n = inert, a = .dat plus arena, no hook, b = hook plus an empty call, c = the detour alone with no call at all, d = the same call from the client's own frame at 0x6AF5F3, h = hook plus audit, no payload, f = full
+sv10 no shadowmaps.dat where the DLL is: the client keeps stock shadows; looked in 'G:\Games\twmoa_1181\shadowmaps.dat' (rename the variant .dat to that name, it belongs beside the DLL, not beside the game)
+sv10 mode n: nothing read, allocated or patched, the client is untouched; shadows stay stock, the popup is expected
+sv10 handler: first-chance vectored handler registered, so the next access violation logs the chunk that was being built and the address the client read (the client's own report is still written afterwards)
 sv10 mode c installed: hook 0x6AF5F0 patched, resume 0x6AF5F6, detour at 0x........, the landing replays the prologue and returns without calling anything -- no .dat read, nothing allocated, no chunk header read or touched (shadows stay stock; this mode exists to test the store and the landing alone)
 sv10 mode d installed: hook 0x6AF5F3 patched (the 5-byte E9 covers mov eax,[ebp+8] / push ebx / push esi), resume 0x6AF5F8 (push edi), detour at 0x........, fixup returns immediately -- no .dat read, nothing allocated, no chunk header read or touched (shadows stay stock; this mode exists to test the stub's argument lookup)
 sv10 first fixup call: this 0x........ record 0x........ after 1 visits, mode d -- the hooking rungs print this once, mode c never does
 sv10 mode b installed: hook 0x6AF5F0 patched, resume 0x6AF5F6, detour at 0x........, fixup returns immediately -- no .dat read, nothing allocated, no chunk header read or touched (shadows stay stock; this mode exists to test the stub alone)
-sv10 mode h installed: hook 0x6AF5F3 patched (the 5-byte E9 covers mov eax,[ebp+8] / push ebx / push esi), resume 0x6AF5F8 (push edi) -- d's shape, the one the clean mode-d run proved, NOT b's [esp+48] frame, detour at 0x........, fixup audits the first chunk whole and dumps every chunk's ofss -- no .dat read, nothing allocated, no chunk header touched (shadows stay stock)
-sv9 mode a installed footprint only: map 'Azeroth' variant 'shadows-Azeroth-morning', entries 114328, payloads 66413, arena 32 MB resident at 0x........0x........ NO hook, no fixup call, no chunk header touched, so the client runs its own code path whole: ...
+sv10 mode h installed: hook 0x6AF5F3 patched, resume 0x6AF5F8 (push edi) -- d's shape, the one the clean mode-d run proved, NOT b's [esp+48] frame, detour at 0x........, fixup audits the first chunk whole and dumps every chunk's ofss -- no .dat read, nothing allocated, no chunk header touched (shadows stay stock)
+sv10 first fixup call: this 0x2cd20008 record 0x2c3dca46 after 1 visits, mode h -- the hooking rungs print this once, mode c never does
+sv10 audit first chunk: record 0x2c3dca46 fourcc 'KNCM' size 0x254c, hdr 0x2c3dca4e flags 0x8009 indexX 0 indexY 0x5
+sv10 audit first chunk: MCSH at hdr+0x2c is 0x4ec -> address 0x2c3dcf3a, fourcc at -8 'HSCM'
+sv10 mode a installed footprint only: map 'Azeroth' variant 'shadows-Azeroth-morning', entries 114328, payloads 66413, arena 32 MB resident at 0x........0x........ NO hook, no fixup call, no chunk header touched, so the client runs its own code path whole: ...
 sv10 mode f installed: map 'Azeroth' variant 'shadows-Azeroth-morning', entries 114328, payloads 66413, arena 32 MB at 0x........0x........, hook 0x6AF5F3 patched with resume 0x6AF5F8 -- d's shape, the one the clean mode-d run proved, NOT b's frame, detour at 0x........; matched chunks get flags |= 1, hdr+0x2c = arena buffer - hdr and hdr+0x30 = 512, so the client's own gate, CreateShadowTexture and the decoders read live .dat bytes
-handler: ACCESS_VIOLATION c0000005 at 6b0fb7, read of 6cf97f32 -- the address the client dereferenced. last chunk seen: this 2b850008 record 2adbe132, fixup visits 1
-handler: the object this chunk carries: hdr@f08 0x........, record@168 0x........, MCVT@f14 0x6cf97f32, MCNR@f18 0x........, ..., this+0xf14 == the address the client read
-handler: the dying chunk's header: hdr 0x........ flags 0x8009 indexX 0x2 indexY 0xa, ofs MCVT 0x88 MCNR 0x2d4 MCLY 0x49c MCRF 0x4b4 MCAL 0x6c4 MCSH 0x4bc MCSE 0x1364 MCLQ 0x6cc, global col 0x1b2 row 0x20a
+handler: ACCESS_VIOLATION 0xc0000005 at 0x6b0fb7, read of 0x6cf97f32 -- the address the client
+dereferenced. last chunk seen: this 0x2bac0008 record 0x2b17ca46, fixup visits 1
+handler: the object this chunk carries: hdr@0xf08 0x6af5fe, record@0x168 0x6af5f6, MCVT@0xf14 0x6cf97f32, MCNR@0xf18 0x8d6af5ff, MCSH@0xf1c 0x51f3fe50, MCLY@0xf20 0x1af65e4e, MCAL@0xf24 0x4c58117, MCRF@0xf28 0x89d7448b, MCLQ@0xf2c 0xe93980fe, MCSE@0xf30 0xcef64cfe. this+0xf14 == the address the client read
+handler: the dying chunk's header: hdr 0x2b17ca4e flags 0x8009 indexX 0 indexY 0x5, ofs MCVT 0x88 MCNR 0x2d4 MCLY 0x49c MCRF 0x4e4 MCAL 0x6f4 MCSH 0x4ec MCSE 0x254c MCLQ 0x1efc, global col 0x1c0 row 0x205
 last chunk seen: this 0x........ record 0x........ hdr 0x........ flags 0x8009 indexX 0x2 indexY 0xa, ofs MCVT 0x88 MCNR 0x2d4 MCLY 0x49c MCRF 0x4b4 MCAL 0x6c4 MCSH 0x4bc MCSE 0x1364 MCLQ 0x6cc, global col 0x1b2 row 0x20a
 audit first chunk: record 0x........ fourcc 'KNCM' size 0x1364, hdr 0x........ flags 0x8009 indexX 0x2 indexY 0xa
-audit first chunk: MCVT at hdr+0x14 is 0x........ -> address 0x........, fourcc at -8 'MCVT'
-audit first chunk: MCSH at hdr+0x2c is 0x........ -> address 0x........, fourcc at -8 'MCSH'
-fixup: first chunk with no payload: gy 519 gx 439 key 531895 (the bake left it without a shadow map, or its tile is not in this set)
-fixup: first chunk matched: gy 352 gx 352 key 360800, shadow drawn from arena+0, this 0x........ record 0x........ hdr 0x........ arena 0x........, hdr flags 0x........ size 0x200 ofs 0x........, mcvtof 0x........ ... mclof 0x........
-fixup: 10000 chunks matched so far, of 114328 entries
+audit first chunk: MCVT at hdr+0x14 is 0x........ -> address 0x........, fourcc at -8 'TVCM'
+audit first chunk: MCSH at hdr+0x2c is 0x........ -> address 0x........, fourcc at -8 'HSCM'
+fixup: first chunk with no payload: gy 560 gx 496 key 573936 (the bake left it without a shadow map, or its tile is not in this set)
+fixup: first chunk matched: gy 517 gx 448 key 529856, shadow drawn from arena+0, this 0x2dac0008
+ record 0x2d17ca46 hdr 0x2d17ca4e arena 0x6ac0000, hdr flags 0x8009 size 0x200 ofs 0xd99435b2,
+ mcvtof 0x88 mcnrof 0x2d4 mclyof 0x49c mcrof 0x4e4 mcalof 0x6f4 mcseof 0x254c mclof 0x1efc
+fixup: 10000 chunks matched so far, of 114328 entries   (never printed in the sv10 run: that run walked one starting area, so it matched under 10000 chunks)
 ```
 
 Every line is prefixed by the milliseconds since **this DLL was loaded** and
@@ -303,36 +309,52 @@ resolves to, which is the resolver's own `lea esi,[ofs+record+8]` math.
 that the arena is what is being drawn and how far under 114,328 the tiles not
 in this set leave it. The first-chunk line names the chunk the client really
 loaded first and comes in both flavours: this set covers 487 of Azeroth's 741
-tiles, so a chunk outside it (`gy 519 gx 439` is tile `27,32`) legitimately logs
-"no payload", and only the `first chunk matched` line proves a payload was drawn.
+tiles, so a chunk whose tile is outside it logs "no payload" right away, and so
+does a chunk inside a covered tile that the bake left without a shadow map — the
+sv10 run logged that second kind, `gy 560 gx 496` being tile `31,35`. Only the
+`first chunk matched` line proves a payload was drawn, and that line is what the
+sv10 mode-`f` run printed.
 That line also dumps the header the write went into — `this`, `record`, `hdr`,
 the arena and all eight sub-record ofss — so the addresses a crash report names
 can be matched against it. The `audit` lines are the same facts for a chunk that
-was never written to, which is what the current build is about.
+was never written to, and the sv10 mode-`h` run printed them whole: all eight
+slots resolved on their own fourcc, beside a record size that is exactly where
+the next `MCNK` sits.
 
 ## Mode ladder (sv10)
 
-Two real runs settled the last open question about the detour. sv9's `c` (the
-store and landing at `0x6AF5F0`, a landing that **calls nothing**) and `d` (the
-store at `0x6AF5F3`, the call, the record read from `[ebp+8]` on the client's own
-live frame) **both entered the world clean, with no new crash report and stock
-shadows** — stock being exactly what two rungs that write nothing must show. The
-handler block never printed for either, so there was no second access violation.
-Put together with the earlier `n`-clean and `a`-clean runs and the sv7/sv8
-crashes, the list of what is proven is now: the 34 MB arena, the `.dat` read, the
-5-byte store, the landing, the replayed prologue, and **both** resume points
-(`0x6AF5F6` and `0x6AF5F8`); `verify_dll.py` re-checked all three detour tables
-in the linked image, and `probe_hooksite.py` insists every store address and every
-resume address is a real instruction start in the client. **The only piece of the
-detour still known to be wrong is `b`'s `[esp+48]` argument lookup** through
-`pushad`/`pushfd` and its 8-byte scratch — and sv9's own `h`/`f` runs never got
-as far as the client: they printed `build defect: the detour byte table and its
-slot offsets disagree, refusing to patch`, because `BuildStub`'s sanity check
-expected a `0x68` push in front of every resume slot while `b`'s resume is the
-operand of a `0xB8` `mov eax,imm32`. sv10 fixes that check to be shape-aware and
-puts the rungs that do real work (`h`, `f`) on **`d`'s shape**, since that is the
-shape a real run proved good; `b` keeps its own shape so that re-running it is
-still the confirmation that the lookup was the whole difference.
+Five rungs of the ladder have been run on the real client — `c` and `d` on the sv9
+build, `h`, `f` and `b` on this one — and the shipping path works.
+
+sv9's `c` (the store and landing at `0x6AF5F0`, a landing that **calls
+nothing**) and `d` (the store at `0x6AF5F3`, the call, the record read from
+`[ebp+8]` on the client's own live frame) entered the world clean with stock
+shadows; sv10's `h` entered the world and printed its `first fixup call` line,
+the whole first-chunk audit block and 2000 per-chunk header dumps; and sv10's
+`f` — **loaded the world and drew the baked set** — the morning shadows were on
+the ground, and the log carries `fixup: first chunk matched: gy 517 gx 448 key
+529856, shadow drawn from arena+0`. So the `.dat`, the 34 MB arena, the 5-byte
+store, the landing, the replayed prologue, both resume points, the audit's file
+I/O inside `Load` and the `MCNK` header writes are all proven by real runs.
+
+The one rung that still crashes is `b`, and its own run says why, 
+not its argument lookup. Its `first fixup call` line printed a valid pair (`this
+0x2bac0008 record 0x2b17ca46`), and the handler's block named the rest: `Load`
+came back at `0x6AF5F6` holding **the resume address in `eax`** where it wants
+the record, because `stub_code` ends in `mov eax,<resume> / jmp eax` — and the
+`mov eax,[ebp+8]` one line above it is exactly what that clobbers. `Load` then
+files the resume address as the chunk's record (`0x6AF5FF mov [esi+0x168],eax` — the
+dump reads `record@0x168 = 0x6af5f6`, and `0x6AF5F0 + 6 = 0x6AF5F6`), and the
+resolver's `lea edx,[eax+8]` makes `hdr@0xf08 = 0x6af5fe` — a dword inside
+`CMapChunk::Load`'s own code. So the eight sub-record ofss are read out of `.text`,
+and the one the crash reports keep naming is MCVT: the dword at `0x6AF5FE+0x14 =
+0x6AF612` is `0x6C8E8934`, hence `this+0xf14 = 0x6AF5FE + 0x6C8E8934 = 0x6CF97F32`,
+which is the exact address every report since sv3 has named, read by `mov ecx,[ebx]`
+at `0x6B0FB7`. Every cursor the handler printed is `hdr + (that .text dword)`, and
+the dying chunk's real header (MCVT `0x88`, MCSH `0x4ec`, MCSE `0x254c`, global col
+`0x1c0` row `0x205`) was printed intact beside it. `c`, `d`, `h` and `f` return
+through `push <resume> / ret`, which leaves `eax` = record; `b` does not, and that
+is the whole difference. `StubShape` is where that rule lives.
 
 Every hooking rung now also prints one `first fixup call: this .. record ..` line
 the first time the fixup is entered — printed **before** the mode gates, so even a
@@ -350,9 +372,19 @@ means `f`.
 | `a` | the `.dat` is read and the whole arena is resident, **no hook, no call, no write** | a crash here while `n` was clean would mean the reservation itself breaks the client. **Ran: clean, 34 MB resident** |
 | `c` | the store and the landing only: `0x6AF5F0` → stub replays the 6 prologue bytes and returns through `push <resume>` / `ret`, **calls nothing at all**, so no C code of this DLL runs on the client's loading path and eax/ecx/edx/esp/flags are exactly what the replay left them | store + landing + resume point, with nothing else in the picture. **Ran (sv9): clean** — entered the world, stock shadows, its three install lines and nothing else, and no `first fixup call` line because this landing calls nothing |
 | `d` | the same call as `b`, found a different way: the `E9` sits at `0x6AF5F3`, its 5 bytes cover `mov eax,[ebp+8]` / `push ebx` / `push esi` whole, the resume is the next instruction boundary `0x6AF5F8` (`push edi`), and the stub takes the record from **`[ebp+8]`** and `this` from `ecx` — no `esp` displacement is part of finding them | `b`'s `[esp+48]` lookup, against everything else. **Ran (sv9): clean** — entered the world with stock shadows. Read `shadow-mod.log.txt` for its `first fixup call` line: that line is what makes this mean *the call happened with a pair of pointers* rather than *nothing happened* |
-| `b` | the detour and a call per chunk that does **nothing at all** — no read, no log, no write, nothing allocated, and the only rung left on `b`'s own shape | the rung sv8's evidence is quoted from. **Ran (sv8): crashed** at the same `0x6B0FB7` reading the same `0x6CF97F32`, log ended at its two install lines. With `c` and `d` clean this isolates `b`'s `[esp+48]` lookup, and sv10 keeps this rung only so that re-running it confirms that |
-| `h` | the detour, the first-chunk audit whole, and one compact header dump per chunk — no `.dat`, nothing allocated, no header touched, and riding **`d`'s shape** now | the audit and its `fopen`/`fprintf` inside the client's loading path. sv7 ran it on `b`'s shape and it crashed; sv9's run never installed at all (`build defect`); **sv10 has not run yet** — it must print the `first fixup call` line, the audit block and the per-chunk dumps, not just its install lines |
-| `f` | everything: `.dat`, arena, hook and the matched-chunk writes, riding **`d`'s shape** | the only rung expected to draw shadows. sv7 crashed on `b`'s shape and never reached a `first chunk matched` line; sv9 refused at install; **sv10 has not run yet** — a clean `f` is the real confirmation and needs that `first chunk matched` line plus shadows on the ground |
+| `b` | the detour and a call per chunk that does **nothing at all** — no read, no log, no write, nothing allocated, and the only rung left on `b`'s own shape | the shape that breaks the return rule above, kept as the evidence for it. **Ran (sv8) and
+again (sv10): crashed** both times at `0x6B0FB7` reading `0x6CF97F32`, and the sv10 run
+named why: its `first fixup call` line printed a valid `this 0x2bac0008 record
+0x2b17ca46`, so the `[esp+48]` lookup was right, while the handler dumped `record@0x168
+= 0x6af5f6` and `hdr@0xf08 = 0x6af5fe` — the resume address filed as the chunk's
+record. Nothing that ships rides this shape |
+| `h` | the detour, the first-chunk audit whole, and one compact header dump per chunk — no `.dat`, nothing allocated, no header touched, and riding **`d`'s shape** now | the audit and its `fopen`/`fprintf` inside the client's loading path. **Ran (sv10): clean** — entered the world, printed the `first fixup call` line, the whole
+first-chunk audit block with all eight slots resolving on their own fourcc, and 2000
+per-chunk header dumps. The audit and its `fopen`/`fprintf` survive inside `Load` |
+| `f` | everything: `.dat`, arena, hook and the matched-chunk writes, riding **`d`'s shape** | the only rung expected to draw shadows. **Ran (sv10): drew the set.** The world loaded, the morning shadows showed on the ground,
+and the log carries `fixup: first chunk matched: gy 517 gx 448 key 529856, shadow drawn
+from arena+0` followed by `fixup: first chunk with no payload: gy 560 gx 496 key 573936` —
+a chunk in a tile this set does not cover. The contract holds end to end |
 
 `n` and `a` install nothing on purpose, so `Load` answers **4**, and VanillaFixes
 answers any non-zero `Load` with its generic
@@ -421,9 +453,9 @@ del G:\Games\twmoa_1181\shadow-mod.log.txt        # between rungs
 echo a > G:\Games\twmoa_1181\shadow-mod.mode      # ran: clean
 echo c > G:\Games\twmoa_1181\shadow-mod.mode      # ran (sv9): clean, entered the world
 echo d > G:\Games\twmoa_1181\shadow-mod.mode      # ran (sv9): clean, entered the world
-echo h > G:\Games\twmoa_1181\shadow-mod.mode      # sv10: rides d's shape, run it next
-echo f > G:\Games\twmoa_1181\shadow-mod.mode      # sv10: the shipping path
-echo b > G:\Games\twmoa_1181\shadow-mod.mode      # ran (sv8): crashed; rerun to confirm the lookup
+echo h > G:\Games\twmoa_1181\shadow-mod.mode      # ran (sv10): clean, printed the audit
+echo f > G:\Games\twmoa_1181\shadow-mod.mode      # ran (sv10): drew the baked set
+echo b > G:\Games\twmoa_1181\shadow-mod.mode      # ran (sv8, sv10): crashed by its jmp eax
 ```
 
 | What the run shows | What it means |
@@ -431,54 +463,58 @@ echo b > G:\Games\twmoa_1181\shadow-mod.mode      # ran (sv8): crashed; rerun to
 | `n` crashes | nothing here is at fault: look at the client and its patch state itself (which `.adt`/MPQ set it is really reading) |
 | `n` clean, `a` crashes | the reservation is the cause: keep the payload bounded (expand-on-demand blocks, or map the `.dat`'s payload area) instead of one arena asked for before any chunk loads. **Did not happen: `a` ran clean with all 34 MB resident** |
 | `a` clean, a hooking rung crashes and `c` crashes with it | the store, the landing or the resume point is wrong — `c` is the only detour shape that involves nothing else, so the handler block says whether the fault is still in the client's own `BuildVertices` read or inside the stub page. **Did not happen: `c` ran clean** |
-| `c` clean, `d` clean | settled by the sv9 runs: the store, the landing, the replayed prologue and **both** resume points are good, so the only detour piece left known-bad is `b`'s `[esp+48]` argument lookup — and that is why `h` and `f` now ride `d`'s shape instead of `b`'s |
+| `c` clean, `d` clean | settled by the sv9 runs: the store, the landing, the replayed prologue and
+**both** resume points are good. The one detour shape still known bad is `b`'s, and it is bad at
+its **return** — `mov eax,<resume> / jmp eax` puts the resume address in `eax`, which is the
+record argument — not at its argument lookup |
 | `d` clean but its log has no `first fixup call` line | the detour is in and the client tolerated it, but the stub never reached the call, so `d` proved the store and nothing about the call: read the stub's `push`/`call` bytes again rather than the client |
-| `h` clean with a `first fixup call` line, an audit block and per-chunk dumps | the audit and its `fopen`/`fprintf` survive inside the client's loading path, which is what `f` then adds nothing to. **Not yet run on sv10** |
-| `h` clean, `f` crashes | the write is the cause, and the handler block plus the `first chunk matched` line say which field of which header. **Not yet reached** |
-| `f` enters the world with a `first chunk matched` line and shadows on the ground | the contract holds end to end, and this is the first real confirmation. **Not yet reached** |
-| `b` crashes with `c` and `d` clean | `b`'s `[esp+48]` displacement is not where its own `pushad`/`pushfd`/scratch put the record, so it was calling the fixup with a garbage argument pair all along. **What sv8 saw, and what sv10's rungs no longer ship** |
+| `h` clean with a `first fixup call` line, an audit block and per-chunk dumps | the audit
+and its `fopen`/`fprintf` survive inside the client's loading path, which is what `f` then
+adds nothing to. **Ran (sv10): exactly that** |
+| `h` clean, `f` crashes | the write is the cause, and the handler block plus the `first chunk
+matched` line say which field of which header. **Did not happen: `f` ran clean** |
+| `f` enters the world with a `first chunk matched` line and shadows on the ground | the contract
+holds end to end, and this is the first real confirmation. **Ran (sv10): all of it, with the
+morning set visible on the ground** |
+| `b` crashes with `c`/`d`/`h`/`f` clean | `b`'s landing hands the resume address to `Load`
+in `eax`, the record argument, so the client resolves its `MCNK` header inside its own code
+and every sub-record ofs is `.text`. **What sv8 and sv10 both saw, and the reason nothing
+that ships rides this shape** |
 | no `mode` line at all in the log | `Load` was never called, so the loader, not the hook, stopped the mod |
 
 ## Honest limits
 
-- **No shadow has ever been drawn, and no rung has ever printed a `first chunk
-  matched` line.** Everything above is verified from the built image and from the
-  client's own bytes, not from a screenshot. What *is* proven by real runs is the
-  front half of the path — arena, `.dat`, store, landing, both resume points and
-  the fixup call with its arguments read off the client's frame — and what is
-  still unproven is the audit's file I/O on the loading path (`h`) and the header
-  write (`f`), which sv9 never got to run at all. The first real confirmation is
-  still someone loading it and seeing the shadows.
-- The runs that installed left the client crashing inside `BuildVertices` —
-   `ACCESS_VIOLATION at 0x6B0FB7`, the `mov ecx,[ebx]` that reads the MCVT
-   floats, `ebx = this+0xf14` — with the same referenced address `0x6CF97F32` in
-   every report while `this` moved. None of them had a `first chunk matched` line,
-   so the chunk that died is one this DLL never wrote to. sv6's audit then settled
-   the contract in the client's own memory: `record` really is an `MCNK` record
-   (it prints `'KNCM'`, the client's byte-reversed spelling), `hdr = record + 8`,
-   every table slot resolves as `hdr + value` with the fourcc 8 before it, and
-   the fixed audit (it reads the fourcc at `hdr + ofs - 8`, the resolver's own
-   `lea` math) printed all eight as their own fourcc — `'TVCM'` for MCVT at
-   `0x88`, `'HSCM'` for MCSH at `0x4bc`, `'ESCM'` for MCSE at `0x1364`, `'QLCM'`
-   for MCLQ at `0x6cc` — with the record's own `size 0x1364`, which is exactly
-   where the next `MCNK` sits. So the basis, `FIELD_MCSH_OFS 0x2c` and the whole
-   sub-record table are settled in the client's memory, byte for byte — for the
-   first chunk.
-- **The ladder runs are real evidence, and nothing past `a` has drawn a shadow.**
-   The sv7 four-rung build: `n` clean, `a` clean with the whole 34 MB arena
-   resident and no hook, `h` and `f` crashed entering the world at `0x6B0FB7`
-   reading `0x6CF97F32`. The sv8 build added the rung whose fixup returns before
-   touching anything, and **it crashed the same way**, with the log ending at its
-   two install lines — so no call's work, no allocation and no write is needed for
-   the fault, only the hook. Its crash report is also intact: the client's frame is
-   where the report says it is, with the return address and both arguments, and
-   `this+0xf14` already holds the unmapped `0x6CF97F32` while `ECX` moves. So the
-   poison cursor is in the **object** before `BuildVertices` reads it, and the stub's
-   own ESP math is not what broke the frame. The sv9 build then ran `c` and `d`, and
-   **both entered the world clean** — which is what moved `h` and `f` onto `d`'s
-   shape — and its `h`/`f` runs printed a build defect instead of installing, which
-   sv10's shape-aware slot check fixes. Nothing about the shadow payload has ever
-   been drawn, and no rung has ever reached a `first chunk matched` line.
+- **The shipping path is confirmed in game: sv10's mode `f` loaded the world and drew the
+  baked morning set**, with `fixup: first chunk matched: gy 517 gx 448 key 529856, shadow
+  drawn from arena+0` in the log and the shadows visible on the ground. What has *not* been
+  checked is every chunk: that run walked the chunks around one spawn point, so it matched
+  fewer than the `.dat`'s 114,328 entries — it never reached a `10000 chunks matched so far`
+  line — and its per-chunk dump hit the 2000-chunk cap. A whole-continent walk is still only
+  implied by the coverage the `.dat` states (487 tiles, chunk grid `(352,352)..(707,975)`)
+- **The crash every earlier build produced is now fully explained, and it was never in the
+  `.adt`.** Every hooked run died at `0x6B0FB7`, the `mov ecx,[ebx]` that reads the MCVT
+  floats, reading `0x6CF97F32` while `this` moved. The sv10 mode-`b` handler dump names the
+  reason: `record@0x168 = 0x6af5f6` and `hdr@0xf08 = 0x6af5fe`, which are that rung's own
+  resume address `0x6AF5F0 + 6` and its `+8`, so `Load` had been resumed with `eax` = resume
+  address instead of the record — `stub_code` ends in `mov eax,<resume> / jmp eax`. It
+  then filed that value as the chunk's record and resolved its header table inside its own
+  code, so the ofss are `.text`: the dword at `0x6AF5FE+0x14 = 0x6AF612` is `0x6C8E8934`,
+  hence `this+0xf14 = 0x6AF5FE + 0x6C8E8934 = 0x6CF97F32`, the address every report names. All
+  eight cursors the handler printed reproduce off the client's `.text`. The audit of the same
+  chunk printed the real table beside it (MCVT `0x88`, MCSH `0x4ec`, MCSE `0x254c`, global col
+  `0x1c0` row `0x205`), so the contract, `FIELD_MCSH_OFS 0x2c` and the whole sub-record table
+  are settled in the client's memory byte for byte
+- **The ladder runs are real evidence, and the last one drew the set.** The sv7 four-rung build:
+  `n` clean, `a` clean with the whole 34 MB arena resident and no hook, `h` and `f` crashed at
+  `0x6B0FB7` reading `0x6CF97F32`. The sv8 build added the rung whose fixup returns before
+  touching anything, and **it crashed the same way**, log ending at its install lines — so
+  nothing the call does is needed for the fault, only the hook. Its report is intact: the
+  frame is where the report says, and `this+0xf14` already holds the unmapped value while
+  `ECX` moves. The sv9 build ran `c` and `d`, **both clean**, which moved `h` and `f` onto
+  `d`'s shape; its `h`/`f` runs printed `build defect` instead of installing, which sv10's
+  shape-aware slot check fixes. The sv10 build then ran `h` clean with a full audit and `f`
+  **with the baked set drawn on the ground**, and re-ran `b`, which crashed and named its own
+  return form as the reason. Nothing about the shadow payload is unexplained any more
 - The crash dumps the client writes next to its reports (`Errors\*.dmp`, WoW's own
    `MDMP` container: magic, timestamp, then `(type, size, file-offset)` directory
    entries and a memory list of `(address, high, size, file-offset)` blocks) do

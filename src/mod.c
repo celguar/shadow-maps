@@ -939,18 +939,36 @@ static const unsigned char stub_code[] = {
 #define STUB_SLOT_FIXUP  12u
 #define STUB_SLOT_RESUME 30u
 
+/* What stub_code's last two bytes really did, settled by the sv10 mode-b run
+ * instead of guessed at: `mov eax,<resume> / jmp eax` resumes at 0x6AF5F6 with
+ * eax = 0x6AF5F6, the resume address, not the record. Load then runs its own
+ * body on that value: 0x6AF5FF mov [esi+0x168],eax files the resume address as
+ * the chunk's record, 0x6AF60A mov eax,[esi+0xf08] and the resolver's lea at
+ * 0x6AF970 make hdr = eax+8 = 0x6AF5FE -- a dword inside CMapChunk::Load's own
+ * code -- and the eight "sub-record ofss" become whatever the .text bytes at
+ * 0x6AF5FE+ofs hold. The one the crash reports keep naming is MCVT: the dword at
+ * 0x6AF5FE+0x14 = 0x6AF612 is 0x6C8E8934, so this+0xf14 = hdr+ofs = 0x6AF5FE +
+ * 0x6C8E8934 = 0x6CF97F32, and BuildVertices' loop at 0x6B0FB7 dereferences it:
+ * ACCESS_VIOLATION reading 0x6CF97F32, exactly the report every run got. The
+ * run's own audit printed the real header beside it (MCVT 0x88, MCSH 0x4ec ...),
+ * which says the .adt's table was intact and only the resume form broke it. stub
+ * c and d therefore return through push <resume> / ret, which leaves eax alone,
+ * and this rung stays in the ladder only as the evidence for that rule. */
 /* sv9's other two detour shapes, same page, same patch rule.
  *
  * stub_code_c is mode c: the landing replays the prologue and jumps back, and
  * NOTHING else -- no pushad, no call, no C code on the path -- so the question
  * this rung asks is only "did the 5-byte store at 0x6AF5F0 land, does the
- * landing run, is 0x6AF5F6 the right resume point". At the landing esp is the
- * function's own entry esp E, since nothing has been pushed yet at 0x6AF5F0;
- * the replayed push ebp takes esp to E-4, which is exactly what 0x6AF5F6
- * expects, and `push <resume> / ret` is the jmp form that leaves eax = record,
- * ecx = this, edx and the flags alone, which jmp eax would not (it would take
- * the resume address in eax). 12 bytes, one imm32 slot at +7, the operand of
- * the 0x68 push.
+ * landing run, is 0x6AF5F6 the right resume point", and a real sv9 run answered
+ * all three: clean. At the landing esp is the function's own entry esp E, since
+ * nothing has been pushed yet at 0x6AF5F0; the replayed push ebp takes esp to
+ * E-4, which is exactly what 0x6AF5F6 expects, and `push <resume> / ret` is the
+ * jmp form that leaves eax = record, ecx = this, edx and the flags alone. The
+ * alternative, `mov eax,<resume> / jmp eax`, does not: it hands the client its
+ * own resume address in the register that holds the record argument, and that is
+ * the whole reason every sv3..sv8 and sv10-b run died. See the note on stub_code
+ * below for the arithmetic. 12 bytes, one imm32 slot at +7, the operand of the
+ * 0x68 push.
  *
  * stub_code_d is mode d: the same empty call, but the store moved to 0x6AF5F3,
  * three bytes into the same prologue, where ebp is already the client's own
@@ -1005,15 +1023,18 @@ static const unsigned char stub_code_d[] = {
 
 /* Which detour shape a rung rides. This is the one place the ladder says which
  * frame is in play, and it changed after real runs: sv8's mode b (the 0x6AF5F0
- * store, pushad/pushfd and the record read at [esp+48]) crashed entering the
- * world at 0x6B0FB7, while the sv9 runs of mode c (that same store and landing,
- * no call) and mode d (the 0x6AF5F3 store, the call, arguments taken from
- * [ebp+8] on the client's own live frame) BOTH entered the world clean. So the
- * store, the landing, the replayed prologue and both resume points are proven
- * good, and the only detour piece still known to be bad is the [esp+48]
- * lookup through pushad/pushfd -- therefore the rungs that do real work (h and
- * f) ride d's shape, and only rung b still emits b's shape, so re-running b is
- * what confirms the lookup was the whole difference. */
+ * store, pushad/pushfd and [esp+48] record lookup) crashed entering the world at
+ * 0x6B0FB7, while the sv9 runs of mode c (that same store and landing, no call)
+ * and mode d (the 0x6AF5F3 store, the call, arguments taken from [ebp+8] on the
+ * client's own live frame) BOTH entered the world clean. The sv10 runs then put
+ * h and f on d's shape and both did real work -- h printed its audit block and
+ * f drew the baked set on the ground -- while b, re-run, crashed again and the
+ * instrument named why: b's `mov eax,<resume> / jmp eax` landing leaves the resume
+ * address in eax where Load wants the record, so the client resolves its header
+ * inside its own code (the note above stub_code has the arithmetic). The [esp+48]
+ * lookup was never the problem: b's own first-call line printed a valid this and
+ * record pair. So the rule the ladder now carries is about the RETURN form, and
+ * only rung b still emits the shape that breaks it. */
 static char StubShape(char rung)
 {
     if (rung == 'c') return 'c';
@@ -1294,13 +1315,16 @@ static int Install(void)
          * crashed at 0x6B0FB7 reading 0x6CF97F32, and the sv9 runs put mode c
          * (this same store at 0x6AF5F0 and this same resume point, landing that
          * calls nothing) and mode d (the 0x6AF5F3 store, the call, arguments
-         * from [ebp+8]) both clean entering the world with no new crash. So the
-         * store, the landing, the replayed prologue and both resume points are
-         * proven, and the [esp+48] lookup through pushad/pushfd is the one
-         * piece of the detour still known to be wrong. Re-running b is how that
-         * is confirmed once more: a b that crashes with c and d clean says the
-         * lookup is the whole difference, and that is why nothing that ships
-         * rides this shape any more. */
+         * from [ebp+8]) both clean entering the world with no new crash. The
+         * sv10 re-run of b crashed again, same instruction, same referenced
+         * address, and the instrument named the reason in the run's own log:
+         * b's landing ends in mov eax,<resume> / jmp eax, so the client comes
+         * back to 0x6AF5F6 with eax = 0x6AF5F6 instead of the record, Load
+         * files that value as the chunk's record at 0x6AF5FF and resolves hdr
+         * = eax+8 = 0x6AF5FE, inside its own code -- see the note above stub_code
+         * for the arithmetic that lands exactly on 0x6CF97F32. The [esp+48]
+         * lookup was never wrong: b's own first-call line printed a valid this
+         * and record pair. Nothing that ships rides this shape. */
         if (!PatchHook('b'))
             return 0;
         g_silent = 1;
@@ -1322,11 +1346,12 @@ static int Install(void)
          * the install refused it -- the slot check expected a 0x68 push before
          * every resume slot, and b's resume is the operand of a 0xB8 mov, so h
          * and f logged "build defect" and patched nothing. This rung now rides
-         * d's shape, so the question left open is narrower: does the audit's own
-         * work survive on the client's loading path. A clean h run has to leave
-         * the first fixup call, the audit block and the per-chunk dumps in the
-         * log, not just its install line -- that line is what makes clean mean
-         * the call happened rather than nothing happened. */
+         * d's shape, and the sv10 run of it answered the question that is left:
+         * it entered the world and printed its first fixup call line (this 0x2cd20008
+         * record 0x2c3dca46), the whole first-chunk audit block with all eight
+         * slots resolving as hdr+ofs on their own fourcc, and 2000 per-chunk
+         * header dumps -- so the audit and its file I/O survive inside Load, and
+         * nothing about the client's loading path is left unexplained. */
         if (!PatchHook('h'))
             return 0;
         g_ready = 1;
@@ -1499,8 +1524,9 @@ static int Install(void)
     fclose(f);
     /* the offsets stay the real ones: every entry addresses its own payload
      * inside this arena, which is what makes the arena live memory the client
-     * can point at (sv6's single-page stand-in is gone, sv7 mode f draws the
-     * real set) */
+     * can point at (sv6's single-page stand-in is gone, and the sv10 mode-f run
+     * really drew this set: its first match logged "shadow drawn from arena+0"
+     * for gy 517 gx 448 and the ground showed the baked shadows) */
     g_arena = arena;
 
     if (g_mode == 'a') {
@@ -1522,8 +1548,11 @@ static int Install(void)
         return 1;
     }
 
-    /* mode f: hook plus writes, the only rung that is expected to draw. It rides
-     * d's shape now, the one a real sv9 run proved good. */
+    /* mode f: hook plus writes, the only rung that is expected to draw -- and the
+     * sv10 run of it did: the world loaded, the baked morning set showed on the
+     * ground, the first match logged "shadow drawn from arena+0", and the run
+     * ended with a chunk the set legitimately has no payload for. It rides d's
+     * shape, the one the clean mode-d run proved, not b's return form. */
     g_allow_write = 1;
     if (!PatchHook('f'))
         return 0;
