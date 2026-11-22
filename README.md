@@ -15,7 +15,8 @@ archive, and a bake never round-trips through a parsed `.adt`.
 Salmiak "Shadows" bake
    -> shadow-variant MPQ export        e.g. G:\Games\twmoa_1181\shadows-Azeroth-morning.mpq
    -> extract_shadowmaps.py            strips every MCSH body out of the archive
-   -> shadowmaps.dat                   one 512-byte payload per chunk, global keys
+   -> shadowmaps.dat                   one 512-byte payload per chunk, global keys,
+                                       every map the archives carried inside one file
    -> ShadowMaps.dll at map load       rewrites each chunk's MCNK header to point
                                        into the .dat's arena; the client draws it
 ```
@@ -31,9 +32,9 @@ own exports, and this machine's own files are the proof: `Data\patch-3.mpq` and
 `Data\patch-6.mpq` (Blizzard's writers, 16,470 and 3,903 files) and `patch-S.mpq`
 (219 MB, 350 files, written by another tool) all extract, and re-extracting
 `shadows-Azeroth-morning.mpq` after these reader changes still gives the same set as
-before it — 487 tiles, 114,328 chunks, 66,413 payloads after dedupe, 34,918,204 bytes.
-(`shadowmaps.dat` next to the DLL is the **blizzlike** variant: 470 tiles, 107,752
-entries, 59,695 payloads, 31,425,980 bytes.) What a foreign writer does differently is
+before it — 487 tiles, 114,328 chunks, 66,413 payloads after dedupe, now written as
+35,375,544 bytes because every entry carries its map row (the same set was 34,918,204
+bytes under the old one-map entry shape). What a foreign writer does differently is
 named by libmpq's flag set (`cmangos/classic/dep/libmpq/libmpq/mpq-internal.h`):
 
 - a hash slot whose block index is `0xFFFFFFFE` is a **deleted** entry, not a used one:
@@ -64,23 +65,40 @@ named by libmpq's flag set (`cmangos/classic/dep/libmpq/libmpq/mpq-internal.h`):
   (`unreadable <name>: <why>`) so one odd file in one archive does not end the run.
 
 One archive can also carry **several maps**: `patch-S.mpq` holds tiles of 12 of them
-(Azeroth 174 tiles, Kalimdor 125, and nine smaller ones). A `.dat` is keyed to one map —
-the DLL compares its map field against the client's own `s_mapName` (`0xC961A0`) and
-ignores the payload while they differ — so the extractor groups tiles by the map folder
-in the name, case-insensitively (`World\Maps\Azeroth` and `World\maps\azeroth` are one
-map, which is how `Data\patch-3.mpq` and `Data\patch-6.mpq` merge into one 178-tile set),
-and writes **one `.dat` per map**: `shadowmaps-Azeroth.dat`, `shadowmaps-Kalimdor.dat`,
-… . `--map NAME` takes one map and writes it to `-o` as named, which is what ships: the
-DLL only ever looks at the fixed name `shadowmaps.dat` beside it, so the map you want
+(Azeroth 174 tiles, Kalimdor 125, and nine smaller ones). One `.dat` now carries them all
+in one file — a map table after the header says which rows belong to which map, and every
+entry names its row — so the extractor groups tiles by the map folder in the name,
+case-insensitively (`World\Maps\Azeroth` and `World\maps\azeroth` are one map, which is how
+`Data\patch-3.mpq` and `Data\patch-6.mpq` merge into one 178-tile set), and writes
+**one `.dat` whatever the archives carry**: `-o` is the file, and no per-map name is made
+from it. A chunk key is only unique *inside* a map, so the DLL picks the run whose name
+matches the client's `s_mapName` (`0xC961A0`) and binary-searches just that run; a chunk
+outside every run keeps the stock shadow. `--map NAME` narrows the file to that map and
+**repeats**, so `--map Azeroth --map Kalimdor` ships both in one file. The DLL still only
+ever reads the fixed name `shadowmaps.dat` beside it, so the whole multi-map file is what
 gets renamed to that.
 
 The three archives above were extracted side by side, with the numbers each one printed:
 
-| archive | files | tiles | `MCSH` chunks | payloads after dedupe | `.dat` bytes |
+| archives | files | tiles | `MCSH` chunks | payloads after dedupe | `.dat` bytes |
 | --- | --- | --- | --- | --- | --- |
-| `shadows-Azeroth-morning.mpq` (Salmiak) | 490 | 487 | 114,328 | 66,413 | 34,918,204 |
-| `patch-S.mpq` (another tool), Azeroth only | 350 | 174 | 38,257 | 21,372 | 11,248,644 |
-| `Data\patch-3.mpq` + `Data\patch-6.mpq`, Azeroth | 20,373 | 178 | 15,684 | 9,715 | 5,099,676 |
+| `shadows-Azeroth-morning.mpq` (Salmiak) | 490 | 487 | 114,328 | 66,413 | 35,375,544 |
+| `patch-S.mpq` (another tool), all 12 of its maps in one file | 350 | 309 | 76,547 | 40,779 | 21,797,872 |
+| `Data\patch-3.mpq` + `Data\patch-6.mpq`, `--map Azeroth --map Kalimdor` | 20,373 | 353 | 31,474 | 18,926 | 10,067,980 |
+
+The same archives cut to one map each, under the old one-map entry shape, gave 11,248,644
+bytes (`patch-S.mpq`, Azeroth's 38,257 chunks) and 5,099,676 bytes (the stock pair, Azeroth's
+15,684 chunks); those two legacy files are what still sits in the game folder today — `shadowmaps.dat`
+at 11,248,644 and `shadowmaps-Kalimdor.dat` at 7,818,452 — and the sv11 loader reads both
+unchanged, which is the point of `mapCount 0`.
+
+The stock pair overlaps too, so the run gate is doing real work on archives this machine
+did not write and did not bake: its one file has **716 chunk keys shared between Azeroth's
+and Kalimdor's runs**, the two key ranges being `390736..982538` and `311856..818927`. Payload
+interning crossed the run boundary as well — Azeroth's 9,715 and Kalimdor's 9,249 distinct
+bodies are 18,964 apart and the file stores 18,926, so 38 bodies are used by both maps and
+stored once, which is safe because what decides whether a body is used at all is the entry's
+map row, not the blob.
 
 The stock pair has far fewer chunks than tiles × 256 because most of their chunks carry
 no `MCSH` at all: the stock 1.12.1 ADTs in a patch MPQ are not shadow-carrying everywhere.
@@ -138,30 +156,37 @@ before starting the noon one.
 | `CMakeLists.txt`, `CMakePresets.json` | the canonical build (mirrors ClassicAPI's project) |
 | `build.py`, `build.ps1` | the no-CMake fallback: names every missing toolchain piece |
 | `verify_dll.py` | confirms a built DLL carries what `src/mod.c` claims |
-| `extract_shadowmaps.py` | shadow-variant archives → one `shadowmaps.dat` per map, foreign archives included |
+| `extract_shadowmaps.py` | shadow-variant archives → one `shadowmaps.dat`, several maps inside it, foreign archives included |
 | `probe_hooksite.py` | re-checks the hook sites against a real client `WoW.exe` |
 | `tools-check/` | labelled stub headers, used **only** by `build.py --check` |
 
 ## The `.dat` file
 
 All little-endian, packed at natural sizes, nothing aligned to anything else.
-The file must be **exactly** `124 + entryCount*8 + payloadBytes` bytes: the
-loader refuses a short file (truncated) *and* a long one (junk appended),
-because either means the counts and the archive disagree and a shadow set would
-be applied from a half-read table.
+The file must be **exactly** as long as its own header says, and the loader
+refuses a short file (truncated) *and* a long one (junk appended), because
+either means the counts and the archive disagree and a shadow set would be
+applied from a half-read table. Two lengths are legal, and the header's last
+word picks which:
+
+```
+mapCount == 0            124 + entryCount*8   + payloadBytes   (legacy, one map)
+mapCount 1..64           124 + mapCount*28 + entryCount*12 + payloadBytes
+```
 
 | Field | Bytes | Meaning |
 | --- | --- | --- |
 | `magic` | 4 | `SHDW` |
 | `version` | 4 | `1` (`SHADOW_DAT_VERSION`) |
-| `map` | 24 | map name, NUL-terminated inside the 24 (`Azeroth`) |
+| `map` | 24 | map name, NUL-terminated inside the 24 (`Azeroth`), or `MULTI` when the file carries several maps |
 | `variant` | 40 | label for the log line, NUL-terminated inside the 40 |
-| `entryCount` | 4 | chunks with a payload |
+| `entryCount` | 4 | chunks with a payload, all maps together |
 | `payloadUnique` | 4 | distinct payloads (`payloadBytes == payloadUnique*512`) |
-| `tiles` | 4 | tiles this set covers |
-| tile/chunk bounds | 8 × `int32` | `tx0,ty0,tx1,ty1` then `cx0,cy0,cx1,cy1` |
-| `reserved` | 4 | `0` |
-| entries | `entryCount` × 8 | `key` (`(gy<<10)\|gx`), `payloadOffset` — **strictly ascending** by key |
+| `tiles` | 4 | tiles this set covers, all maps together |
+| tile/chunk bounds | 8 × `int32` | `tx0,ty0,tx1,ty1` then `cx0,cy0,cx1,cy1`, over every map |
+| `mapCount` | 4 | `0` for the single-map file the format had before, `1..64` for a file that carries a map table |
+| map records | `mapCount` × 28 | `char name[24]` NUL-terminated inside the 24, then that map's `entryCount` — only present when `mapCount` is not 0 |
+| entries | `entryCount` × 8 or × 12 | `key`, `payloadOffset`, then the entry's row in the map table — the third word is there only when `mapCount` is not 0 |
 | payload area | `payloadUnique` × 512 | packed `MCSH` bodies, 64×64 texels, LSB-first |
 
 The key mirrors Salmiak's own bake selection: a chunk's global coordinates are
@@ -172,6 +197,29 @@ to the client without a `.adt` in between. Chunks that share identical shadow
 bytes share one payload (including one shared all-zero buffer, so a cleared
 shadow really draws nothing); a chunk the bake never touched simply has **no**
 entry, and the client keeps whatever stock shadow the `.adt` carries for it.
+
+A key is unique only **inside a map**: tile 14,20 chunk 3,5 of Azeroth and of
+Kalimdor are the same 20-bit number. So the map table and the third entry word
+exist to say which run an entry belongs to, and the per-chunk gate picks the run
+it binary-searches by comparing the client's `s_mapName` against the run's name
+(`CiEqName`, case-insensitive) — never a `==`, and the client's name is re-read
+per chunk, so one session that visits two maps still works. Entries are grouped
+by map in table order with keys strictly ascending inside a group, which is what
+makes a run one contiguous span of the arrays. The same key in two runs is
+legitimate; a repeated key inside one run is the same chunk listed twice and is
+refused. The payload pool stays interned **across** maps, so an identical body
+used by Azeroth and by Kalimdor is stored once — safe, because what decides
+whether a payload is used at all is the entry's map index, not the blob.
+
+This is not hypothetical on this machine: `patch-S.mpq` carries tiles of twelve
+maps, and its one `.dat` (21,797,872 bytes, `124 + 12*28 + 76547*12 + 40779*512`)
+has **7,927 chunk keys that appear in more than one map's run**, 38,257 of them
+Azeroth's and 27,723 Kalimdor's, with the two key ranges overlapping. Searching
+the whole file instead of one run would answer those chunks with another map's
+shadow. With `mapCount 1` the table still gets a row, and the header's `map`
+word keeps the real map name so an older reader that ignores the table still
+gates on the right map; with several maps the header says `MULTI`, so an older
+reader refuses outright instead of drawing one map's shadows onto another's.
 
 ## Hook contract
 
@@ -275,8 +323,11 @@ nothing so it has no add to match).
 1. Install VanillaFixes if it isn't already.
 2. Copy `ShadowMaps.dll` into the game directory.
 3. Add `ShadowMaps.dll` to `dlls.txt`.
-4. Rename the chosen variant's `.dat` to `shadowmaps.dat` and put it **next to
-   the DLL**, not next to the game.
+4. Rename the file to `shadowmaps.dat` and put it **next to the DLL**,
+   not next to the game. One file carries every map the archives had —
+   the loader picks the run whose name matches the client's map — so one
+   rename ships the whole set, and a legacy single-map file works the same
+   way.
 5. Launch the game with `VanillaFixes.exe`.
 
 Swapping shadow sets is one file: replace `shadowmaps.dat` and restart. The
@@ -320,17 +371,25 @@ build chose, so an off-by-eight is a build failure, not an in-game crash.
 
 ## What this machine produces
 
-`out\ShadowMaps.dll` 142,848 bytes and `build\Release\ShadowMaps.dll` 144,384
+`out\ShadowMaps.dll` 144,896 bytes and `build\Release\ShadowMaps.dll` 146,432
 bytes, both i686, both exporting `Load`, both importing only `KERNEL32.dll`,
 both accepted by `verify_dll.py` with zero complaints — i.e. the stub's stack
 math is read from real linked code, not from a comment.
 
-The test payload sits in the game folder as
-`G:\Games\twmoa_1181\shadowmaps.dat`: 34,918,204 bytes (33.3 MiB), `SHDW` v1,
-map `Azeroth`, variant `shadows-Azeroth-morning`,
-114,328 entries, 66,413 unique payloads (34,003,456 payload bytes), 487 tiles in
-`(22,22)..(44,60)`, chunk grid `(352,352)..(707,975)`, and `124 + entries*8 +
-payloadBytes == filesize`.
+What sits in the game folder today is the shipping trio: `ShadowMaps.dll`,
+`shadow-mod.mode` (`f`) and `shadowmaps.dat` — 11,248,644 bytes, `SHDW` v1,
+`mapCount 0` so one legacy run, map `Azeroth`, variant `patch-S`, 38,257 entries,
+21,372 payloads (10,942,464 payload bytes), 174 tiles, and `124 + entries*8 +
+payloadBytes == filesize`. Beside it, not read because the DLL only ever opens the
+fixed name, waits `shadowmaps-Kalimdor.dat`: 7,818,452 bytes, the same `patch-S`
+cut for Kalimdor's 125 tiles and 27,723 entries, legacy too. Both legacy files
+still load unchanged on the sv11 loader, which is the point of `mapCount 0`.
+
+The log walkthrough below was made with the **morning** set's legacy `.dat`
+(34,918,204 bytes, `mapCount 0`, map `Azeroth`, variant `shadows-Azeroth-morning`,
+114,328 entries, 66,413 payloads, 487 tiles in `(22,22)..(44,60)`, chunk grid
+`(352,352)..(707,975)`), so the counts in those lines are that file's, and the
+folder's `patch-S` file has 38,257 entries instead.
 
 Expected log lines, in `shadow-mod.log.txt` next to the DLL. The loader's own
 lines carry the build stamp, so an old DLL is never read as a new one. A refusal
@@ -366,7 +425,17 @@ fixup: first chunk matched: gy 517 gx 448 key 529856, shadow drawn from arena+0,
  record 0x2d17ca46 hdr 0x2d17ca4e arena 0x6ac0000, hdr flags 0x8009 size 0x200 ofs 0xd99435b2,
  mcvtof 0x88 mcnrof 0x2d4 mclyof 0x49c mcrof 0x4e4 mcalof 0x6f4 mcseof 0x254c mclof 0x1efc
 fixup: 10000 chunks matched so far, of 114328 entries   (never printed in the sv10 run: that run walked one starting area, so it matched under 10000 chunks)
+sv11 shadowmaps.dat answers for 2 map(s): Azeroth 38257 entries Kalimdor 27723 entries
+fixup: client map 'Outland' is not one the payload names (Azeroth Kalimdor): the payload is ignored on this map
 ```
+
+The last two lines are the multi-map file's shape, written in the words the loader
+uses rather than quoted from a run: no run has printed them yet. The install line is
+one per install and names **every run the file answers for**, with entry counts, so a
+run that draws nothing can be read against the client's own map instead of guessed at
+— a single-map file prints the same line with one name. The `fixup` line is one per
+session and appears only when the client's `s_mapName` matches none of the names, so
+the sv10 runs, whose file named the map the client was in, never printed it.
 
 Every line is prefixed by the milliseconds since **this DLL was loaded** and
 carries the build stamp and, for the install lines, the mode letter (the prefix
@@ -393,10 +462,18 @@ was never written to, and the sv10 mode-`h` run printed them whole: all eight
 slots resolved on their own fourcc, beside a record size that is exactly where
 the next `MCNK` sits.
 
-## Mode ladder (sv10)
+## Mode ladder (sv10 ladder, sv11 build)
 
 Five rungs of the ladder have been run on the real client — `c` and `d` on the sv9
 build, `h`, `f` and `b` on this one — and the shipping path works.
+
+The ladder did not move between sv10 and sv11: same seven rungs, same stub shapes,
+same 5-byte store and resume points, same `MCNK` header writes, so every fact in the
+table below is sv10's real runs and reads the same from an sv11 log — the stamp slot
+just says `sv11`. What sv11 changed is only the `.dat`'s chunk addressing above, and
+`verify_dll.py` accepts both sv11 images with the same three detour tables at the same
+sizes (`b` 36, `c` 12, `d` 29), the same `add esp` pairing and the same plain-`ret`
+`fixup_chunk` epilogue. An sv11 run in the client has not been done yet.
 
 sv9's `c` (the store and landing at `0x6AF5F0`, a landing that **calls
 nothing**) and `d` (the store at `0x6AF5F3`, the call, the record read from
@@ -599,9 +676,11 @@ that ships rides this shape** |
   client's own shadow path still decides the rest: the `MCNK` flag bit and the
   world-wide shadow flag gate it, and `shadowLevel` still picks the 64×64 vs
   32×32 mip.
-- One `.dat` per map: the payload carries the map name and `fixup` compares it
-  against the client's `s_mapName`, so a wrong-map `.dat` is ignored with one
-  log line rather than applied somewhere it does not belong.
+- One `.dat` can carry several maps, but a chunk is only looked up inside the run whose
+  map name matches the client's `s_mapName`: a `.dat` cut for other maps is ignored with
+  one log line naming every run it answers for, rather than applied somewhere it does not
+  belong. A multi-map file and a legacy single-map file (`mapCount` 0, 8-byte entries) are
+  both read by the same loader, so swapping between them is one file rename.
 - A chunk whose `ofsMCSH` was 0 in the archive gets no entry at all, so
   stock-shadow chunks survive a morning set that covers only 487 of Azeroth's
   741 tiles.

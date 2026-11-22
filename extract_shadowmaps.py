@@ -17,12 +17,13 @@ Usage
                 whose shadows land in the .dat.
 
     -o OUT.dat  Output file. Default: shadowmaps.dat in the current directory.
-                When the archives carry more than one map, one file is written per
-                map and the map name is put in the stem: shadowmaps-Azeroth.dat,
-                shadowmaps-Kalimdor.dat, so the DLL can be given the one it wants.
-    --map NAME          Only takes tiles of that map, case-insensitive against the
-                        name in the tile's path. Default: every map the archives
-                        carry, each into its own .dat.
+                ONE file is written whatever the archives carry: a .dat names the
+                maps its payloads belong to, so an Azeroth set and a Kalimdor set
+                sit in the same file and the DLL picks the run that matches the
+                map the client is on. See the map table in shadow_dat.h.
+    --map NAME          Only take tiles of that map. Repeat the flag to keep
+                        several maps in the one .dat (--map Azeroth --map
+                        Kalimdor). Default: every map the archives carry.
     --variant NAME      Label stored in the header only, for your own records.
                         Default: the archive's file stem.
     --no-dedupe         Keep every payload even when several chunks share the same
@@ -37,10 +38,10 @@ Example
         -o "G:\Games\twmoa_1181\shadows-Azeroth-morning.dat"
 
 What it prints
-    Per map: the map name, the tile bounds, how many chunks were read per tile, and
-    how many bytes the .dat ended up being after dedupe. A full Azeroth set is 741
-    tiles times 256 chunks; dedupe usually keeps it near 25 MB, which is why the .dat
-    is not a 340 MB archive.
+    The one .dat written, and per map inside it: the map name, the tile bounds, how
+    many chunks were read per tile, and how many bytes the file ended up being after
+    dedupe. A full Azeroth set is 741 tiles times 256 chunks; dedupe usually keeps it
+    near 25 MB, which is why the .dat is not a 340 MB archive.
 
 Reading an archive
     Salmiak's own exports are unencrypted, sectored zlib, sector shift 3, and carry a
@@ -494,8 +495,9 @@ def main(argv):
     ap = argparse.ArgumentParser(add_help=True, description="Salmiak shadow archives -> shadowmaps.dat")
     ap.add_argument("archives", nargs="+", help=".mpq files or directories containing them")
     ap.add_argument("-o", "--out", default="shadowmaps.dat")
-    ap.add_argument("--map", default=None,
-                    help="only take tiles of this map; default: every map the archives carry")
+    ap.add_argument("--map", dest="maps", action="append", default=None,
+                    help="only take tiles of this map; repeat the flag to put several "
+                         "maps into the one .dat (default: every map the archives carry)")
     ap.add_argument("--variant", default=None, help="label stored in the header only")
     ap.add_argument("--no-dedupe", action="store_true")
     ap.add_argument("--probe", metavar="NAME", default=None, help="print one file's ADT walk and stop")
@@ -536,6 +538,9 @@ def main(argv):
     # (it checks the map field against the client's own s_mapName), so each map gets
     # its own payloads, its own tile bounds and its own output file. Later archives
     # still win over earlier ones, per map, the way the client resolves a name
+    # --map repeats, and a map is one group keyed case-insensitively, so the
+    # filter is a set of lower-cased names rather than one name to equal
+    wanted = [m.lower() for m in args.maps] if args.maps else None
     gathered = {}
     seen_maps = set()
     display_name = {}
@@ -564,7 +569,7 @@ def main(argv):
             # World\Maps\Azeroth and another World\maps\azeroth, and that is one map, so
             # the group is keyed case-insensitively and keeps the first spelling it saw
             key = mp.lower()
-            if args.map and key != args.map.lower():
+            if args.maps and key not in wanted:
                 continue
             display_name.setdefault(key, mp)
             payloads, tiles_seen, per_tile, missing = gathered.setdefault(
@@ -588,63 +593,100 @@ def main(argv):
     if not gathered and seen_maps:
         raise SystemExit(
             "no tile of map %s in these archives: they carry %s"
-            % (args.map, ", ".join(sorted(seen_maps)))
+            % (", ".join(args.maps), ", ".join(sorted(seen_maps)))
         )
     if not any(payloads for (payloads, _, _, _) in gathered.values()):
         raise SystemExit("no MCSH blocks found in any archive")
 
+    variant = args.variant or (variant_seen[-1] if variant_seen else "set")
+    # runs are ordered biggest map first, then by name: the file is the same bytes
+    # every run, and the map you are most likely to care about is the first row of
+    # the table the DLL prints
+    order = [k for k in sorted(gathered, key=lambda k: (-len(gathered[k][0]), k))
+             if gathered[k][0]]
     if len(gathered) > 1:
         print(
-            "these archives carry %d maps with tiles, so one .dat is written per map: "
-            "the DLL reads one .dat and ignores it while the client's s_mapName differs"
-            % len(gathered)
+            "these archives carry %d maps with tiles, so the one .dat carries %d maps with "
+            "payloads: a chunk key is only unique INSIDE a map, and the .dat's map table says "
+            "which run every entry belongs to"
+            % (len(gathered), len(order))
         )
-
-    base, ext = os.path.splitext(args.out)
-    for key in sorted(gathered, key=lambda k: (-len(gathered[k][0]), k)):
-        payloads, tiles_seen, per_tile, missing = gathered[key]
-        if not payloads:
-            continue
-        name = display_name[key]
-        variant = args.variant or (variant_seen[-1] if variant_seen else "set")
-        out = args.out if len(gathered) == 1 else "%s-%s%s" % (base, name, ext)
-        groups = None
-        if not args.no_dedupe:
-            groups = {}
-            for body in payloads.values():
-                groups[body] = groups.get(body, 0) + 1
-        _write_dat(out, name, variant, payloads, groups, tiles_seen, missing[0], per_tile)
+    _write_dat(args.out, order, variant, gathered, display_name, not args.no_dedupe)
 
 
-def _write_dat(out, name, variant, payloads, groups, tiles_seen, missing, per_tile):
-    # one payload per distinct 512-byte block; identical chunks share it, which is what
-    # keeps a full Azeroth set near 25 MB instead of 741 tiles x 256 chunks x 512 B
-    order = []
+def _write_dat(out, order, variant, gathered, display_name, dedupe):
+    """One .dat, several maps inside it (see shadow_dat.h's map-record table).
+
+    A chunk key is (gy<<10)|gx, which is only unique INSIDE a map: tile 14,20
+    chunk 3,5 of Azeroth and of Kalimdor are the same number. So the file carries
+    a map table after the header, entries are 12 bytes instead of 8 and the third
+    one is the entry's row in that table, and the entries are grouped per map in
+    table order with keys ascending inside a group -- which is what lets the DLL
+    binary-search one group and never answer a chunk with another map's shadow.
+
+    The payload area is one interned pool for the whole file: identical bodies
+    share one 512-byte blob even across maps, and that is safe because what
+    decides whether a payload is used at all is the entry's map index, not the
+    blob it points at.
+    """
+    # the gate the DLL runs is on the names written here, so two maps whose names
+    # collapse to the same 23 bytes would be indistinguishable: refuse rather than
+    # write a file whose runs cannot be told apart
+    short = {}
+    for group in order:
+        s = display_name[group][:23].lower()
+        if s in short:
+            raise SystemExit(
+                "maps %s and %s have the same name once cut to 23 characters: the .dat's runs "
+                "could not be told apart, so nothing is written" % (short[s], display_name[group])
+            )
+        short[s] = display_name[group]
+
+    # one payload per distinct 512-byte block; identical chunks share it, which is
+    # what keeps a full Azeroth set near 25 MB instead of 741 tiles x 256 x 512 B
     blobs = {}
-    if groups is None:
+    bodies = []
+    entries = []
+    map_counts = []
+    for (mi, group) in enumerate(order):
+        payloads = gathered[group][0]
+        count = 0
         for key in sorted(payloads):
-            blobs[(key, payloads[key])] = len(order) * 512
-            order.append(payloads[key])
-        entries = [(key, blobs[(key, payloads[key])]) for key in sorted(payloads)]
-    else:
-        first_key = {}
-        for key in sorted(payloads):
-            first_key.setdefault(payloads[key], key)
-        for body in sorted(set(payloads.values()), key=lambda b: first_key[b]):
-            blobs[body] = len(order) * 512
-            order.append(body)
-        entries = [(key, blobs[payloads[key]]) for key in sorted(payloads)]
+            body = payloads[key]
+            if dedupe:
+                off = blobs.get(body)
+                if off is None:
+                    off = len(bodies) * 512
+                    blobs[body] = off
+                    bodies.append(body)
+            else:
+                off = len(bodies) * 512
+                bodies.append(body)
+            entries.append((mi, key, off))
+            count += 1
+        map_counts.append(count)
 
-    keys = sorted(payloads)
+    keys = [e[1] for e in entries]
     xs = [k & 0x3FF for k in keys]
     ys = [(k >> 10) & 0x3FF for k in keys]
     gx0, gx1 = min(xs), max(xs)
     gy0, gy1 = min(ys), max(ys)
+    tiles_all = set()
+    for group in order:
+        tiles_all |= gathered[group][1]
     # per-axis tile bounds, not first/last of the sorted list, which mis-orders them
-    tile_x = [t[0] for t in tiles_seen]
-    tile_y = [t[1] for t in tiles_seen]
+    tile_x = [t[0] for t in tiles_all]
+    tile_y = [t[1] for t in tiles_all]
     tx0, tx1, ty0, ty1 = min(tile_x), max(tile_x), min(tile_y), max(tile_y)
-    map_name = name.encode("ascii", "replace")[:23]
+    # the header's own map word names the file: one map's name when there is one
+    # map, so an older reader that ignores the table still gates on the right map,
+    # and MULTI when there are several, so an older reader refuses outright rather
+    # than drawing one map's shadows onto another's
+    if len(order) == 1:
+        label = display_name[order[0]]
+    else:
+        label = "MULTI"
+    map_name = label.encode("ascii", "replace")[:23]
     var_name = variant.encode("ascii", "replace")[:39]
     with open(out, "wb") as f:
         f.write(struct.pack(
@@ -653,9 +695,9 @@ def _write_dat(out, name, variant, payloads, groups, tiles_seen, missing, per_ti
             1,
             map_name.ljust(24, b"\0"),
             var_name.ljust(40, b"\0"),
-            len(keys),
-            len(order),
-            len(order) * 512,
+            len(entries),
+            len(bodies),
+            len(bodies) * 512,
             tx0,
             ty0,
             tx1,
@@ -664,37 +706,51 @@ def _write_dat(out, name, variant, payloads, groups, tiles_seen, missing, per_ti
             gy0,
             gx1,
             gy1,
-            len(tiles_seen),
-            0,
+            len(tiles_all),   # distinct (map, tile) across the file
+            len(order),       # mapCount: the table follows the header
         ))
-        for key in sorted(payloads):
-            f.write(struct.pack("<II", key, blobs[payloads[key]]))
-        for body in order:
+        for (mi, group) in enumerate(order):
+            # the DLL refuses a name that does not fit with a NUL inside the 24,
+            # so the record name is truncated to 23 the same way the header's is
+            rec = display_name[group].encode("ascii", "replace")[:23]
+            f.write(struct.pack("<24sI", rec.ljust(24, b"\0"), map_counts[mi]))
+        for (mi, key, off) in entries:
+            f.write(struct.pack("<III", key, off, mi))
+        for body in bodies:
             f.write(body)
+
+    size = os.path.getsize(out)
+    expect = 124 + len(order) * 28 + len(entries) * 12 + len(bodies) * 512
     print(
-        "map %s  variant %s\n"
-        "tiles %d (%d..%d, %d..%d)  chunks %d  payloads %d -> %d after dedupe  -> %s  %.1f MiB"
-        % (
-            name,
-            variant,
-            len(tiles_seen),
-            tx0,
-            tx1,
-            ty0,
-            ty1,
-            len(payloads),
-            len(payloads),
-            len(order),
-            out,
-            os.path.getsize(out) / 1048576.0,
-        )
+        "-> %s  %d bytes  rule 124 + %d maps*28 + %d entries*12 + %d payloads*512 = %d"
+        % (out, size, len(order), len(entries), len(bodies), expect)
     )
-    print("chunk grid x %d..%d  y %d..%d" % (gx0, gx1, gy0, gy1))
-    print("chunks without an MCSH: %d" % missing)
-    counts = defaultdict(int)
-    for (tx, ty), n in per_tile.items():
-        counts[n] += 1
-    print("chunks per tile: %s" % dict(sorted(counts.items())))
+    if size != expect:
+        raise SystemExit("the .dat written does not match its own size rule: %d vs %d" % (size, expect))
+    print("maps in this .dat: %s" % " ".join(display_name[g] for g in order))
+    for (mi, group) in enumerate(order):
+        payloads, tiles_seen, per_tile, missing = gathered[group]
+        print(
+            "map %s  variant %s\n"
+            "tiles %d (%d..%d, %d..%d)  entries %d"
+            % (
+                display_name[group],
+                variant,
+                len(tiles_seen),
+                min(t[0] for t in tiles_seen),
+                max(t[0] for t in tiles_seen),
+                min(t[1] for t in tiles_seen),
+                max(t[1] for t in tiles_seen),
+                len(payloads),
+            )
+        )
+        counts = defaultdict(int)
+        for (tx, ty), n in per_tile.items():
+            counts[n] += 1
+        print("chunks per tile: %s  chunks without an MCSH: %d"
+              % (dict(sorted(counts.items())), missing[0]))
+    print("whole-file tile bounds %d..%d, %d..%d  chunk grid x %d..%d  y %d..%d"
+          % (tx0, tx1, ty0, ty1, gx0, gx1, gy0, gy1))
 
 
 if __name__ == "__main__":

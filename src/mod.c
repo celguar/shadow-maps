@@ -26,9 +26,40 @@
  * and IsInChunkShadow all consume the arena. A chunk the .dat has no entry
  * for is left untouched, and the payload map name is checked against the
  * client's own s_mapName (0xC961A0) at every chunk, so a payload for the
- * wrong map is ignored rather than half-applied.
+ * wrong map is ignored rather than half-applied. One .dat can carry several
+ * maps now, so that check picks WHICH run of the entry table gets searched:
+ * a chunk key is only unique inside one map, and the run is what keeps
+ * Azeroth's shadows off Kalimdor's chunks of the same number.
  *
- * What the sv9 ladder settled, and what sv10 changes because of it. Four real
+ * What sv10 settled, and what sv11 adds on top of it. sv10 put the working rungs
+ * on d's stub shape (the record read from [ebp+8] on the client's own frame, the
+ * 8-byte scratch before the two pushed arguments and the matching `add esp, 16`),
+ * made the slot check stop assuming every resume is a `push` operand -- b's resume
+ * is the operand of a `mov`, which was the disagreement that refused h and f --
+ * and gave every hooking rung one "first fixup call" line naming the two pointers
+ * it really got, so a clean d run now means "the call happened". Re-running b
+ * against those is what confirms the [esp+48] lookup was the whole difference,
+ * byte for byte: the crash's EIP and EBX match what filing the resume address as
+ * the chunk's record produces, so the poison cursor is the client's own resolver
+ * reading a code address as an `MCNK` header, and no [esp+48] arithmetic is ever
+ * wrong. sv11 does not touch the hook, the stubs or the writes at all: it changes
+ * only how one .dat addresses chunks, because a chunk key is unique only INSIDE a
+ * map. tile 14,20 chunk 3,5 of Azeroth and of Kalimdor are the same 20-bit number,
+ * and `patch-S.mpq`'s one file has twelve maps with 7927 keys that appear in more
+ * than one of them -- searching the whole entry table would answer those chunks
+ * with another map's shadow. So the header's reserved word became mapCount: 0 is
+ * the single-map file the format had, with 8-byte entries and one run named by the
+ * header's map field (every .dat written so far still loads unchanged), and 1..64
+ * puts a table of 28-byte name+count records after the header and gives every
+ * entry a third word, its row in that table. Install reads the table once, refuses
+ * a table whose counts do not add up to entryCount, whose entries are not grouped
+ * in table order, whose keys are not strictly ascending inside a run, or whose
+ * index words do not name a record; the per-chunk gate then compares the client's
+ * map name against each run's and binary-searches only that run -- the name is
+ * re-read per chunk, so a session that changes map keeps working without an
+ * install-time map-name dependency. extract_shadowmaps.py writes the new shape
+ * always, one file for however many maps the archives carry, so the shipping
+ * command is one command and the swap is still one file rename.
  * runs came back with their install lines and no new crash: mode a (the whole
  * 34 MB arena resident, no hook), mode c (the store and landing at 0x6AF5F0,
  * no call) and mode d (the call with its arguments read from [ebp+8] on the
@@ -117,10 +148,13 @@
 #include <string.h>
 #include "../shadow_dat.h"
 
-#define STAMP "sv10" /* build stamp, printed in every log line: an old build of
+#define STAMP "sv11" /* build stamp, printed in every log line: an old build of
                      * this DLL sitting next to a new .dat is the most common
                      * confusion, so the line says which build made it, and the
-                     * mode line below names which of the seven rungs ran */
+                     * mode line below names which of the seven rungs ran. sv11
+                     * is sv10 with only the .dat's chunk addressing changed, so
+                     * an sv10 log line and an sv11 log line mean the same thing
+                     * about the hook; they differ in which .dat shape built it. */
 
 /* ---------------------------------------------------------------- pinned **/
 
@@ -234,6 +268,20 @@ static volatile int g_ready;          /* gate for fixup: set after install  */
 static unsigned g_entryCount;
 static unsigned *g_keys;              /* sorted ascending, binary searched  */
 static unsigned *g_offs;              /* payload byte offset inside arena   */
+/* one .dat can carry several maps (see shadow_dat.h's map-record table): a
+ * chunk key is only unique INSIDE a map -- tile 14,20 chunk 3,5 of Azeroth and
+ * of Kalimdor are the same number -- so the file's entries are kept in one
+ * contiguous run per map and the per-chunk name gate picks the run to search.
+ * A file that predates the map table (its header's mapCount word is 0) is
+ * treated as exactly one run named by the header's map field, which is what
+ * every single-map .dat written so far already is. g_dat_map is then only the
+ * file's own label, and g_dat_maps_txt is the joined list of gate names, used
+ * by the one mismatch line the per-chunk gate prints. */
+static unsigned g_mapCount;                                   /* 1..64 runs */
+static unsigned g_map_start[SHADOW_DAT_MAP_MAX];    /* first entry of a run  */
+static unsigned g_map_len[SHADOW_DAT_MAP_MAX];      /* entries in that run    */
+static char g_map_name[SHADOW_DAT_MAP_MAX][24];     /* gate name of a run     */
+static char g_dat_maps_txt[512];                    /* every run, for the log */
 static unsigned char *g_arena;        /* payloadUnique x 512 live shadow maps */
 static unsigned char *g_stub;         /* the executable page holding the detour */
 static unsigned char g_dat_map[24];   /* header's map name, NUL-terminated  */
@@ -602,7 +650,7 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
     unsigned gx, gy, key;
     unsigned i, moved;
     unsigned before[PROBE_COUNT];
-    int lo, hi, mid, hit;
+    int lo, hi, mid, hit, which;
     unsigned char *hdr;
     char msg[768];
 
@@ -712,13 +760,25 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
     if (!g_allow_write)
         return;
 
+    /* the gate is per chunk on the client's own s_mapName, so it keeps working
+     * when a session changes map, and it names which of the file's runs to
+     * search: a key that two maps share cannot answer with the wrong map's
+     * shadow. A single-map file is one run and one string compare, exactly as
+     * before, so nothing about the common case got slower. */
     client_map = (const unsigned char *)ADDR_MAP_NAME;
-    if (!CiEqName((const char *)g_dat_map, (const char *)client_map)) {
+    which = -1;
+    for (i = 0; i < g_mapCount; ++i) {
+        if (CiEqName((const char *)g_map_name[i], (const char *)client_map)) {
+            which = (int)i;
+            break;
+        }
+    }
+    if (which < 0) {
         if (!g_log_mismatch) {
             g_log_mismatch = 1;
             snprintf(msg, sizeof msg,
-                     "fixup: client map '%s' vs payload map '%s': the payload is ignored on this map",
-                     (const char *)client_map, (const char *)g_dat_map);
+                     "fixup: client map '%s' is not one the payload names (%s): the payload is ignored on this map",
+                     (const char *)client_map, g_dat_maps_txt);
             LogMsg(msg);
         }
         return;
@@ -730,8 +790,12 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
         return;
     key = (gy << SHADOW_DAT_KEY_SHIFT) | gx;
 
-    lo = 0;
-    hi = (int)g_entryCount - 1;
+    /* only the current map's run is searched: tile 14,20 chunk 3,5 of Azeroth and
+     * of Kalimdor are the SAME key, so searching the whole file could answer a
+     * chunk with another map's shadow. Entries are grouped per map at load, so
+     * the run is contiguous and keys stay sorted inside it. */
+    lo = (int)g_map_start[which];
+    hi = (int)(g_map_start[which] + g_map_len[which]) - 1;
     hit = -1;
     while (lo <= hi) {
         mid = lo + ((hi - lo) >> 1);
@@ -1205,10 +1269,12 @@ static int Install(void)
 {
     FILE *f;
     ShadowDatHeader head;
-    size_t table_bytes, expect_size;
+    size_t table_bytes, expect_size, rec_bytes;
     long fsize;
     unsigned char *ent;
-    unsigned i, prev_key;
+    unsigned char *rec;
+    unsigned i, prev_key, mapCount, stride, run, start, shown;
+    int fresh; /* the entry loop: 1 at a run's first entry */
     unsigned char *arena;
     unsigned char *site = (unsigned char *)(size_t)ADDR_LOAD;
     char msg[512];
@@ -1430,12 +1496,94 @@ static int Install(void)
         return 0;
     }
 
-    table_bytes = (size_t)head.entryCount * 8u;
-    expect_size = SHADOW_DAT_HEADER_BYTES + table_bytes + head.payloadBytes;
+    /* the map runs, before the size rule: mapCount decides the entry stride, and
+     * the rule has to say how long the file is WITH the record table. mapCount 0
+     * is the single-map file the format had before -- one run, named by the
+     * header's map field, 8-byte entries -- so every .dat written so far still
+     * loads unchanged. mapCount 1..64 puts a table of 28-byte records between the
+     * header and the entries, and every entry then carries its run's index, which
+     * is what lets one .dat carry several maps: a chunk key is only unique inside
+     * one map, so the run the per-chunk gate searches is what keeps Azeroth's
+     * shadows off Kalimdor's chunks. */
+    mapCount = head.mapCount;
+    stride = 8u;
+    rec_bytes = 0;
+    rec = NULL;
+    if (mapCount > SHADOW_DAT_MAP_MAX) {
+        LogMsg(STAMP " shadowmaps.dat names too many maps (want at most 64): refusing to patch");
+        fclose(f);
+        return 0;
+    }
+    if (mapCount) {
+        unsigned total = 0;
+        stride = 12u;
+        rec_bytes = (size_t)mapCount * SHADOW_DAT_MAP_RECORD_BYTES;
+        rec = (unsigned char *)malloc(rec_bytes);
+        if (!rec) {
+            LogMsg(STAMP " out of memory for the map record table: refusing to patch");
+            fclose(f);
+            return 0;
+        }
+        if (ReadBlock(f, rec, rec_bytes) != rec_bytes) {
+            LogMsg(STAMP " map record table read failed: refusing to patch");
+            free(rec);
+            fclose(f);
+            return 0;
+        }
+        start = 0;
+        for (i = 0; i < mapCount; ++i) {
+            const unsigned char *r = rec + (size_t)i * SHADOW_DAT_MAP_RECORD_BYTES;
+            if (r[0] == 0 || r[23] != 0) {
+                LogMsg(STAMP " a map record has no name or one that does not fit its 24 bytes: refusing to patch");
+                free(rec);
+                fclose(f);
+                return 0;
+            }
+            memcpy(g_map_name[i], r, 24);
+            g_map_name[i][23] = 0;
+            /* the record's entryCount is at +24 */
+            g_map_start[i] = start;
+            g_map_len[i] = ((const unsigned *)(r + 24))[0];
+            start += g_map_len[i];
+            total += g_map_len[i];
+        }
+        if (total != head.entryCount) {
+            LogMsg(STAMP " the map records' entry counts do not add up to the header's entryCount: refusing to patch");
+            free(rec);
+            fclose(f);
+            return 0;
+        }
+        g_mapCount = mapCount;
+    } else {
+        /* one run, named by the header */
+        g_mapCount = 1;
+        g_map_start[0] = 0;
+        g_map_len[0] = head.entryCount;
+        memcpy(g_map_name[0], head.map, 24);
+        g_map_name[0][23] = 0;
+    }
+    memcpy(g_dat_map, head.map, 24); /* the file's label: a several-map writer
+                                       * puts "MULTI" here, and the names that
+                                       * gate a chunk are g_map_name's */
+    /* the joined list the mismatch line prints, so a wrong-map run says every
+     * name the file does answer for, not just one */
+    g_dat_maps_txt[0] = 0;
+    shown = 0;
+    for (i = 0; i < g_mapCount; ++i) {
+        if (shown + 32 >= sizeof g_dat_maps_txt)
+            break;
+        snprintf(g_dat_maps_txt + shown, sizeof g_dat_maps_txt - shown,
+                 "%s%s", shown ? " " : "", g_map_name[i]);
+        shown += (unsigned)strlen(g_map_name[i]) + (shown ? 1u : 0u);
+    }
+
+    table_bytes = (size_t)head.entryCount * stride;
+    expect_size = SHADOW_DAT_HEADER_BYTES + rec_bytes + table_bytes + head.payloadBytes;
     fseek(f, 0, SEEK_END);
     fsize = ftell(f);
     if (fsize < 0 || (size_t)fsize != expect_size) {
         LogMsg(STAMP " shadowmaps.dat size does not match its header (truncated or junk appended): refusing to patch");
+        free(rec);
         fclose(f);
         return 0;
     }
@@ -1443,16 +1591,21 @@ static int Install(void)
     ent = (unsigned char *)malloc(table_bytes);
     if (!ent) {
         LogMsg(STAMP " out of memory for the entry table: refusing to patch");
+        free(rec);
         fclose(f);
         return 0;
     }
-    fseek(f, SHADOW_DAT_HEADER_BYTES, SEEK_SET);
+    fseek(f, (long)(SHADOW_DAT_HEADER_BYTES + rec_bytes), SEEK_SET);
     if (ReadBlock(f, ent, table_bytes) != table_bytes) {
         LogMsg(STAMP " entry table read failed: refusing to patch");
         free(ent);
+        free(rec);
         fclose(f);
         return 0;
     }
+    if (rec)
+        free(rec); /* the names are copied out into g_map_name; the table itself
+                     * is not needed again, and a several-map file is read once */
 
     g_entryCount = head.entryCount;
     g_keys = (unsigned *)malloc((size_t)head.entryCount * 4u);
@@ -1464,9 +1617,31 @@ static int Install(void)
         return 0;
     }
     prev_key = 0;
+    run = 0;
+    start = 0;
+    fresh = 1; /* the first entry of a run has nothing to be compared against */
     for (i = 0; i < head.entryCount; ++i) {
-        unsigned k = ((unsigned *)ent)[i * 2];
-        unsigned off = ((unsigned *)ent)[i * 2 + 1];
+        unsigned base = i * (stride / 4u);
+        unsigned k = ((unsigned *)ent)[base];
+        unsigned off = ((unsigned *)ent)[base + 1u];
+        if (stride == 12u) {
+            unsigned mp = ((unsigned *)ent)[base + 2u];
+            /* entries are grouped by map, in record order, so the run boundary
+             * is where the entries pass this run's length; a jump back to an
+             * earlier index would make a run non-contiguous, and the per-chunk
+             * search counts on a run being one span of the arrays */
+            while (run + 1u < mapCount && i >= start + g_map_len[run]) {
+                start += g_map_len[run];
+                ++run;
+                fresh = 1;
+            }
+            if (mp >= mapCount || mp != run) {
+                LogMsg(STAMP " an entry's map index does not follow the record table's grouping: refusing to patch");
+                free(ent);
+                fclose(f);
+                return 0;
+            }
+        }
         if (k > ((SHADOW_DAT_COORD_MAX << SHADOW_DAT_KEY_SHIFT) | SHADOW_DAT_COORD_MAX)) {
             LogMsg(STAMP " an entry key is outside the 10-bit chunk grid: refusing to patch");
             free(ent);
@@ -1479,8 +1654,11 @@ static int Install(void)
             fclose(f);
             return 0;
         }
-        if (i && k <= prev_key) {
-            LogMsg(STAMP " entry keys are not strictly ascending: refusing to patch");
+        /* keys ascend strictly inside a run. The same key in two runs is the
+         * same chunk number of two different maps, which is legitimate: the
+         * per-chunk gate only ever searches one of the two runs. */
+        if (!fresh && k <= prev_key) {
+            LogMsg(STAMP " entry keys are not strictly ascending inside a map's run: refusing to patch");
             free(ent);
             fclose(f);
             return 0;
@@ -1488,6 +1666,7 @@ static int Install(void)
         g_keys[i] = k;
         g_offs[i] = off;
         prev_key = k;
+        fresh = 0;
     }
     free(ent);
 
@@ -1528,6 +1707,30 @@ static int Install(void)
      * really drew this set: its first match logged "shadow drawn from arena+0"
      * for gy 517 gx 448 and the ground showed the baked shadows) */
     g_arena = arena;
+
+    /* one line naming every run the file answers for, entry counts included, so
+     * a run that draws nothing can be read against the client's own map without
+     * guessing which map the file was cut for -- and a file that carries several
+     * says so here, which is the point of the map table */
+    snprintf(msg, sizeof msg, STAMP " shadowmaps.dat answers for %u map(s):", g_mapCount);
+    {
+        size_t used = strlen(msg);
+        for (i = 0; i < g_mapCount; ++i) {
+            int n;
+            n = snprintf(msg + used, sizeof msg - used, " %s %u entries", g_map_name[i], g_map_len[i]);
+            if (n < 0)
+                break;
+            used += (size_t)n;
+            if (used >= sizeof msg) {
+                msg[sizeof msg - 1] = 0; /* snprintf NUL-terminates inside the
+                                           * buffer; this only stops the trail
+                                           * getting any further, the gate above
+                                           * does not read this line */
+                break;
+            }
+        }
+    }
+    LogMsg(msg);
 
     if (g_mode == 'a') {
         snprintf(msg, sizeof msg,
