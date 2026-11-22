@@ -51,6 +51,16 @@
  *   mapCount >  0:  124 + mapCount*28 + entryCount*12  + payloadBytes
  * (extra trailing bytes are ignored, short files are refused)
  *
+ * Both tables come BEFORE the pool: the map-record table sits right after the
+ * header, the entry table after that, so an entry's payloadOffset addresses file
+ * offset 124 + mapCount*28 + entryCount*stride (stride 8 legacy, 12 with a table).
+ * A reader that seeks past the entries only fills its arena rec_bytes (= mapCount
+ * * 28) short of every payload, and a 12-map file then draws a chunk's shadow as
+ * the tail of one payload over the head of the next -- mirrored-and-rotated
+ * shapes in about the right places, which is exactly what an sv11 run showed in
+ * game. mapCount 0 means rec_bytes 0, so the two offsets are the same offset and
+ * every legacy file reads the same either way.
+ *
  * Bounds fields are for reporting only (the .dat's own extent, over every map it
  * carries); the DLL matches chunks by key and by the map name, never by the bounds.
  *

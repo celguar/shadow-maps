@@ -88,9 +88,11 @@ The three archives above were extracted side by side, with the numbers each one 
 
 The same archives cut to one map each, under the old one-map entry shape, gave 11,248,644
 bytes (`patch-S.mpq`, Azeroth's 38,257 chunks) and 5,099,676 bytes (the stock pair, Azeroth's
-15,684 chunks); those two legacy files are what still sits in the game folder today — `shadowmaps.dat`
-at 11,248,644 and `shadowmaps-Kalimdor.dat` at 7,818,452 — and the sv11 loader reads both
-unchanged, which is the point of `mapCount 0`.
+15,684 chunks); the legacy files cut this way still sit in the game folder — `shadowmaps.patchS-legacy.dat`
+at 11,248,644 and `shadowmaps-Kalimdor.dat` at 7,818,452 — and the sv11 and sv12 loaders read both
+unchanged, which is the point of `mapCount 0`. What the loader actually opens today is the multi-map
+file under the fixed name, so `shadowmaps.dat` is 21,797,872 bytes there (see "What this machine
+produces").
 
 The stock pair overlaps too, so the run gate is doing real work on archives this machine
 did not write and did not bake: its one file has **716 chunk keys shared between Azeroth's
@@ -220,6 +222,24 @@ shadow. With `mapCount 1` the table still gets a row, and the header's `map`
 word keeps the real map name so an older reader that ignores the table still
 gates on the right map; with several maps the header says `MULTI`, so an older
 reader refuses outright instead of drawing one map's shadows onto another's.
+
+**An entry's `payloadOffset` addresses the payload area, which starts after BOTH
+tables** — the map-record table, then the entry table — so byte 0 of the pool is file
+offset `124 + mapCount*28 + entryCount*stride`. That term is not cosmetic, and finding
+out what it costs is what caught a bug: sv11 checked the file's size against a rule
+that counted the record table, then filled the arena with a seek that did not skip it.
+With twelve maps the whole pool sat 336 bytes early, so a chunk's 64×64 map was the
+tail of one payload over the head of the next — 336 bytes is 42 texel rows, and the
+ground came back as shadows of about the right shapes in the wrong place, looking
+mirrored and rotated. The one-map cut of the same archive drew correctly under the
+same loader, which is what made the format a suspect rather than the bake: `mapCount
+0` means `rec_bytes 0` and the two offsets agree. sv12 restored the term in the one
+`fseek` that reads the payload area, and the disagreement is measurable against the
+archive that made the file: read the pool where the size rule puts it, and all 76,547
+entries of the twelve-run file carry exactly the `MCSH` body `patch-S.mpq` holds for
+their chunk, run by run (Azeroth 38,257 of 38,257, EmeraldSanctum 171 of 171); read
+it where sv11 did and none of the 76,547 match. Nothing about a legacy file changes —
+its `rec_bytes` is 0, so both reads are the same read.
 
 ## Hook contract
 
@@ -377,7 +397,7 @@ both accepted by `verify_dll.py` with zero complaints — i.e. the stub's stack
 math is read from real linked code, not from a comment.
 
 What sits in the game folder today is the shipping trio: `ShadowMaps.dll` (the
-sv11 image, 146,432 bytes), `shadow-mod.mode` (`f`) and `shadowmaps.dat` — now the
+sv12 image, 146,432 bytes), `shadow-mod.mode` (`f`) and `shadowmaps.dat` — now the
 multi-map file: 21,797,872 bytes, `SHDW` v1, `mapCount 12`, header map word `MULTI`,
 variant `patch-S`, 76,547 entries, 40,779 payloads (20,878,848 payload bytes), 309 tiles,
 and `124 + 12*28 + 76547*12 + 20878848 == filesize`, its 12 runs being Azeroth 38,257,
@@ -434,17 +454,19 @@ fixup: first chunk matched: gy 517 gx 448 key 529856, shadow drawn from arena+0,
  record 0x2d17ca46 hdr 0x2d17ca4e arena 0x6ac0000, hdr flags 0x8009 size 0x200 ofs 0xd99435b2,
  mcvtof 0x88 mcnrof 0x2d4 mclyof 0x49c mcrof 0x4e4 mcalof 0x6f4 mcseof 0x254c mclof 0x1efc
 fixup: 10000 chunks matched so far, of 114328 entries   (never printed in the sv10 run: that run walked one starting area, so it matched under 10000 chunks)
-sv11 shadowmaps.dat answers for 2 map(s): Azeroth 38257 entries Kalimdor 27723 entries
+sv12 shadowmaps.dat answers for 12 map(s): Azeroth 38257 entries Kalimdor 27723 entries Sunnyglade 2145 entries Giln 2048 entries netherstormbg 2048 entries Karazahn40 1280 entries Grove 1121 entries Winterveil 1024 entries Hateforge 281 entries development 256 entries Moomoo 193 entries EmeraldSanctum 171 entries
 fixup: client map 'Outland' is not one the payload names (Azeroth Kalimdor): the payload is ignored on this map
 ```
 
 The last two lines are the multi-map file's shape, written in the words the loader
 uses rather than quoted from a run: no run has printed them yet. The install line is
-one per install and names **every run the file answers for**, with entry counts, so a
-run that draws nothing can be read against the client's own map instead of guessed at
-— a single-map file prints the same line with one name. The `fixup` line is one per
-session and appears only when the client's `s_mapName` matches none of the names, so
-the sv10 runs, whose file named the map the client was in, never printed it.
+one per install and names **every run the file answers for**, with entry counts — the
+line above is the twelve-run file that sits in the game folder today, so that is the
+line the next mode-`f` launch prints, and a two-map file prints the same line with two
+names. The `fixup` line is one per session and appears only when the client's `s_mapName`
+matches none of the names (its bracketed list is the run names joined by single spaces,
+counts left out), so the sv10 runs, whose file named the map the client was in, never
+printed it.
 
 Every line is prefixed by the milliseconds since **this DLL was loaded** and
 carries the build stamp and, for the install lines, the mode letter (the prefix
@@ -471,18 +493,22 @@ was never written to, and the sv10 mode-`h` run printed them whole: all eight
 slots resolved on their own fourcc, beside a record size that is exactly where
 the next `MCNK` sits.
 
-## Mode ladder (sv10 ladder, sv11 build)
+## Mode ladder (sv10 ladder, sv12 build)
 
 Five rungs of the ladder have been run on the real client — `c` and `d` on the sv9
 build, `h`, `f` and `b` on this one — and the shipping path works.
 
-The ladder did not move between sv10 and sv11: same seven rungs, same stub shapes,
+The ladder did not move between sv10, sv11 and sv12: same seven rungs, same stub shapes,
 same 5-byte store and resume points, same `MCNK` header writes, so every fact in the
-table below is sv10's real runs and reads the same from an sv11 log — the stamp slot
-just says `sv11`. What sv11 changed is only the `.dat`'s chunk addressing above, and
-`verify_dll.py` accepts both sv11 images with the same three detour tables at the same
-sizes (`b` 36, `c` 12, `d` 29), the same `add esp` pairing and the same plain-`ret`
-`fixup_chunk` epilogue. An sv11 run in the client has not been done yet.
+table below is sv10's real runs and reads the same from an sv11 or sv12 log — the stamp
+slot just says `sv12`. What sv11 changed is only the `.dat`'s chunk addressing above, and
+what sv12 changed is only where the payload-area read seeks (the paragraph above). `verify_dll.py`
+accepts both sv12 images with the same three detour tables at the same sizes (`b` 36, `c` 12,
+`d` 29), the same `add esp` pairing and the same plain-`ret` `fixup_chunk` epilogue. What an
+sv11 run of this file showed in game: shadows came on the ground, but every chunk's was the
+mix that paragraph above describes — mirrored-and-rotated shapes in about the right places —
+so the hook, the header write and the run gate all ran and only the arena's fill was wrong.
+An sv12 run of the same file has not been done yet.
 
 sv9's `c` (the store and landing at `0x6AF5F0`, a landing that **calls
 nothing**) and `d` (the store at `0x6AF5F3`, the call, the record read from
@@ -690,6 +716,15 @@ that ships rides this shape** |
   one log line naming every run it answers for, rather than applied somewhere it does not
   belong. A multi-map file and a legacy single-map file (`mapCount` 0, 8-byte entries) are
   both read by the same loader, so swapping between them is one file rename.
+- **What the multi-map shape has shown in game, so far:** the sv11 build put this
+  twelve-run `.dat` on the ground as mirrored-and-rotated shadows — right shapes,
+  wrong place — and the reason is one read: the payload area was not seeked past the
+  map-record table, so every entry sat 336 bytes off (see the `.dat` section). The
+  legacy cut of the same archive drew right under the same build, because its
+  `rec_bytes` is 0. The sv12 build put the term back; its run of this file has not
+  happened yet, so the twelve-run file being drawn correctly is still only measured
+  against `patch-S.mpq`'s own `MCSH` bodies — all 76,547 entries, run by run — and
+  not yet seen in game.
 - A chunk whose `ofsMCSH` was 0 in the archive gets no entry at all, so
   stock-shadow chunks survive a morning set that covers only 487 of Azeroth's
   741 tiles.

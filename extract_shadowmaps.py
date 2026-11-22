@@ -688,6 +688,13 @@ def _write_dat(out, order, variant, gathered, display_name, dedupe):
         label = "MULTI"
     map_name = label.encode("ascii", "replace")[:23]
     var_name = variant.encode("ascii", "replace")[:39]
+    # layout, in the order written: the 124-byte header, then mapCount records of
+    # 28 bytes, then entryCount entries of 12, then the pool. So payload byte 0 is
+    # file offset 124 + mapCount*28 + entryCount*12, and a reader that seeks past
+    # the entries only fills its arena mapCount*28 bytes short of every payload --
+    # 336 bytes on a 12-map file, 42 of the 64 texel rows of every chunk, which is
+    # what made an in-game set look mirrored and rotated (sv11's loader did exactly
+    # that; sv12's seeks both tables).
     with open(out, "wb") as f:
         f.write(struct.pack(
             "<4sI24s40sIII8iII",

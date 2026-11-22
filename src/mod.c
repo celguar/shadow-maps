@@ -60,6 +60,20 @@
  * install-time map-name dependency. extract_shadowmaps.py writes the new shape
  * always, one file for however many maps the archives carry, so the shipping
  * command is one command and the swap is still one file rename.
+ *
+ * What sv12 fixes on top of sv11: sv11's multi-map file drew in game, but not
+ * the map it carried -- every chunk showed a mix that read as mirrored and
+ * rotated, while the legacy single-map cut of the same archive drew right. The
+ * .dat was never the suspect: measured against patch-S.mpq's own MCSH bodies,
+ * all 76547 entries point at the payload they should ONLY when the payload area
+ * is read from 124 + mapCount*28 + entryCount*12, and reading it from 124 +
+ * entryCount*12 -- which is what sv11's loader did -- matches 0 of 76547. The
+ * record table was skipped when checking the file's size but not when filling
+ * the arena, so every arena offset sat 336 bytes (42 of the 64 texel rows)
+ * short of its own payload and each chunk drew the tail of one map's shadow
+ * over the head of the next. A legacy file has mapCount 0, so rec_bytes is 0
+ * and both reads agree: that is why nothing older than the multi-map shape
+ * ever showed this. One seek changed.
  * runs came back with their install lines and no new crash: mode a (the whole
  * 34 MB arena resident, no hook), mode c (the store and landing at 0x6AF5F0,
  * no call) and mode d (the call with its arguments read from [ebp+8] on the
@@ -148,13 +162,18 @@
 #include <string.h>
 #include "../shadow_dat.h"
 
-#define STAMP "sv11" /* build stamp, printed in every log line: an old build of
+#define STAMP "sv12" /* build stamp, printed in every log line: an old build of
                      * this DLL sitting next to a new .dat is the most common
                      * confusion, so the line says which build made it, and the
                      * mode line below names which of the seven rungs ran. sv11
-                     * is sv10 with only the .dat's chunk addressing changed, so
-                     * an sv10 log line and an sv11 log line mean the same thing
-                     * about the hook; they differ in which .dat shape built it. */
+                     * and sv12 are sv10 with only the .dat's chunk addressing
+                     * changed -- sv12 fixes which byte the payload area starts
+                     * at, and neither touches the hook, the stubs or the writes
+                     * -- so an sv10, sv11 or sv12 log line means the same thing
+                     * about the hook and differs only in which .dat shape built
+                     * it. sv11's multi-map run drew the WRONG payloads (see the
+                     * note at the top of this file), so a mirrored-and-rotated
+                     * ground under an sv11 line is that seek, not the bake. */
 
 /* ---------------------------------------------------------------- pinned **/
 
@@ -1693,7 +1712,14 @@ static int Install(void)
     /* the offset fits in a long: the payload area is capped at 1 GiB above, and
      * the table at 20 million entries x 8 bytes, so this file is well under the
      * 2 GiB ftell limit on either target */
-    fseek(f, (long)(SHADOW_DAT_HEADER_BYTES + table_bytes), SEEK_SET);
+    /* the payload area follows BOTH tables: the entry table sits behind the
+     * record table, so skipping only the entries shifts every payload by
+     * rec_bytes (= 336 for a 12-map file) and hands a chunk the tail of one
+     * map and the head of the next, which is what made a multi-map set look
+     * mirrored and rotated in game while every legacy file (rec_bytes 0) drew
+     * correctly. The size rule above already counts both tables; the read has
+     * to agree with it */
+    fseek(f, (long)(SHADOW_DAT_HEADER_BYTES + rec_bytes + table_bytes), SEEK_SET);
     if (ReadBlock(f, arena, (size_t)head.payloadBytes)
         != (size_t)head.payloadBytes) {
         LogMsg(STAMP " payload area read failed: refusing to patch");
