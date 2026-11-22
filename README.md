@@ -376,14 +376,23 @@ bytes, both i686, both exporting `Load`, both importing only `KERNEL32.dll`,
 both accepted by `verify_dll.py` with zero complaints — i.e. the stub's stack
 math is read from real linked code, not from a comment.
 
-What sits in the game folder today is the shipping trio: `ShadowMaps.dll`,
-`shadow-mod.mode` (`f`) and `shadowmaps.dat` — 11,248,644 bytes, `SHDW` v1,
-`mapCount 0` so one legacy run, map `Azeroth`, variant `patch-S`, 38,257 entries,
-21,372 payloads (10,942,464 payload bytes), 174 tiles, and `124 + entries*8 +
-payloadBytes == filesize`. Beside it, not read because the DLL only ever opens the
-fixed name, waits `shadowmaps-Kalimdor.dat`: 7,818,452 bytes, the same `patch-S`
-cut for Kalimdor's 125 tiles and 27,723 entries, legacy too. Both legacy files
-still load unchanged on the sv11 loader, which is the point of `mapCount 0`.
+What sits in the game folder today is the shipping trio: `ShadowMaps.dll` (the
+sv11 image, 146,432 bytes), `shadow-mod.mode` (`f`) and `shadowmaps.dat` — now the
+multi-map file: 21,797,872 bytes, `SHDW` v1, `mapCount 12`, header map word `MULTI`,
+variant `patch-S`, 76,547 entries, 40,779 payloads (20,878,848 payload bytes), 309 tiles,
+and `124 + 12*28 + 76547*12 + 20878848 == filesize`, its 12 runs being Azeroth 38,257,
+Kalimdor 27,723, Sunnyglade 2,145, Giln 2,048, netherstormbg 2,048, Karazahn40 1,280,
+Grove 1,121, Winterveil 1,024, Hateforge 281, development 256, Moomoo 193 and
+EmeraldSanctum 171. Whatever map the client is in picks one of those runs by name —
+the sv10 run's log line said `Azeroth`, whose run is this file's first with 38,257
+entries — so the same shadows that legacy cut drew must come back through the table,
+and the run gate is what decides it. Two other files sit beside them and are never read,
+because the loader only ever opens the fixed name: `shadowmaps.patchS-legacy.dat`
+(11,248,644 bytes, the Azeroth-only cut renamed aside so the legacy path can be
+re-tested by renaming back) and `shadowmaps-Kalimdor.dat` (7,818,452 bytes, Kalimdor's
+125 tiles and 27,723 entries). Both legacy files report `mapCount 0` and pass the
+8-byte rule, which is the point of `mapCount 0`: swapping between the two shapes is one
+file rename, no rebuild.
 
 The log walkthrough below was made with the **morning** set's legacy `.dat`
 (34,918,204 bytes, `mapCount 0`, map `Azeroth`, variant `shadows-Azeroth-morning`,
