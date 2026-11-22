@@ -1,0 +1,134 @@
+# build-release.yml -- one manual run: build, gate the image, publish.
+#
+# This is README.md's Building section run by a robot, in the same order and
+# behind the same gates, minus the line that verifies the image:
+#
+#     cmake --preset win32                        # the only supported configuration
+#     cmake --build build --preset release        # build/Release/ShadowMaps.dll
+#     python verify_dll.py build/Release/ShadowMaps.dll   # local, before the commit
+#
+# verify_dll.py is NOT run here: it is what says the image can load in WoW.exe
+# build 5875 at all (i686 machine type, `Load` exported undecorated, only
+# operating-system DLLs imported, every detour table present exactly once), and
+# it is run locally, over the build that is about to be committed -- README.md's
+# Building section ends with it, and .gitignore's first line says a DLL is
+# verified per build. It cannot be the CI gate: the script reads mod.c through
+# its own MOD_CPP constant, one absolute path on the box that wrote it, so on a
+# runner it falls back to FALLBACK_STUBS, and that fallback is not a clean read
+# of sv13 (its rung-c entry gives fixup slot 0, which the script then demands a
+# zeroed imm32 at -- stub c has no fixup slot at all, so the check fails on a
+# good image). What CI does check is the one property a runner can get wrong by
+# itself, with the standard library only: the machine type.
+#
+# Run it:
+#
+#     gh workflow run build-release.yml
+#
+# The asset is uploaded with `--clobber`: the same name on the same release is
+# replaced, never stacked. The name stays ShadowMaps.dll because that is the
+# file the client's loader resolves, and README.md's install lines put it
+# beside the client under that name; the build stamp the mod prints in its log
+# lines is what tells a new download from a stale one.
+
+name: build-release
+
+# Manual only: what a run publishes is a shipped artifact, so a commit should
+# not change what players download. To also rebuild on push, write
+# `on: [workflow_dispatch, push]` here. A dispatched run builds the branch it
+# is dispatched from, which is this repo's master.
+on:
+  workflow_dispatch:
+
+# GITHUB_TOKEN needs contents: write to touch a release's assets.
+permissions:
+  contents: write
+
+jobs:
+  ship:
+    # Windows, for the reason README.md's toolchain paragraph states: /MT for
+    # the static CRT, /MACHINE:IX86, and the SDK's i686 import libraries
+    # (kernel32.lib, ntdll.lib) are an MSVC-for-Windows thing.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: python for the PE-header check below
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # build.py's own first check, done here so a runner whose Visual Studio
+      # install has no x86-32 target compiler says that in one line rather than
+      # at the top of a wall of linker complaints -- and rather than letting an
+      # x64 image reach the release. Same rule build.py uses before its link
+      # (PATTERNS, and the bin\ folder's own name says which architecture cl.exe
+      # emits): a bin\Host*\x86\cl.exe is the only compiler that can make the
+      # i686 image WoW.exe build 5875 loads.
+      - name: the runner can target i686
+        run: |
+          $cl = Get-ChildItem -Path 'C:\Program Files*\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\*' -Filter cl.exe -Recurse -Depth 2 -EA SilentlyContinue
+          foreach ($c in $cl) { Write-Output $c.FullName }
+          if (-not $cl) {
+            Write-Output 'no cl.exe under any VC\Tools\MSVC tree: nothing can build'
+            exit 1
+          }
+          $i686 = $cl | Where-Object { $_.FullName -match 'bin\\Host[^\\]*\\x86\\cl\.exe' }
+          if (-not $i686) {
+            Write-Output 'no bin\Host*\x86\cl.exe: this runner has no 32-bit target, so ShadowMaps.dll cannot be built here'
+            exit 1
+          }
+          Write-Output "i686-capable cl.exe: $($i686[0].FullName)"
+
+      - name: cmake --preset win32
+        run: cmake --preset win32
+
+      - name: cmake --build build --preset release
+        run: cmake --build build --preset release
+
+      # The one thing CI has to know about the image it just linked, read with
+      # the standard library so there is nothing to pip install: 0x14c is the
+      # i686 machine type, the one build 5875's loader accepts. README.md's
+      # toolchain paragraph is the reason this is asked here rather than left
+      # to the upload -- asked for a target it cannot emit, the driver answers
+      # D9002 "unknown parameter" and quietly produces an x64 image, and an
+      # x64 DLL cannot be loaded by the client at all, so it must not become a
+      # release asset. Everything else about the image (the `Load` export, the
+      # import list, the three detour tables) is what verify_dll.py said when
+      # this build was made locally, before it was committed.
+      - name: the image is an i686 PE
+        run: python -c "import struct,sys;d=open('build/Release/ShadowMaps.dll','rb').read();o=struct.unpack_from('<I',d,0x3c)[0];m=struct.unpack_from('<H',d,o+4)[0];print('image %d bytes, machine 0x%x' % (len(d), m));sys.exit(m != 0x14c)"
+
+      # gh is preinstalled on every runner, but it stopped reading the
+      # workflow's GITHUB_TOKEN under its old name: without GH_TOKEN it answers
+      # "To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN
+      # environment variable" and releases nothing, so the token is handed to
+      # this step by name. The tag is read with `gh api`, not with `gh release
+      # view`: this gh refuses --jq beside a view command unless --json is given
+      # with it, and gh api's output is JSON already, so --jq alone is fine
+      # there. repos/.../releases/latest is GitHub's own latest release, picked
+      # by semantic version of the tag, which is the release the Releases page
+      # points at and the one a player downloads; the repo is named by the
+      # github.repository expression rather than left to gh to guess from
+      # whatever checkout it finds. --clobber then replaces the asset of this
+      # name rather than stacking another copy beside it, so a re-run keeps
+      # one ShadowMaps.dll.
+      - name: gh release upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = gh api "repos/${{ github.repository }}/releases/latest" --jq ".tag_name"
+          if (-not $tag) {
+            Write-Output 'the repo has no release: there is nothing to attach the DLL to'
+            exit 1
+          }
+          Write-Output "latest release: $tag"
+          Write-Output "built from commit: $(git rev-parse --short HEAD)"
+          gh release upload $tag build/Release/ShadowMaps.dll --clobber
+          # a multi-line PowerShell block is judged by its last command, so the
+          # upload's own exit code is checked here rather than left to the
+          # listing below to hide it.
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output 'gh release upload failed: the built DLL is still on disk, the release is unchanged'
+            exit $LASTEXITCODE
+          }
+          gh release view $tag --json assets --jq '.assets[] | "\(.name)  \(.size) bytes  \(.browser_download_url)"'

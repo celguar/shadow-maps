@@ -32,10 +32,10 @@ Usage
                         and stop: the way to check an archive you were handed.
 
 Example
-    python extract_shadowmaps.py "G:\Games\twmoa_1181\patch-S.mpq" ^
-        --map Azeroth -o "G:\Games\twmoa_1181\shadows-Azeroth.dat"
-    python extract_shadowmaps.py "G:\Games\twmoa_1181\shadows-Azeroth-morning.mpq" ^
-        -o "G:\Games\twmoa_1181\shadows-Azeroth-morning.dat"
+    python extract_shadowmaps.py "D:\games\wow-1.12.1\patch-S.mpq" ^
+        --map Azeroth -o "D:\games\wow-1.12.1\shadows-Azeroth.dat"
+    python extract_shadowmaps.py "D:\games\wow-1.12.1\shadows-Azeroth-morning.mpq" ^
+        -o "D:\games\wow-1.12.1\shadows-Azeroth-morning.dat"
 
 What it prints
     The one .dat written, and per map inside it: the map name, the tile bounds, how

@@ -13,7 +13,7 @@ archive, and a bake never round-trips through a parsed `.adt`.
 
 ```
 Salmiak "Shadows" bake
-   -> shadow-variant MPQ export        e.g. G:\Games\twmoa_1181\shadows-Azeroth-morning.mpq
+   -> shadow-variant MPQ export        e.g. D:\games\wow-1.12.1\shadows-Azeroth-morning.mpq
    -> extract_shadowmaps.py            strips every MCSH body out of the archive
    -> shadowmaps.dat                   one 512-byte payload per chunk, global keys,
                                        every map the archives carried inside one file
@@ -268,6 +268,13 @@ to be one of those starts: pinning the right bytes at an address that is the
 middle of an operand is as wrong as pinning the wrong ones, and `0x6AF5F8` being
 where the client itself starts a `push edi` is what makes rung `d` legal.
 
+The clients it probes are not spelled out in the script: pass them on the
+command line, or keep them in the git-ignored `probe_hooksite.local.txt` beside it
+(one `WoW.exe` per line), or set `SHADOW_PROBE_EXES` as a `;` separated list.
+Which copies a machine has says nothing about the contract above, and the folder
+paths quoted elsewhere in this README are one machine's layout, written to be read
+rather than copied.
+
 The write is also checked against the client's own resolver at run time. `0x6AF970`
 turns eight header ofss into addresses with one `lea esi,[ofs+record+8]` each,
 and `BuildVertices` (`0x6B0E50`) then walks 145 floats off the MCVT one — its
@@ -371,7 +378,7 @@ saying "I did not install", and the reason is always the first line of
 `shadow-mod.log.txt`:
 
 ```
-DLL G:\Games\twmoa_1181\ShadowMaps.dll was not loaded properly (load function failed)
+DLL D:\games\wow-1.12.1\ShadowMaps.dll was not loaded properly (load function failed)
 ```
 
 The common cause is exactly the one that line names: the `.dat` still carries
@@ -452,8 +459,8 @@ else unless something went wrong, and the install line says which of the two lev
 so a one-line log is never mistaken for a broken one; see the Logging section:
 
 ```
-[12 ms after this DLL was loaded] sv10 mode 'h' read from 'G:\Games\twmoa_1181\shadow-mod.mode' (no such file means f): n = inert, a = .dat plus arena, no hook, b = hook plus an empty call, c = the detour alone with no call at all, d = the same call from the client's own frame at 0x6AF5F3, h = hook plus audit, no payload, f = full
-sv10 no shadowmaps.dat where the DLL is: the client keeps stock shadows; looked in 'G:\Games\twmoa_1181\shadowmaps.dat' (rename the variant .dat to that name, it belongs beside the DLL, not beside the game)
+[12 ms after this DLL was loaded] sv10 mode 'h' read from 'D:\games\wow-1.12.1\shadow-mod.mode' (no such file means f): n = inert, a = .dat plus arena, no hook, b = hook plus an empty call, c = the detour alone with no call at all, d = the same call from the client's own frame at 0x6AF5F3, h = hook plus audit, no payload, f = full
+sv10 no shadowmaps.dat where the DLL is: the client keeps stock shadows; looked in 'D:\games\wow-1.12.1\shadowmaps.dat' (rename the variant .dat to that name, it belongs beside the DLL, not beside the game)
 sv10 mode n: nothing read, allocated or patched, the client is untouched; shadows stay stock, the popup is expected
 sv10 handler: first-chance vectored handler registered, so the next access violation logs the chunk that was being built and the address the client read (the client's own report is still written afterwards)
 sv10 mode c installed: hook 0x6AF5F0 patched, resume 0x6AF5F6, detour at 0x........, the landing replays the prologue and returns without calling anything -- no .dat read, nothing allocated, no chunk header read or touched (shadows stay stock; this mode exists to test the store and the landing alone)
@@ -701,13 +708,13 @@ counts milliseconds since the **system** booted, which is why an older log's raw
 numbers look like hours and cannot be used to count client starts.
 
 ```
-echo n  > G:\Games\twmoa_1181\shadow-mod.mode     # ran: clean
-echo a v > G:\Games\twmoa_1181\shadow-mod.mode    # ran: clean
-echo c v > G:\Games\twmoa_1181\shadow-mod.mode    # ran (sv9): clean, entered the world
-echo d v > G:\Games\twmoa_1181\shadow-mod.mode    # ran (sv9): clean, entered the world
-echo h v > G:\Games\twmoa_1181\shadow-mod.mode    # ran (sv10): clean, printed the audit
-echo f v > G:\Games\twmoa_1181\shadow-mod.mode    # ran (sv10): drew the baked set
-echo b v > G:\Games\twmoa_1181\shadow-mod.mode    # ran (sv8, sv10): crashed by its jmp eax
+echo n  > D:\games\wow-1.12.1\shadow-mod.mode     # ran: clean
+echo a v > D:\games\wow-1.12.1\shadow-mod.mode    # ran: clean
+echo c v > D:\games\wow-1.12.1\shadow-mod.mode    # ran (sv9): clean, entered the world
+echo d v > D:\games\wow-1.12.1\shadow-mod.mode    # ran (sv9): clean, entered the world
+echo h v > D:\games\wow-1.12.1\shadow-mod.mode    # ran (sv10): clean, printed the audit
+echo f v > D:\games\wow-1.12.1\shadow-mod.mode    # ran (sv10): drew the baked set
+echo b v > D:\games\wow-1.12.1\shadow-mod.mode    # ran (sv8, sv10): crashed by its jmp eax
 ```
 
 | What the run shows | What it means |

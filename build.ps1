@@ -1,6 +1,6 @@
 # build.ps1 -- front end for build.py, the no-CMake fallback; run it from this
 # folder:
-#   cd I:\code\wow\misc\salmiak-shadow-mod
+#   cd <the folder that holds this file and src\mod.c>
 #   powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 #
 # The canonical build is CMake -- see README.md and CMakeLists.txt, which mirror

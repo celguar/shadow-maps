@@ -10,7 +10,9 @@ the clients carry IDENTICAL .text at the addresses the mod uses (a Turtle-Wow
 flavor and a vanilla copy load the same mod because their code is the same).
 
 Usage
-    python probe_hooksite.py [<WoW.exe> ...]        (default: the two known copies)
+    python probe_hooksite.py [<WoW.exe> ...]  (default: the WoW.exe list in
+                                              probe_hooksite.local.txt, else the
+                                              SHADOW_PROBE_EXES ';' list)
 
 What it prints
     Per client: imagebase, the .text section map, and for every pinned address
@@ -27,6 +29,7 @@ log a refusal rather than patch it.
 """
 
 import sys
+import os
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32
 import pefile
 
@@ -69,10 +72,32 @@ EXPECT = {
     0x6B0030: bytes.fromhex("55 8b ec 8b 45 08".replace(" ", "")),
 }
 
-DEFAULT_EXES = [
-    r"G:\Games\twmoa_1181\WoW.exe",
-    r"G:\Games\WoW Vanilla\WoW.exe",
-]
+# Which clients to read when the command line names none is a fact about the
+# machine, not about this project: the pinned windows and the instruction
+# boundaries below are the contract, and any 1.12.1 client that carries them
+# takes the same patch. So no game folder is spelled out in this file. The clients
+# come, by precedence, from the command line, then LOCAL_EXES (one WoW.exe per
+# line, a leading # comments), then ENV_EXES as a ';' separated list.
+LOCAL_EXES = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "probe_hooksite.local.txt")
+ENV_EXES = "SHADOW_PROBE_EXES"
+
+
+def default_exes():
+    """The machine's own client copies: LOCAL_EXES if it is there, else ENV_EXES."""
+    hit = []
+    if os.path.isfile(LOCAL_EXES):
+        with open(LOCAL_EXES, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    hit.append(line.strip('"'))
+    if not hit:
+        for piece in os.environ.get(ENV_EXES, "").split(";"):
+            piece = piece.strip().strip('"')
+            if piece:
+                hit.append(piece)
+    return hit
 
 
 def read_at(pe, data, va, length):
@@ -85,7 +110,12 @@ def read_at(pe, data, va, length):
 
 
 def main(argv):
-    exes = argv or DEFAULT_EXES
+    exes = argv or default_exes()
+    if not exes:
+        print("no clients to probe: name them on the command line (python probe_hooksite.py"
+              " <WoW.exe> ...), or put one WoW.exe per line in 'probe_hooksite.local.txt'"
+              " beside this script, or set SHADOW_PROBE_EXES as a ';' separated list")
+        return 1
     md = Cs(CS_ARCH_X86, CS_MODE_32)
     texts = {}
     bad = 0

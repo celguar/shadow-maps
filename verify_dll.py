@@ -99,8 +99,16 @@ import os
 import pefile
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32
 
-MOD_CPP = r"I:\code\wow\misc\salmiak-shadow-mod\src\mod.c"
-DEFAULT_DLLS = [r"I:\code\wow\misc\salmiak-shadow-mod\out\ShadowMaps.dll"]
+# Everything this script reads lives inside the project, so the folder it starts
+# from is the folder holding this file: build.py's default out\ShadowMaps.dll is
+# beside it, and mod.c is under src\. Deriving the root instead of spelling an
+# absolute path keeps the script true on any machine -- the one that built the
+# DLL and any that only reads a copy -- and says nothing about any of them. A
+# copy carried off the project root alone misses MOD_CPP, and the reader below
+# says so and falls back to the hardcoded needles.
+ROOT = os.path.dirname(os.path.abspath(__file__))
+MOD_CPP = os.path.join(ROOT, "src", "mod.c")
+DEFAULT_DLLS = [os.path.join(ROOT, "out", "ShadowMaps.dll")]
 
 # the DLLs a WoW 1.12.1 mod may legitimately import; anything else means the
 # build pulled in a CRT or C++ runtime the client's folder has no reason to

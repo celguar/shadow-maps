@@ -18,5 +18,9 @@ out/
 # the mod's own run log, in the game folder
 *.log.txt
 
+# which WoW.exe copies this machine has, read by probe_hooksite.py when the
+# command line names none: a fact about the PC, not about the contract
+probe_hooksite.local.txt
+
 # python's own scratch
 __pycache__/
