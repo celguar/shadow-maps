@@ -101,8 +101,8 @@ attributable to the angles that produced it after both have been exported.
 
 | Preset | Sliders | Reads back as | Why it is or is not worth shipping |
 | --- | --- | --- | --- |
-| Blizzlike - stock shadows | `29 / 33` | 45.5° of bearing, 47.2° of height | the nearest pair of whole degrees to the sun the stock 1.12.1 `MCSH` payloads were cast at, and the pair Salmiak's defaults still carry. **Shipping this is a no-op-looking variant**: it reproduces what the client's own `.adt`s already have, so it is the calibration run, not the payload to sell. |
-| Morning 06:00 | `42 / 63` | 45.3°, 19.7° | the client's own polar track at 06:00, the longest shadows vanilla has. **This is the variant to ship** — it is what the `shadowmaps.dat` in the tables above was extracted from, and a long-shadow set is the one that visibly differs from stock. |
+| Blizzlike - stock shadows | `29 / 33` | 45.5° of bearing (north-west), 47.2° of height | the nearest pair of whole degrees to the sun the stock 1.12.1 `MCSH` payloads were cast at, and the pair Salmiak's defaults still carry. **Shipping this is a no-op-looking variant**: it reproduces what the client's own `.adt`s already have, so it is the calibration run, not the payload to sell. |
+| Morning 06:00 | `42 / 63` | 45.3°, 19.7° — sun north-west, shadows south-east | the client's own polar track at 06:00, the longest shadows vanilla has. **This is the variant to ship** — it is what the `shadowmaps.dat` in the tables above was extracted from, and a long-shadow set is the one that visibly differs from stock. |
 | Evening 18:00 | `42 / 63` | same pair | the client's polar track is symmetric about 12:00 and its azimuth is one constant all day, so vanilla has exactly one low-sun shape: Evening *is* Morning, and both ticks light at once. There is no separate evening set to bake. |
 | Noon 12:00 | `34 / 43` | 44.7°, 37.3° | the polar's 127° key: same bearing, shorter shadows. |
 | Night - moon 00:00 | `24 / 26` | 45.4°, 55.2° | the stock client ships **one** static shadow map sampled whatever hour it is, so night is not on the sun's tracks at all; this uses the white moon's own tracks (same bearing, a higher light). The low-sun pair is the wrong shape for it. |
@@ -113,6 +113,15 @@ that re-solves nearest to its hour, per the bake's own ray
 `benilla-re` (`systems/lighting/celestial.md`), and it is the *bearing* that never
 changes across a vanilla day — only the height does, so a morning variant and a
 noon variant differ in shadow length, not direction.
+
+Which way that bearing points, spelled out once because the compass here is not the
+one a map reader assumes: on a north-up map the client's azimuth runs **clockwise**
+from +X to +Y, so 0° is west, 90° north, 180° east, 270° south and +X itself is west.
+A bearing of ~45° is the north-west quarter, the client's 225° of travel is toward the
+south-east, and every preset above therefore puts the sun over the north-west with
+shadows running to the south-east — the same way the stock 1.12.1 maps already draw
+them, which is how the `29 / 33` default was recognised by eye against the client's own
+terrain. The pairs are not mirrored against that look; only the words around them are.
 
 Run one variant end to end at a time: a fresh whole-map bake drops the packed
 bits the previous walk left in memory, so export (or discard) the morning set
