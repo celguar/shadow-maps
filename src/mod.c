@@ -1098,7 +1098,7 @@ static const struct SunPreset {
  * sine and cosine are the client's: all this does is turn degrees into the
  * radians the key floats hold. */
 #define SUN_D2R 0.01745329251994329186404805098050064450281532733429333166503906250f
-#define SUN_R2D 57.2957795130823246137866726764679354908450925425769347584686279296875
+#define SUN_R2D 57.2957795130823246137866726764679354908450925425769347584686279296875f
 
 static int g_sun_forced = -1;     /* shadow-mod.sun's name, -1 is the clock  */
 static int g_sun_off;             /* shadow-mod.sun said off                */
@@ -1109,6 +1109,9 @@ static unsigned g_sun_said_preset;  /* one line per preset applied, bit per  */
 static int g_sun_said_stock;
 static int g_sun_said_off;
 static int g_sun_said_back;
+static unsigned g_sun_said_read;   /* one read-back line per preset index, bit per
+                                     * index: the readback says what the live bytes
+                                     * hold once per window, a crossing says so once */
 
 /* the clock, in the unit the presets' windows use. The DLL never makes a
  * clock of its own: this is the float the client stamps every rendered world
@@ -1233,6 +1236,170 @@ static void SunWrite(unsigned which)
     SunPut(3u, p->t_pol_d, p->pol_d);
 }
 
+/* the client's own evaluator rule, replayed over whatever its tracks hold
+ * NOW rather than over the tables this file means to write, which is what
+ * separates a write that did not land, a track whose key times got a
+ * neighbour's, and a phase that is not the hour the UI shows -- all of which
+ * read the same in game and say nothing until the live bytes are read back.
+ * benilla-re systems/lighting/celestial.md#tracks: the phase is clamped to
+ * [0,1] with NaN as 1; the first key i whose time is at or above the phase
+ * is taken, cyclically, with j the key before it -- the last key when i is
+ * the first or when no key qualifies; with d = time[i] - time[j] a |d| below
+ * 0.001 returns value[j] whole, and a negative d and a negative e = phase -
+ * time[j] each take +1 before the lerp, which is what makes a pair whose
+ * times straddle midnight a rising leg across it. the angles are the
+ * radians the client holds, so they are turned back into degrees here. */
+static float SunEvalTrack(unsigned tr, float phase)
+{
+    const float *kv = (const float *)(size_t)sun_addr[tr];
+    unsigned n = sun_n[tr];
+    unsigned i, j, k;
+    float d, e, tj;
+
+    if (!n)
+        return 0.0f;
+    if (phase < 0.0f)
+        phase = 0.0f;
+    else if (!(phase >= 0.0f))
+        phase = 1.0f; /* the NaN's, the client's own answer */
+    else if (phase > 1.0f)
+        phase = 1.0f;
+    i = n;
+    for (k = 0; k < n; ++k) {
+        if (phase <= kv[n + k]) {
+            i = k;
+            break;
+        }
+    }
+    if (i >= n)
+        i = 0; /* no key qualified: the leg from the last key to the first */
+    j = (i + n - 1u) % n;
+    tj = kv[n + j];
+    d = kv[n + i] - tj;
+    if (d > -0.001f && d < 0.001f)
+        return kv[j] * SUN_R2D;
+    if (d < 0.0f)
+        d += 1.0f;
+    e = phase - tj;
+    if (e < 0.0f)
+        e += 1.0f;
+    return (kv[j] + (kv[i] - kv[j]) * (e / d)) * SUN_R2D;
+}
+
+/* a float's degrees to whole degrees, away from zero at the half. The readback
+ * prints degrees the client's radians round-trip to, and a truncating cast
+ * turns 495 deg, held as the nearest float's radians, into 494 on the line --
+ * which reads as a key one degree off its own table. Rounding is what makes
+ * the line say the key it holds. */
+static int SunRoundDeg(float deg)
+{
+    return (int)(deg >= 0.0f ? deg + 0.5f : deg - 0.5f);
+}
+
+/* degrees to the map's, in the frame the stock sun pins: the client's azimuth
+ * 0 is due west and the angle grows through north, so a bearing is the
+ * azimuth with whole turns taken out. */
+static int SunBearing(float az)
+{
+    int b = SunRoundDeg(az) % 360;
+    if (b < 0)
+        b += 360;
+    return b;
+}
+
+/* what the client is showing right now, from its own bytes: the four tracks
+ * as they read now, and the two bearings that come out of them at the
+ * client's own phase. this is the one line that tells an in-game visit which
+ * side of the write is wrong, because a disc in the wrong place, a shading
+ * bearing 180 deg off the disc, and a bearing that never matches the sky
+ * under any reading are three different facts about live memory and the
+ * azimuth's handedness, and only the live bytes can sort them out. one line
+ * per preset window, next to the line that names the preset written. */
+static void SunReadback(unsigned which, unsigned hmin)
+{
+    const struct SunPreset *p = &sun_presets[which];
+    const float *st = (const float *)(size_t)SUN_TOD_STATE;
+    float phase = st[SUN_TOD_OFF / 4u];
+    float az_l, pol_l, az_d, pol_d;
+    int disc_b, disc_el, src_b, src_el, gap;
+    char msg[1792]; /* the line prints all four tracks' live key pairs plus the
+                      * phase, the preset name and the two bearings: rendered at
+                      * the widest addresses and a long preset name it runs past
+                      * 1410, so a 1280 buffer cut its tail off in the log */
+
+    int dv[4][5];
+    unsigned tv[4][5];
+    unsigned tr, i;
+    const float *kv;
+
+    if (g_sun_said_read & (1u << which))
+        return;
+    g_sun_said_read |= (1u << which);
+
+    if (!(phase >= 0.0f) || phase >= 1.0f)
+        phase = 0.0f;
+    for (tr = 0; tr < 4u; ++tr) {
+        kv = (const float *)(size_t)sun_addr[tr];
+        for (i = 0; i < sun_n[tr]; ++i) {
+            dv[tr][i] = SunRoundDeg(kv[i] * SUN_R2D);
+            tv[tr][i] = (unsigned)(kv[sun_n[tr] + i] * 10000.0f + 0.5f);
+        }
+    }
+    az_l = SunEvalTrack(0u, phase);
+    pol_l = SunEvalTrack(1u, phase);
+    az_d = SunEvalTrack(2u, phase);
+    pol_d = SunEvalTrack(3u, phase);
+    disc_b = SunBearing(az_d);
+    src_b = SunBearing(az_l + 180.0f); /* the direction light comes from is the
+                                        * antipode of the direction it travels,
+                                        * celestial.md#sun-direction */
+    disc_el = 90 - SunRoundDeg(pol_d);
+    src_el = SunRoundDeg(pol_l) - 90;
+    gap = src_b - disc_b;
+    if (gap > 180)
+        gap -= 360;
+    if (gap < -180)
+        gap += 360;
+
+    snprintf(msg, sizeof msg,
+             STAMP " sun read back: what the client's own tracks hold now, and what its evaluator"
+                    " makes them give at the client's own phase. the phase at 0x%x+%x is 0.%04u,"
+                    " half-minute %u of %u, and %s is the preset this visit wrote. the live keys,"
+                    " values then their times, degrees as the radians at each address read back:"
+                    " light azimuth 0x%x = %d %d %d %d deg at 0.%04u 0.%04u 0.%04u 0.%04u;"
+                    " light polar 0x%x = %d %d %d %d deg at 0.%04u 0.%04u 0.%04u 0.%04u;"
+                    " disc azimuth 0x%x = %d %d %d deg at 0.%04u 0.%04u 0.%04u;"
+                    " disc polar 0x%x = %d %d %d %d %d deg at 0.%04u 0.%04u 0.%04u 0.%04u 0.%04u."
+                    " interpolating those at the phase gives the disc at azimuth %d deg and polar"
+                    " %d deg and the light azimuth %d deg and polar %d deg, so the disc sits at"
+                    " bearing %d deg, %d deg above the horizon, and the shading comes from bearing"
+                    " %d deg, %d deg high: they are %d deg apart. read the two bearings against the"
+                    " sky you are looking at: a disc bearing that matches makes the tables and the"
+                    " handedness right and the arc's own angles are what to change; a shading bearing"
+                    " 180 apart from the disc is the light pointing at the sun rather than away from"
+                    " it; and a disc polar that should keep it below the horizon at a night hour and"
+                    " does not is a key time belonging to another track. the azimuths are 0 = west,"
+                    " 90 = north, 180 = east, 270 = south, the frame the stock sun's own NORTH WEST"
+                    " pins",
+             SUN_TOD_STATE, SUN_TOD_OFF,
+             (unsigned)(phase * 10000.0f + 0.5f), hmin, SUN_HMIN_DAY, p->name,
+             sun_addr[0],
+             dv[0][0], dv[0][1], dv[0][2], dv[0][3],
+             tv[0][0], tv[0][1], tv[0][2], tv[0][3],
+             sun_addr[1],
+             dv[1][0], dv[1][1], dv[1][2], dv[1][3],
+             tv[1][0], tv[1][1], tv[1][2], tv[1][3],
+             sun_addr[2],
+             dv[2][0], dv[2][1], dv[2][2],
+             tv[2][0], tv[2][1], tv[2][2],
+             sun_addr[3],
+             dv[3][0], dv[3][1], dv[3][2], dv[3][3], dv[3][4],
+             tv[3][0], tv[3][1], tv[3][2], tv[3][3], tv[3][4],
+             SunRoundDeg(az_d), SunRoundDeg(pol_d), SunRoundDeg(az_l), SunRoundDeg(pol_l),
+             disc_b, disc_el, src_b, src_el, gap);
+    LogMsg(msg);
+}
+
 /* shadow-mod.sun, next to the mode file: absent or clock means the clock
  * decides, which is the concept; off means leave the stock sun alone; a
  * preset name forces that one, which is how a preset is watched without
@@ -1337,6 +1504,7 @@ static void SunKeepArc(void)
             LogMsg(msg);
         }
         SunWrite(which);
+        SunReadback(which, hmin);
         g_sun_applied = (int)which;
         return;
     }
@@ -1360,6 +1528,7 @@ static void SunKeepArc(void)
             LogMsg(msg);
         }
         SunWrite(which);
+        SunReadback(which, hmin);
         return;
     }
     SunWrite(which);
@@ -1387,24 +1556,40 @@ static void SunKeepArc(void)
                  (unsigned)sun_presets[which].pol_d[4], SUN_EVAL_ADDR);
         LogMsg(msg);
     }
+    SunReadback(which, hmin);
 }
 
 /* sv15's test hook, next to the arc: the day runs faster, so an arc can be
  * watched cross the sky in one visit instead of one hour per sky. Nothing here
- * makes a clock: this is the client's own scale float at 0xce8564, multiplied.
+ * makes a clock: this is the client's own scale float at 0xce8564, the game
+ * clock at 0xce8538's +0x2c, set to what the mode file's digits say.
+ *
+ * The number is the SCALE itself, game minutes per real second, not a
+ * multiplier of the live float, and that is not a style choice: the server
+ * sends this scale as 0.01666667f (0x3c888889, 1/60), which is also what
+ * 0x643300 builds the clock with, so multiplying a live scale by 99 asked for
+ * 1.65 game minutes per real second -- one hour of sky in 36 real seconds --
+ * which is what an in-game visit showed the day actually doing, an hour of
+ * sky in well under a minute but nowhere near a minute of sky a second. The
+ * mode file's number is what the day runs at, so 60 is one game hour per
+ * real second and a whole day is 24 real seconds. 0x643820 keeps its own
+ * clamp, [1/60, 60], so digits above 60 land on 60 rather than on a scale
+ * the client can never ask for, and the clamp is what makes the printed
+ * before/after pair readable: the stock scale prints as 17 milli.
+ *
  * The scale is only re-written when the float is NOT already what this DLL
  * wrote, so the server's time messages -- whose opcode 0x47 and 0x42 handlers
- * both end in 0x643820 -- are picked up and multiplied again rather than
- * compounded: the base is always whatever the client last had, never our own
- * output. The result keeps 0x643820's own clamp, since a direct store would
- * otherwise leave the client able to hold a scale it can never ask for. */
+ * both end in 0x643820 -- are picked up and set again rather than compounded
+ * off: the base is always whatever the client last had, never our own output,
+ * and that is also what lets a server that sends its own scale be seen. */
 static void TimeSpeedKeep(void)
 {
     float *sc;
     float cur, want;
-    char msg[768]; /* the line names both scales, the day's real length and the
-                     * hour's, and runs past 700 bytes: a 384 buffer cut its tail
-                     * off in the log, which is what made the line unreadable */
+    char msg[1536]; /* sv15's line now also explains why the number is the scale
+                      * itself and not a multiplier of the server's 1/60: rendered
+                      * it runs past 1180 bytes, and a shorter buffer cut its tail
+                      * off in the log, which is what made the line unreadable */
 
     if (g_time_speed <= 1)
         return;
@@ -1412,11 +1597,17 @@ static void TimeSpeedKeep(void)
     cur = *sc;
     if (g_time_wrote != 0.0f && cur == g_time_wrote)
         return; /* still ours: the day is already running at this speed */
-    want = cur * (float)g_time_speed;
+    want = (float)g_time_speed;
     if (!(want >= GT_SCALE_LO))
-        want = GT_SCALE_LO; /* also a NaN's scale: the client's own low bound */
+        want = GT_SCALE_LO; /* 0x643820's low bound, the same guard the client
+                              * keeps: the digits cannot reach it, so this line
+                              * is here only so the store below is always a
+                              * scale the client itself could have asked for */
     if (want > GT_SCALE_HI)
-        want = GT_SCALE_HI;
+        want = GT_SCALE_HI; /* 0x643820's high bound, 60: one game hour per
+                              * real second, a whole day in 24 real seconds.
+                              * the parser caps the digits at 99, so this is
+                              * where a run of digits lands from 60 up */
     *sc = want;
     g_time_wrote = want;
     if (!g_time_said) {
@@ -1424,17 +1615,25 @@ static void TimeSpeedKeep(void)
         snprintf(msg, sizeof msg,
                  STAMP " clock: shadow-mod.mode had %u, so the game clock object's scale at 0x%x, the"
                         " game clock at 0xce8538's +0x2c, went"
-                        " from %u to %u milli-game-minutes per real second, the float 0x643a70 multiplies"
-                        " the real seconds since the last minute by to get the day phase and 0x6435a0"
-                        " adds dt times to the minute accumulator. a whole game day is %u real minutes"
-                        " at the new scale and one hour of sky turns in %u real seconds: the sun's phase,"
-                        " clock Script::GetGameTime returns and the day count all move together. the"
-                        " server re-sends this scale in its time messages -- the 0x47 handler 0x6c5de0"
-                        " and the 0x42 handler 0x6c5e80 end in 0x643820, which clamps to [1/60, 60] --"
-                        " so it is re-asserted at every chunk visit",
+                        " from %u to %u milli-game-minutes per real second. %u is the mode file's"
+                        " number used as the scale itself rather than as a multiplier of what was"
+                        " there, because the server sends this scale as 0.01666667f, 1/60, which is"
+                        " also what 0x643300 builds the clock with: multiplying that live scale asked"
+                        " for %u milli, an hour of sky in well under a minute but nowhere near a game"
+                        " minute a second. the float is what 0x643a70 multiplies the real seconds since"
+                        " the last minute by to get the day phase and what 0x6435a0 adds dt times of to"
+                        " the minute accumulator, so a whole game day is %u real seconds and one hour"
+                        " of sky turns in %u real seconds: the sun's phase, the clock the UI shows and"
+                        " the day count all move together. 0x643820 clamps the scale to [1/60, 60], 17"
+                        " to 60000 milli, so digits at or above 60 land on 60, one game hour a real"
+                        " second and a day in 24 real seconds; the server re-sends its own scale in its"
+                        " time messages -- the 0x47 handler 0x6c5de0 and the 0x42 handler 0x6c5e80 both"
+                        " end in 0x643820 -- so the number is set again at every chunk visit",
                  (unsigned)g_time_speed, (unsigned)(GT_CLOCK_STATE + GT_SCALE_OFF),
                  (unsigned)(cur * 1000.0f + 0.5f), (unsigned)(want * 1000.0f + 0.5f),
-                 (unsigned)(1440.0f / want / 60.0f + 0.5f),
+                 (unsigned)g_time_speed,
+                 (unsigned)(cur * (float)g_time_speed * 1000.0f + 0.5f),
+                 (unsigned)(1440.0f / want + 0.5f),
                  (unsigned)(60.0f / want + 0.5f));
         LogMsg(msg);
     }
@@ -2130,7 +2329,8 @@ static int Install(void)
              " with no call at all, d = the same call from the client's own frame"
              " at 0x6AF5F3, h = hook plus audit, no payload, f = full; a v"
              " anywhere in the file also turns the diagnostic lines on, and digits up to 99 anywhere in it"
-             " runs the game clock that many times as fast",
+             " set the game clock's scale to that many game minutes per real second, which 0x643820"
+             " clamps to at most 60, one game hour a real second",
              g_mode, g_dir);
     LogVerb(msg);
 
@@ -2151,18 +2351,28 @@ static int Install(void)
 
     /* sv15's clock digit: the mode file's third thing, read with the mode above
      * it so a rung that cannot carry the arc cannot carry the speed-up either.
-     * The mode file's number multiplies the SERVER's scale, which is what the
-     * client last had,
-     * so a server that already sped the day up is sped up from there again. */
+     * The number is the scale itself, game minutes per real second, because the
+     * scale the server sends is 1/60 -- one game minute a real minute -- so
+     * multiplying that live float by 99 only asked for 1.65, an hour of sky in
+     * 36 real seconds. 0x643820's clamp keeps it in [1/60, 60], so 60 is the
+     * fastest the client can be asked to run: one game hour a real second, a
+     * whole day in 24 real seconds. */
     if (g_time_speed > 1) {
         snprintf(msg, sizeof msg,
                  STAMP " clock: shadow-mod.mode had %u, so the game clock's scale at 0x%x, the game clock"
-                        " at " GT_CLOCK_TXT "'s +0x%x, is multiplied by %u at every chunk visit -- h and f"
-                        " only. the day, the sun's phase and the clock the UI shows all run %u times as"
-                        " fast, and the server's own scale is what gets multiplied, so this is a test"
-                        " control, not a shipping one",
+                        " at " GT_CLOCK_TXT "'s +0x%x, is set to %u game minutes per real second at every"
+                        " chunk visit -- h and f only. the number is the scale itself, not a multiplier"
+                        " of the live float: the server sends this scale as 1/60, one game minute a real"
+                        " minute, so a multiplier asked for a fraction of a game minute a second. the day"
+                        " and the sun's phase run at that scale once the clamp takes it, so a day is %u"
+                        " real seconds and one hour of sky turns in %u real seconds. 0x643820's clamp"
+                        " keeps the scale in [1/60, 60], so 60 is as fast as the client can be asked to"
+                        " run and a mode file's digits at or above that land there and print as a day"
+                        " in 24 real seconds",
                  (unsigned)g_time_speed, (unsigned)GT_SCALE_ADDR, GT_SCALE_OFF,
-                 (unsigned)g_time_speed, (unsigned)g_time_speed);
+                 (unsigned)g_time_speed,
+                 (unsigned)(1440.0f / (float)(g_time_speed > 60 ? 60 : g_time_speed) + 0.5f),
+                 (unsigned)(60.0f / (float)(g_time_speed > 60 ? 60 : g_time_speed) + 0.5f));
         LogVerb(msg);
     } else if (g_time_speed == 1) {
         snprintf(msg, sizeof msg,

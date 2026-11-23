@@ -1,9 +1,11 @@
 # sv15: the sun travels one arc, the game's own clock picks where it applies
 
 Same shadow pipeline as sv13 — the hook, the stubs, the arena, the writes and
-the `.dat` are sv13's byte for byte — plus sv14's sun writes and one new thing
-of sv15's: a number in the mode file runs the client's own game clock faster,
-so one session can watch the arc cross the sky.
+the `.dat` are sv13's byte for byte — plus sv14's sun writes and two new things
+of sv15's: a number in the mode file sets the client's own game clock's scale,
+so one session can watch the arc cross the sky, and every preset that gets
+written is read back out of the client's bytes and printed, so a sky report
+names the live keys rather than the sky.
 
 Nothing else in the pipeline changed: no new hook, no new file format, no new
 export, and `verify_dll.py` still reports the same hook, the same three detour
@@ -125,7 +127,7 @@ The clock windows are two, not five:
 
 | preset | clock window | disc azimuth → light azimuth | disc polar → light polar |
 |---|---|---|---|
-| `arc-swnw` | 00:00–20:00 | 315 360 405 @ 05:30 12:00 21:30 → 495 517.5 540 585 @ 05:30 08:48 12:00 21:30 | stock's own: 100 5 5 5 100 @ 05:30 11:55 12:00 12:05 21:30 → 127 110 127 110 @ 00:00 06:00 12:00 18:00 |
+| `arc-swnw` | 00:00–20:00 | 315 360 405 @ 05:30 12:00 21:30 → 495 517.5 540 585 @ 05:30 08:45 12:00 21:30 | stock's own: 100 5 5 5 100 @ 05:30 11:55 12:00 12:05 21:30 → 127 110 127 110 @ 00:00 06:00 12:00 18:00 |
 | `arc-stock` | 20:00–24:00 | stock's own tables, written back — 45° on all three keys → 225° on all four | stock's own, as above |
 
 Bearing convention: azimuth is clockwise from +X to +Y, 0° = west, 90° = north,
@@ -167,7 +169,7 @@ python build.py .                  # links out\ShadowMaps.dll
 python verify_dll.py out\ShadowMaps.dll
 ```
 
-The sv15 image is 154,112 bytes.
+The sv15 image is 158,720 bytes.
 
 Ship it as sv13 ships it: `ShadowMaps.dll`, `ShadowMaps.def`, `ShadowMaps.dll.id`
 in `dlls.txt`, and rename the shadow file to `shadowmaps.dat` **next to the
@@ -175,14 +177,15 @@ DLL**.
 
 The mode file decides what runs, and that is how the arc is reached — the first
 letter of `shadow-mod.mode` next to the DLL picks the rung, a `v` anywhere in it
-turns the diagnostic lines on, and **a number anywhere in it runs the game clock
-that many times as fast**. A missing file means `f` with quiet logging:
+turns the diagnostic lines on, and **a number anywhere in it sets the game
+clock's scale to that many game minutes per real second**. A missing file means
+`f` with quiet logging:
 
 | put in `shadow-mod.mode` | what you get |
 |---|---|
 | (no file) | mode `f`, quiet: the arc runs **and** the `.dat` must be there, so a missing `.dat` means `Load` answers 1, the hook is not patched, and VanillaFixes shows its popup — no arc |
 | `h v` | the test rung: hook, the per-chunk audit, **no `.dat` needed**, nothing allocated, no chunk header touched — shadows stay stock and the arc still runs, with the diagnostic lines on |
-| `h 9 v` | the same rung with the day running nine times as fast — an arc crosses the sky in one session |
+| `h 9 v` | the same rung with the day at 9 game minutes a real second — an arc crosses the sky in one session |
 | `f v` | the full rung with the diagnostics on: the arc runs and the baked shadows draw |
 | `d v` or `b v` | the silent rungs: the hook is in and the call happens, but the fixup returns before the sun, so **no arc** — their install line says so |
 
@@ -191,17 +194,19 @@ install line names which rung you are on. **`h` and `f` are the two rungs that
 carry the arc**, and `h` is the one to test on because it needs no `.dat`.
 
 The number is read as a run of digits: `9` is nine, `45` is forty-five, `2 7` is
-seven because a gap ends a run and the last run wins, and a run is capped at
-99 — 99 is as far as it goes: the client's own setter `0x643820`
-clamps the scale to `[1/60, 60]` game minutes per real second and this DLL keeps
-that clamp too, so a multiplier of 60 or more all land on the same speed — 60
-game minutes per real second, a game day in 24 real seconds. The stock scale is
-1 game minute per real second (`1000` in the milli units the log prints), so 9
-means a game day of 160 real seconds, about 3 real minutes, and an hour of sky
-every 7 real seconds. The multiplier is put on the scale the client
-currently has, which is what the server last sent, so a server that already
-sped the day up is sped up from there again: this is a test control, not a
-shipping one.
+seven because a gap ends a run and the last run wins, and a run is capped at 99.
+**The number is the scale itself**, game minutes per real second, not a
+multiplier of what is in the field: `0x643300` builds the clock with `+0x2c` =
+`0x3c888889`, 1/60, and the server's time messages carry that same scale, so the
+live float is 17 milli-game-minutes per real second, not 1000. A multiplier of
+99 therefore asked for 1.65 game minutes a real second — an hour of sky in 36
+real seconds, which is what the last visit watched the day do. `0x643820`
+clamps the scale to `[1/60, 60]`, and this DLL keeps that clamp, so digits at or
+above 60 all land on 60 game minutes a real second: one game hour a real second
+and a whole game day in 24 real seconds. At 9 a day is 160 real seconds and an
+hour of sky turns in 7. The scale is only re-written when the live float is not
+already what this DLL wrote, which is what keeps the server re-sending its own
+1/60 from compounding off: this is a test control, not a shipping one.
 
 Then, in order:
 
@@ -230,12 +235,12 @@ Then, in order:
    evening that is still the morning arc is not.
 
 3. Put a number in the mode file and watch the sky instead of waiting for it:
-   `h 9 v` gives a game day of 160 real seconds — the line prints it as 3 real
-   minutes — and an hour of sky every 7 real seconds, and the clock the UI shows
-   moves with it. The line to look for is
+   `h 9 v` puts the day at 9 game minutes a real second — a game day of 160 real
+   seconds, an hour of sky every 7 — and the clock the UI shows moves with it.
+   The line to look for is
 
    ```
-   sv15 clock: shadow-mod.mode had 9, so the game clock object's scale at 0xce8564, the game clock at 0xce8538's +0x2c, went from 1000 to 9000 milli-game-minutes per real second, the float 0x643a70 multiplies the real seconds since the last minute by to get the day phase and 0x6435a0 adds dt times to the minute accumulator. a whole game day is 3 real minutes at the new scale and one hour of sky turns in 7 real seconds: the sun's phase, clock Script::GetGameTime returns and the day count all move together. the server re-sends this scale in its time messages -- the 0x47 handler 0x6c5de0 and the 0x42 handler 0x6c5e80 end in 0x643820, which clamps to [1/60, 60] -- so it is re-asserted at every chunk visit
+   sv15 clock: shadow-mod.mode had 9, so the game clock object's scale at 0xce8564, the game clock at 0xce8538's +0x2c, went from 17 to 9000 milli-game-minutes per real second. 9 is the mode file's number used as the scale itself rather than as a multiplier of what was there, because the server sends this scale as 0.01666667f, 1/60, which is also what 0x643300 builds the clock with: multiplying that live scale asked for 150 milli, an hour of sky in well under a minute but nowhere near a game minute a second. the float is what 0x643a70 multiplies the real seconds since the last minute by to get the day phase and what 0x6435a0 adds dt times of to the minute accumulator, so a whole game day is 160 real seconds and one hour of sky turns in 7 real seconds: the sun's phase, the clock the UI shows and the day count all move together. 0x643820 clamps the scale to [1/60, 60], 17 to 60000 milli, so digits at or above 60 land on 60, one game hour a real second and a day in 24 real seconds; the server re-sends its own scale in its time messages -- the 0x47 handler 0x6c5de0 and the 0x42 handler 0x6c5e80 both end in 0x643820 -- so the number is set again at every chunk visit
    ```
 
    Nothing here makes a clock: `0xce8564` is the scale float inside the client's
@@ -249,7 +254,25 @@ Then, in order:
    in the same folder as the mode file, and `off` to leave the client's tables
    alone.
 
-5. If the day-night file ever rebuilds its tracks after install, the line to
+5. Every preset that is written gets one readback line after it, and that line is
+   what makes a sky report decisive: it reads the four tracks back out of the
+   client, replays the client's own evaluator rule over whatever those bytes
+   hold at the client's own phase, and prints the disc's bearing and elevation
+   and the bearing the shading comes from. An in-game sky that disagrees with
+   this line is a disagreement about the live bytes, not about the tables the
+   source says it wrote:
+
+   ```
+   sv15 sun read back: what the client's own tracks hold now, and what its evaluator makes them give at the client's own phase. the phase at 0xce9b60+4 is 0.3681, half-minute 1060 of 2880, and arc-swnw is the preset this visit wrote. the live keys, values then their times, degrees as the radians at each address read back: light azimuth 0xce8d90 = 495 517 540 585 deg at 0.2292 0.3646 0.5000 0.8958; light polar 0xce8db0 = 127 110 127 110 deg at 0.0000 0.2500 0.5000 0.7500; disc azimuth 0xce8d4c = 315 360 405 deg at 0.2292 0.5000 0.8958; disc polar 0xce8d64 = 100 5 5 5 100 deg at 0.2292 0.4965 0.5000 0.5035 0.8958. interpolating those at the phase gives the disc at azimuth 338 deg and polar 51 deg and the light azimuth 518 deg and polar 118 deg, so the disc sits at bearing 338 deg, 39 deg above the horizon, and the shading comes from bearing 338 deg, 28 deg high: they are 0 deg apart. read the two bearings against the sky you are looking at: a disc bearing that matches makes the tables and the handedness right and the arc's own angles are what to change; a shading bearing 180 apart from the disc is the light pointing at the sun rather than away from it; and a disc polar that should keep it below the horizon at a night hour and does not is a key time belonging to another track. the azimuths are 0 = west, 90 = north, 180 = east, 270 = south, the frame the stock sun's own NORTH WEST pins
+   ```
+
+   The keys the line prints are the live bytes: the arc's own values, in degrees,
+   with their times. The last five numbers are the ones to compare with the sky —
+   the disc's bearing, its elevation, the shading's bearing, its elevation, and
+   how far the two bearings are apart. The stock window gets the same line after
+   its write-back, so an evening can be checked the same way.
+
+6. If the day-night file ever rebuilds its tracks after install, the line to
    look for is
 
    ```
@@ -275,16 +298,17 @@ what mode `h` gives you without any extra work.
 * Two presets, compiled in, and one arc. The five windows sv14 shipped were not
   one sun crossing one sky; a preset payload format still belongs in
   `shadow_dat.h`, not in the hook.
-* The clock multiplier stays a test control, because it multiplies whatever the
-  client last had, and a server that sends its own time messages sets that base
-  again.
+* The clock scale stays a test control, because it writes the client's own scale
+  float, and a server that sends its own time messages sets that float again —
+  this DLL re-asserts its number at every chunk visit rather than compounding on
+  it.
 * The azimuths are left unwrapped above 360° — 495°, not 135° — because `0x6cf6c0`
   lerps in **value** space and its cyclic search wraps in **time**, so a value
   that wraps back is a backwards sweep and a value that leaves a gap is a jump at
   midnight. Monotonic through the wrap is what makes the interpolation one
   continuous forward rotation. The client's `fsin`/`fcos` read either spelling
   the same.
-* The arc's light azimuth carries its second key at 08:48 rather than stock's
+* The arc's light azimuth carries its second key at 08:45 rather than stock's
   06:00, because stock's own key times would put a non-monotonic pair of
   azimuths in the small hours and unwind the morning sweep. The night leg —
   21:30 back to 05:30 — is the cyclic one and interpolates along itself, which
