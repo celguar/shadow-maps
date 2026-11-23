@@ -337,6 +337,71 @@ Two things to know about this table:
    `0xce8d8c`, and the next used global after that gap is `0xce8d90` again, which is where the
    "no room to grow in place" line above comes from.
 
+### 4.4.1 What sv15 actually wrote, and where the sketch above changed
+
+The sketch is the design record; sv15 wrote something narrower, and an in-game
+visit is what made it narrow. Three things the sketch assumed were wrong:
+
+* **the 180° sweep with new polar keys was not taken.** sv14 moved the light
+  polar down to 80°, under 90°, and in game the ground came out mirrored and
+  over-bright: past 90° is where the light direction stops pointing down, and a
+  light direction pointing up makes the diffuse term of every up-facing normal
+  zero, so the shading reads as reflected. The fix that holds is the simple one:
+  **keep the polar keys stock's own, unchanged.** Then the day's heights, its
+  rise at 06:10 and its set at 20:31 and its strength are stock's hour for hour,
+  and only the azimuth moves — which is also the thing the player asked for, an
+  evening that matches stock.
+* **the sweep is a quarter turn, not a half one.** With stock's hours and
+  heights, a sun that rises south-west (315° at 05:30) and sets north-west
+  (405° at 21:30) passes **due west** at noon (360°), not north-west: a
+  90° sweep across the day. That keeps vanilla's north-west at dusk, which is
+  where the shipped `MCSH` presets are and where an evening has to match stock.
+* **one arc, not one window per hour.** The four tracks are one global block
+  that the day-night file builds once behind the guard bits at `0x6d3a10` and
+  `0x6d3b80`; five windows holding five different arcs were never one sun
+  crossing one sky, and the visits showed the disc, the ground and the objects
+  disagreeing about where the light was. sv15 has two windows: the arc from
+  00:00 to 20:00 and **stock written back** from 20:00 to 24:00 — writing the
+  stock keys, not nothing, because writing nothing is what let a morning arc
+  survive into the evening.
+
+What it writes, `arc-swnw` (0° = west, 90° = north, clockwise; polar from the sky's
+top), in the client's own key counts 4 / 4 / 3 / 5:
+
+| track | time | value |
+| --- | --- | --- |
+| `0xce8d90` light azimuth (4) | 0.2291667 (05:30) | 495° |
+| | 0.3645833 (08:45) | 517.5° |
+| | 0.5000000 (12:00) | 540° |
+| | 0.8958333 (21:30) | 585° |
+| `0xce8db0` light polar (4) | 0.0 0.25 0.5 0.75 | 127° 110° 127° 110° — stock's own |
+| `0xce8d4c` disc azimuth (3) | 0.2291667 0.5 0.8958333 | 315° 360° 405° |
+| `0xce8d64` disc polar (5) | 0.2291667 0.4965278 0.5 0.5034722 0.8958333 | 100° 5° 5° 5° 100° — stock's own, at stock's own times |
+
+The light azimuth is the disc azimuth plus 180° **at the disc's own key times**
+(495° at 05:30, 540° at noon, 585° at 21:30) plus their midpoint at 08:45, and
+stock's own light key times (00:00, 06:00, 12:00, 18:00) cannot hold that arc:
+sampled there the disc gives 557°, 499°, 540° and 571°, so the first key is
+*above* the second and the leg from midnight to six runs backwards 58° —
+`0x6cf6c0` lerps in value space, so a descending pair unwinds the morning sweep
+and the shading comes from the far side of the disc through the small hours, the
+"180° off" symptom. Sampling the disc at its own three keys plus their midpoint
+keeps the four values ascending, which is what makes the one sweep continuous.
+
+Two corrections to earlier claims worth keeping, because they were both found by
+reading the bytes rather than by believing them:
+
+* sv14's stock table had the disc polar's noon trio at three keys all at 0.5;
+  the client builds them at 11:55, 12:00 and 12:05 (`celestial.md:41`, the ±0.0034722
+  offsets at `0x811510`), and a table with three keys at noon matches neither
+  stock's own tracks nor an all-zero block, so `SunPin` refuses and the arc is
+  never written on a client that has built its day-night file. sv15 carries the
+  real times.
+* the azimuth is left **unwrapped** (495°, not 135°) because `0x6cf6c0` lerps in
+  value space and wraps only in time: a wrapped value is a backwards sweep and a
+  gap is a jump at midnight. The client's `fsin`/`fcos` read either spelling the
+  same.
+
 ### 4.5 Preset table — what to ship
 
 A preset is a pair: the `.dat` shadow set (already the project's job) plus the sun key set.
@@ -351,9 +416,16 @@ with the sun-key side and the new arc rows filled in.
 | Morning | 45° | 110° | `42 / 63` → 45.3°, 19.7° | yes, the set the shipped `.dat` came from |
 | Evening | 45° | 110° | `42 / 63` | identical to Morning in vanilla (`README.md:126`) |
 | Night — white moon | 45° | 35° polar ⇒ the moon's own track | `24 / 26` → 45.4°, 55.2° | vanilla ships one static map for every hour (`README.md:128`) |
-| **Morning arc** | **315° (SW)** | 110° | re-bake at bearing ≈ 315°, height ≈ 20° | new |
-| **Evening arc** | **135° (NE)** | 110° | re-bake at bearing ≈ 135°, height ≈ 20° | new — and now it *is* a distinct set from Morning |
-| **Noon arc** | 45° (unchanged) | 127° | `34 / 43` unchanged | new preset, vanilla shape |
+| **Arc, sampled 06:00** | 318° (south west) | 110° (20°) | re-bake at bearing ≈ 318°, height ≈ 20° | new |
+| **Arc, sampled 12:00** | 360° (due west) | 127° (37°) | re-bake at bearing ≈ 360°, height ≈ 37° | new |
+| **Arc, sampled 18:00** | 388° (north west) | 110° (20°) | re-bake at bearing ≈ 388°, height ≈ 20° | new |
+| **Arc, sampled 21:00** | 403° (north west) | stock's own — this hour is `arc-stock`, stock written back | `42 / 63` unchanged | the vanilla evening |
+
+The arc rows are the *sampled* hour: one arc crosses the sky, so one baked
+`MCSH` set cannot follow it, and the honest pair is per hour you bake for. That
+re-bake is the data half of the same row every other arc row names — Salmiak's
+bake is at a fixed 45°, and re-baking is out of scope for this change, which is
+why the sun test runs with stock shadow payloads.
 
 The payoff worth selling: with the arc, Morning and Evening become genuinely different payloads
 (shadows run NE vs SW) instead of the same bytes twice, which is exactly the difference `README.md:126`

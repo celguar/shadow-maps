@@ -125,11 +125,13 @@
  *  #light-state), and the light table build reads that same float at 0xce9b64
  *  while turning it into half-minutes. sv14 turns it the same way -- round(tod
  *  * 2880), 2880 being the half-minutes in a day -- and picks the preset whose
- *  window of half-minutes holds it: the day is cut into five hours-long
- *  windows, arc-high at 00:00, arc-long at 05:00, arc-low at 10:00, arc-west
- *  at 15:00 and arc-stock at 20:00, so the hour the world was entered at names
- *  the arc, and arc-stock is the stock sun, which asks for nothing at all. An
- *  unstamped block reads 0, which is midnight and arc-high's window, so the
+ *  window of half-minutes holds it: the day is cut into two windows, arc-swnw
+ *  from midnight to 20:00 and arc-stock from 20:00 to midnight, so the hour the
+ *  world was entered at names the arc, and arc-stock is the stock sun. sv14 cut
+ *  it into five windows holding five different arcs, which was never one sun
+ *  crossing one sky -- see the sv15 note below -- and sv15 also writes the stock
+ *  keys back in this window instead of asking for nothing. An
+ *  unstamped block reads 0, which is midnight and the arc's window, so the
  *  first chunk visit already writes an arc and every visit after it reads the
  *  clock again -- the choice settles as soon as the world stamps the block.
  *  The applied line prints
@@ -153,6 +155,55 @@
  *  which is how one arc is watched without waiting for the hour. docs/sun-arc-
  *  note.md, next to this branch, is what the arc does in game and what it
  *  deliberately leaves alone.
+ *
+ * What sv15 adds on top of sv14: the stock window puts the stock keys back, and
+ *  a digit in the mode file makes the game clock run faster, for testing.
+ *  sv14's arc-stock window asked for nothing at all, which is wrong on more than
+ *  one continent: the four tracks are one global block in WoW.exe's data, and
+ *  the day-night file builds them once behind the guard bits at 0x6d3a10 and
+ *  0x6d3b80, so the last arc written survives into every hour that does not
+ *  overwrite it -- and outside a preset's own key span 0x6cf6c0 takes the wrap
+ *  leg from its last key back to its first and interpolates ALONG it, so hours
+ *  the preset never covered get an extrapolated sun. That is what an in-game
+ *  visit showed: Kalimdor at 11:30 wrote arc-low, then Eastern Kingdoms at 23:30
+ *  fell in arc-stock's window and kept arc-low's keys, whose wrap leg at 0.979
+ *  puts the disc 10 deg under the horizon but the LIGHT polar back to 80 deg --
+ *  a light direction pointing above the horizon, which zeroes the diffuse term
+ *  of every up-facing normal and reads as mirrored, reflected ground. sv15's
+ *  stock window writes the stock keys instead, so the arc that another
+ *  continent left cannot carry into these hours. The second half is a test hook
+ *  only: the client's clock object at 0xce8538 keeps its game minutes per real
+ *  second at +0x2c (gametime.md#clock-state), 0x643a70 multiplies the real
+ *  seconds since the last minute by it to get the day phase, and 0x6435a0 adds
+ *  dt times it every frame, so that one float IS the speed of the day. The
+ *  server sends it in the same packets as the time -- the opcode 0x47 handler
+ *  0x6c5de0 and the 0x42 handler 0x6c5e80 both end in 0x643820, which stores it
+ *  clamped to [1/60, 60] -- so digits up to 99 anywhere in shadow-mod.mode
+ *  multiplies whatever the server sent, re-asserted at every chunk visit the way
+ *  the key sets are, because a time message would otherwise undo it. Nothing
+ *  else in this file reads the clock object, and nothing about the shadow path
+ *  moves.
+ *
+ *  The third thing sv15 changes is the shape of the arc itself, because an
+ *  in-game evening and morning said sv14's tables were wrong in two ways. The
+ *  lighting polar went as low as 80 deg, under the 90 deg horizon, so the light
+ *  direction pointed UP: the ground read mirrored and over-bright -- the desert
+ *  that was lit far past what stock does -- and the shading seemed to come from
+ *  the far side of the disc. And sv14's polar key times put the disc 67 deg up
+ *  at 08:50 where stock has it 39 deg up, and made its day rise at 03:39 and
+ *  set at 22:04 instead of stock's 06:11 and 20:30, so the sun was too high and
+ *  the sunset came at the wrong hours. sv15 keeps the polar keys of all four
+ *  tracks exactly as stock has them, the disc at 100 deg at 05:30 and 21:30 and
+ *  5 deg at noon, the light at 127/110/127/110 on stock's own times, so the
+ *  height, the rise at 06:11, the set at 20:30 and the strength of the day are
+ *  stock's hour for hour, and moves only the azimuth: the disc runs 315 deg at
+ *  sunrise, due west at noon, 405 deg at sunset -- a south west sunrise and a
+ *  north west sunset on the map, the direction the player asked for -- with the
+ *  light azimuth kept the disc's antipode as stock keeps it, so the shading
+ *  comes from where the disc is. One arc up to 20:00 and stock's own keys from
+ *  20:00, not four windows of four arcs: four arcs were never one sun crossing
+ *  one sky, and the visits showed the disc, the ground and the objects naming
+ *  three different places for the same light.
  *
  * runs came back with their install lines and no new crash: mode a (the whole
  * 34 MB arena resident, no hook), mode c (the store and landing at 0x6AF5F0,
@@ -242,7 +293,7 @@
 #include <string.h>
 #include "../shadow_dat.h"
 
-#define STAMP "sv14" /* build stamp, printed in every log line: an old build of
+#define STAMP "sv15" /* build stamp, printed in every log line: an old build of
                      * this DLL sitting next to a new .dat is the most common
                      * confusion, so the line says which build made it, and the
                      * mode line below names which of the seven rungs ran. sv11
@@ -449,6 +500,13 @@ static int g_verbose;                 /* sv13: the diagnostic level is on. Set b
                                          run (no file at all) keeps it off */
 static int g_allow_write;             /* only mode f lets fixup_chunk write    */
 static int g_diagnostic;              /* installed nothing on purpose: Load returns 4 */
+static int g_time_speed;              /* sv15: the mode file's digits, to 99, */
+                                      /* 0 means the file had none. Read with */
+                                      /* the mode letter, used by the arc's own */
+                                      /* per-chunk hook, and 1 means the */
+                                      /* server's own speed, nothing written. */
+static float g_time_wrote;            /* the scale this DLL last wrote, 0 none */
+static int g_time_said;               /* its applied line prints once          */
 
 static DWORD WINAPI InitWorker(LPVOID p);
 static int Install(void);
@@ -564,13 +622,29 @@ static void TrimLogFile(void)
  * all, and the file is what a debug session adds. A rung other than f implies
  * verbose -- those rungs exist to be read against the client, so walking the
  * README ladder does not have to remember the v, and every ladder log keeps
- * saying the same thing an sv10..sv12 ladder log said. */
+ * saying the same thing an sv10..sv12 ladder log said. sv15 adds a third thing
+ * the same file can say: digits up to 99 anywhere in it multiply the game clock's
+ * speed, so "f v 4" is the full run, verbose, with the day running four times as
+ * fast -- which is how one arc is watched cross the sky without waiting for the
+ * hour. A run of digits is ONE number and two of them are allowed, so "45" is
+ *  forty-five times and not four then five: at the client's own 1/60 game
+ * minutes per real second a plain 9 leaves a whole day at 160 real minutes,
+ * which is still slow to watch, while 45 puts a day at 32 real minutes and one
+ * hour of sky at 80 seconds. A run after a gap replaces the run before it, so "2 7" means
+ * 7. 99 is the top: past that the day runs in under 15 real minutes and the
+ * client's own per-minute work starts dropping minutes. A 1 is the server's
+ * own speed, and no digit at all leaves the clock untouched, so shipping and
+ * every older mode file keep meaning the same thing. */
 static char ReadModeFile(void)
 {
     char path[MAX_PATH];
     FILE *f;
     int c;
     char m;
+    int gap = 1;              /* a space, tab or newline closes the run of digits
+                                * the reader is in, so "4 5" is two runs */
+    int run = 0;              /* digits counted in the current run */
+    int d;
 
     snprintf(path, sizeof path, "%s\\shadow-mod.mode", g_dir);
     f = fopen(path, "r");
@@ -578,12 +652,40 @@ static char ReadModeFile(void)
         return 'f';
     m = 0;
     while ((c = fgetc(f)) != EOF) {
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            /* a gap closes the digit run it was in, so "4 5" is two runs and
+             * the last one is what the clock gets */
+            gap = 1;
             continue;
+        }
         if (c >= 'A' && c <= 'Z')
             c += 32;
         if (c == 'v') {
             g_verbose = 1;
+            gap = 1;
+            continue;
+        }
+        if (c >= '0' && c <= '9') {
+            /* a run of digits is ONE number, two digits deep: "45" is 45 times,
+             * not four then forty-five or four then five. A run that starts
+             * after a gap replaces the run before it, so a file that says 2
+             * then 7 is a session that changed its mind, and the clock is a
+             * test control, not something a rung letter competes about. 99 is
+             * the top: the day then runs in 15 real minutes and the client's
+             * own per-minute work starts skipping minutes. */
+            d = c - '0';
+            if (gap) {
+                g_time_speed = d;
+                run = 1;
+            } else if (run == 1) {
+                /* the second digit joins the run: 4 then 5 is forty-five, and
+                 * 0 then 5 is five */
+                g_time_speed = g_time_speed * 10 + d;
+                ++run;
+            }
+            /* a third digit in the same run is past 99 and stays out of the
+             * clock */
+            gap = 0;
             continue;
         }
         if (c == 'n' || c == 'a' || c == 'b' || c == 'c' || c == 'd'
@@ -885,6 +987,26 @@ static void InstallHandler(void)
                                    /* LightParams records are keyed by        */
 #define SUN_EVAL_ADDR  0x6cf6c0u   /* named only in a log line               */
 
+/* sv15's test hook: the game clock object and the one float that is the day's
+ * speed. benilla-re systems/gametime.md#clock-state: the clock is one object at
+ * 0xce8538, 0x70 bytes, and +0x2c is its scale in game minutes per real second,
+ * initialised to 1/60. 0x643a70's day phase is (tick - [+0x38]) * 0.001f *
+ * [+0x2c] + [+0x3c] times 1/1440, so the real seconds since the last minute are
+ * scaled by it, and 0x6435a0's per-frame advance adds dt * [+0x2c] to the
+ * minute accumulator, so that one float is the speed of everything the clock
+ * drives: the time of day the sun's phase comes from, the minute and hour
+ * Script::GetGameTime returns, and the day count. 0x643820 stores what the
+ * server sent clamped to [1/60, 60] -- it is reached from the opcode 0x47
+ * handler 0x6c5de0 and from the 0x42 handler 0x6c5e80, the packet that also
+ * carries the time -- so the server re-sends it through the whole session and
+ * the same clamp is applied here. */
+#define GT_CLOCK_STATE 0xce8538u  /* the client's game clock object           */
+#define GT_SCALE_OFF   0x2cu       /* +0x2c: game minutes per real second     */
+#define GT_SCALE_LO    (1.0f / 60.0f) /* 0x3c888889, 0x643820's low bound      */
+#define GT_SCALE_HI    60.0f            /* 0x42700000, its high bound          */
+#define GT_SCALE_ADDR  (GT_CLOCK_STATE + GT_SCALE_OFF) /* 0xce8564, the float  */
+#define GT_CLOCK_TXT   "0xce8538"      /* the same object, spelled in a line   */
+
 /* the four tracks, and their stock keys in degrees. The counts are the
  * evaluator's own: 4 / 4 for the lighting sun, 3 / 5 for the disc. */
 static const unsigned int sun_addr[4] = { 0xce8d90u, 0xce8db0u, 0xce8d4cu, 0xce8d64u };
@@ -899,16 +1021,52 @@ static const float sun_stock_t[4][5] = {
     { 0.0f, 0.25f, 0.5f, 0.75f },
     { 0.0f, 0.25f, 0.5f, 0.75f },
     { 0.2291667f, 0.5f, 0.8958333f },
-    { 0.2291667f, 0.5f, 0.5f, 0.5f, 0.8958333f }
+    { 0.2291667f, 0.4965278f, 0.5f, 0.5034722f, 0.8958333f }
+    /* sv15: the sun disc's polar keys are 11:55, 12:00 and 12:05, not three
+     * keys at noon. celestial.md says the day-night file builds these from the
+     * constants at 0x811510 with 0.0034722 (five minutes) added and subtracted,
+     * and the pin below compares the live client tracks against this table to
+     * 0.0001 -- a table whose noon keys are all 0.5 calls the client's own
+     * tracks neither-stock and not-unbuilt, which refuses the pin and leaves
+     * the sun alone. sv14 had all three at 0.5, so its arc never got written
+     * on a client that had already built its day-night file. */
 };
 
 /* A sun preset: the key times and values for one shape, and the window of the
  * day it answers for, in half-minutes. Times are the fraction of the cycle the
  * clock's phase means; angles are degrees, which SunPut turns into the
- * radians the client's floats hold. Every arc rises and sets with its
- * polar angle ending just below the horizon (100 deg, the stock's own end
- * value) and passing the zenith side of the sky, and every light track is the
- * disc's antipode, so the four tracks of one preset are one sun. */
+ * radians the client's floats hold. Two rules, both read off the stock tables
+ * (benilla-re systems/lighting/celestial.md#static-tracks), and both of them
+ * wrong in sv14's tables, which is what an in-game visit showed:
+ *
+ * the polar angle is measured FROM THE ZENITH, so a body's height over the
+ * horizon is 90 - polar. The sun disc's stock polar is 5 deg at noon (85 deg
+ * UP) and 100 deg at 05:30 and 21:30 (10 deg UNDER the horizon), so stock has
+ * no sun disc after 20:30 and its sunset sits on the horizon there -- the
+ * brighter horizon at 21:00 the player sees with no DLL is that. The lighting
+ * sun's polar is the same angle of the direction light TRAVELS, so stock keeps
+ * it between 110 and 127 deg, always past 90: the light direction always
+ * points DOWN, and its source sits at the antipode, pol - 90 deg above the
+ * horizon, 20 to 37 deg up all day. sv14 put pol_l as low as 80 deg, under
+ * 90, which points the light direction UP: the diffuse and specular terms
+ * then invert, the ground reads mirrored and over-bright and the shading
+ * seems to come from the far side of the sun -- the exact symptom a morning
+ * visit showed. sv15 keeps the polar keys as stock's own, unchanged, so the
+ * day's height, its rise at 06:11, its set at 20:30 and its strength match
+ * stock hour for hour, and only the azimuth moves.
+ *
+ * and the azimuth keeps stock's own relation between the two tracks: the light
+ * azimuth is the disc azimuth plus 180, so the shading comes from where the
+ * disc is. Stock has 45 deg on the disc and 225 on the light, and both read on
+ * the map as NORTH WEST -- the fixed point every arc is pinned to.
+ *
+ * One arc, not four. Azimuth runs 0 = W, 90 = N, 180 = E, 270 = S, clockwise,
+ * so a sun that rises in the south west is at 315 deg and the same sun setting
+ * in the north west is at 405 deg, one quarter turn later, and it passes due
+ * west at noon -- which is what stock's own hours and heights give once the
+ * azimuth is free to move at all. Four windows holding four different arcs
+ * were never one sun crossing one sky, and the visits showed it: the disc, the
+ * ground and the objects disagreed about where the light was. */
 static const struct SunPreset {
     const char name[16];
     unsigned short h0, h1;                 /* the clock's window             */
@@ -917,44 +1075,23 @@ static const struct SunPreset {
     float t_az_l[4], t_pol_l[4];           /* their key times                */
     float t_az_d[3], t_pol_d[5];
 } sun_presets[] = {
-    { "arc-high",       0, 600,
-      { 495.0f, 585.0f, 675.0f, 675.0f }, {  80.0f, 150.0f, 175.0f,  80.0f },
-      { 315.0f, 405.0f, 495.0f },         { 100.0f,  30.0f,   5.0f,  30.0f, 100.0f },
-      { 0.2291667f, 0.5f, 0.8958333f, 0.8958333f },
+    { "arc-swnw",    0, 2400,
+      { 495.0f, 517.5f, 540.0f, 585.0f }, { 127.0f, 110.0f, 127.0f, 110.0f },
+      { 315.0f, 360.0f, 405.0f },         { 100.0f,   5.0f,   5.0f,   5.0f, 100.0f },
       { 0.2291667f, 0.3645833f, 0.5f, 0.8958333f },
+      { 0.0f, 0.25f, 0.5f, 0.75f },
       { 0.2291667f, 0.5f, 0.8958333f },
-      { 0.2291667f, 0.3645833f, 0.5f, 0.6354167f, 0.8958333f } },
-    { "arc-long",     600, 1200,
-      { 450.0f, 585.0f, 720.0f, 720.0f }, {  80.0f, 150.0f, 175.0f,  80.0f },
-      { 270.0f, 405.0f, 540.0f },         { 100.0f,  30.0f,   5.0f,  30.0f, 100.0f },
-      { 0.125f, 0.5f, 0.9583333f, 0.9583333f },
-      { 0.125f, 0.3125f, 0.5f, 0.9583333f },
-      { 0.125f, 0.5f, 0.9583333f },
-      { 0.125f, 0.3125f, 0.5f, 0.6875f, 0.9583333f } },
-    { "arc-low",     1200, 1800,
-      { 405.0f, 495.0f, 585.0f, 585.0f }, {  80.0f, 120.0f, 145.0f,  80.0f },
-      { 225.0f, 315.0f, 405.0f },         { 100.0f,  60.0f,  35.0f,  60.0f, 100.0f },
-      { 0.3333333f, 0.5f, 0.6666667f, 0.6666667f },
-      { 0.3333333f, 0.4166667f, 0.5f, 0.6666667f },
-      { 0.3333333f, 0.5f, 0.6666667f },
-      { 0.3333333f, 0.4166667f, 0.5f, 0.5833333f, 0.6666667f } },
-    { "arc-west",    1800, 2400,
-      { 360.0f, 450.0f, 540.0f, 540.0f }, {  80.0f, 140.0f, 170.0f,  80.0f },
-      { 180.0f, 270.0f, 360.0f },         { 100.0f,  40.0f,  10.0f,  40.0f, 100.0f },
-      { 0.25f, 0.5f, 0.75f, 0.75f },
-      { 0.25f, 0.375f, 0.5f, 0.75f },
-      { 0.25f, 0.5f, 0.75f },
-      { 0.25f, 0.375f, 0.5f, 0.625f, 0.75f } },
+      { 0.2291667f, 0.4965278f, 0.5f, 0.5034722f, 0.8958333f } },
     { "arc-stock",   2400, SUN_HMIN_DAY,
       { 225.0f, 225.0f, 225.0f, 225.0f }, { 127.0f, 110.0f, 127.0f, 110.0f },
       {  45.0f,  45.0f,  45.0f },         { 100.0f,   5.0f,   5.0f,   5.0f, 100.0f },
       { 0.0f, 0.25f, 0.5f, 0.75f },
       { 0.0f, 0.25f, 0.5f, 0.75f },
       { 0.2291667f, 0.5f, 0.8958333f },
-      { 0.2291667f, 0.5f, 0.5f, 0.5f, 0.8958333f } }
+      { 0.2291667f, 0.4965278f, 0.5f, 0.5034722f, 0.8958333f } }
 };
 #define SUN_PRESETS ((unsigned)(sizeof sun_presets / sizeof sun_presets[0]))
-#define SUN_STOCK_PRESET (SUN_PRESETS - 1u) /* the last one writes nothing  */
+#define SUN_STOCK_PRESET (SUN_PRESETS - 1u) /* sv15: writes the stock keys back */
 
 /* pi/180 and 180/pi as the float the client's own constants round to. The DLL
  * carries no math library (it links kernel32 and ntdll only), and the sun's
@@ -977,7 +1114,7 @@ static int g_sun_said_back;
  * clock of its own: this is the float the client stamps every rendered world
  * frame at 0xce9b64, the same one the light table build at 0x6d2210 reads
  * while turning it into half-minutes. An all-zero block reads 0, which is
- * midnight and arc-high's window, so the first chunk visit already writes an
+ * midnight and the arc's window, so the first chunk visit already writes an
  * arc and every visit after it reads the clock again: a 0 float is read the
  * same as midnight, so the difference between "not stamped yet" and "midnight"
  * is not visible here and does not need to be -- the keys are written either
@@ -1152,8 +1289,9 @@ static void SunReadChoice(void)
 static void SunKeepArc(void)
 {
     unsigned hmin, clock = 0, which;
-    char msg[1024]; /* the applied line names the clock, the preset and the arc's
-                      * own numbers, and runs past 600 bytes */
+    char msg[1280]; /* the applied line names the clock, the preset and the arc's
+                      * own numbers, and sv15's stock-window line also explains
+                      * why the keys get written back: both run past 1024 */
 
     if (g_sun_off) {
         if (!g_sun_said_off) {
@@ -1181,13 +1319,25 @@ static void SunKeepArc(void)
             g_sun_said_stock = 1;
             snprintf(msg, sizeof msg,
                      STAMP " sun: the client's clock at 0x%x+%x reads %02u:%02u (the float is 0.%04u,"
-                            " half-minute %u of %u), which is %s's window: that preset is the stock sun, so"
-                            " nothing is written and the world keeps its stock sun. enter at another hour"
-                            " and the same line names the arc that gets written",
+                            " half-minute %u of %u), which is %s's window: the stock sun keys are WRITTEN"
+                            " back into the client's own tables at 0x%x and 0x%x, so an arc another"
+                            " continent or an earlier hour left cannot survive here. sv14 wrote nothing"
+                            " in this window and that was wrong twice over: the four tracks are one"
+                            " global block and the day-night file builds them once behind the guard bits"
+                            " at 0x6d3a10 and 0x6d3b80, so the last arc written keeps living in every"
+                            " hour that does not overwrite it -- and outside a preset's own key span"
+                            " 0x6cf6c0 takes the leg from its last key back to its first and interpolates"
+                            " ALONG it, so hours the preset never covered get an extrapolated sun whose"
+                            " light polar can come back above 90 deg, a light direction pointing above"
+                            " the horizon, which zeroes the diffuse term of every up-facing normal and"
+                            " reads as mirrored, reflected ground. the world keeps its stock sun here,"
+                            " and enter at another hour and the next line names the arc that gets written",
                      SUN_TOD_STATE, SUN_TOD_OFF, hmin / 120u, (hmin % 120u) / 2u, clock, hmin, SUN_HMIN_DAY,
-                     sun_presets[which].name);
+                     sun_presets[which].name, sun_addr[0], sun_addr[2]);
             LogMsg(msg);
         }
+        SunWrite(which);
+        g_sun_applied = (int)which;
         return;
     }
     if ((int)which == g_sun_applied) {
@@ -1196,7 +1346,10 @@ static void SunKeepArc(void)
         /* the tracks are back to the stock keys under a preset that is not
          * stock: the day-night file built its tracks after install. One line,
          * then the keys are put back, and the arc carries on. */
-        if (!g_sun_said_back) {
+        if (!g_sun_said_back && which != SUN_STOCK_PRESET) {
+            /* sv15 wrote the stock keys itself in the stock window, so the
+             * stock keys under the stock preset are expected and say nothing:
+             * only an arc whose own keys went back to stock is a rebuild. */
             g_sun_said_back = 1;
             snprintf(msg, sizeof msg,
                      STAMP " sun: the key tables at 0x%x and 0x%x hold the stock keys again"
@@ -1220,8 +1373,10 @@ static void SunKeepArc(void)
                         " 0x%x (disc polar): the disc's azimuth runs from %u deg to %u deg,"
                         " %u deg over the day, and its polar angle goes from %u deg through"
                         " %u deg back to %u deg, so the sun crosses the horizon at both ends"
-                        " instead of rocking on one bearing; the light tracks are the disc's"
-                        " antipode, so the shading follows the sun you can see, and 0x%x"
+                        " instead of rocking on one bearing; the light azimuth is the disc azimuth plus"
+                        " 180, so the shading comes from the bearing the disc is in and the two never"
+                        " disagree about it, while both tracks keep stock's own polar angles, which is"
+                        " what keeps the light between +20 and +37 deg above the horizon all day; 0x%x"
                         " interpolates it every frame. re-asserted at every chunk visit",
                  SUN_TOD_STATE, SUN_TOD_OFF, hmin / 120u, (hmin % 120u) / 2u, clock, hmin, SUN_HMIN_DAY,
                  sun_presets[which].name, sun_addr[0], sun_addr[2], sun_addr[3],
@@ -1230,6 +1385,57 @@ static void SunKeepArc(void)
                  (unsigned)(sun_presets[which].az_d[2] - sun_presets[which].az_d[0]),
                  (unsigned)sun_presets[which].pol_d[0], (unsigned)sun_presets[which].pol_d[2],
                  (unsigned)sun_presets[which].pol_d[4], SUN_EVAL_ADDR);
+        LogMsg(msg);
+    }
+}
+
+/* sv15's test hook, next to the arc: the day runs faster, so an arc can be
+ * watched cross the sky in one visit instead of one hour per sky. Nothing here
+ * makes a clock: this is the client's own scale float at 0xce8564, multiplied.
+ * The scale is only re-written when the float is NOT already what this DLL
+ * wrote, so the server's time messages -- whose opcode 0x47 and 0x42 handlers
+ * both end in 0x643820 -- are picked up and multiplied again rather than
+ * compounded: the base is always whatever the client last had, never our own
+ * output. The result keeps 0x643820's own clamp, since a direct store would
+ * otherwise leave the client able to hold a scale it can never ask for. */
+static void TimeSpeedKeep(void)
+{
+    float *sc;
+    float cur, want;
+    char msg[768]; /* the line names both scales, the day's real length and the
+                     * hour's, and runs past 700 bytes: a 384 buffer cut its tail
+                     * off in the log, which is what made the line unreadable */
+
+    if (g_time_speed <= 1)
+        return;
+    sc = (float *)(size_t)(GT_CLOCK_STATE + GT_SCALE_OFF);
+    cur = *sc;
+    if (g_time_wrote != 0.0f && cur == g_time_wrote)
+        return; /* still ours: the day is already running at this speed */
+    want = cur * (float)g_time_speed;
+    if (!(want >= GT_SCALE_LO))
+        want = GT_SCALE_LO; /* also a NaN's scale: the client's own low bound */
+    if (want > GT_SCALE_HI)
+        want = GT_SCALE_HI;
+    *sc = want;
+    g_time_wrote = want;
+    if (!g_time_said) {
+        g_time_said = 1;
+        snprintf(msg, sizeof msg,
+                 STAMP " clock: shadow-mod.mode had %u, so the game clock object's scale at 0x%x, the"
+                        " game clock at 0xce8538's +0x2c, went"
+                        " from %u to %u milli-game-minutes per real second, the float 0x643a70 multiplies"
+                        " the real seconds since the last minute by to get the day phase and 0x6435a0"
+                        " adds dt times to the minute accumulator. a whole game day is %u real minutes"
+                        " at the new scale and one hour of sky turns in %u real seconds: the sun's phase,"
+                        " clock Script::GetGameTime returns and the day count all move together. the"
+                        " server re-sends this scale in its time messages -- the 0x47 handler 0x6c5de0"
+                        " and the 0x42 handler 0x6c5e80 end in 0x643820, which clamps to [1/60, 60] --"
+                        " so it is re-asserted at every chunk visit",
+                 (unsigned)g_time_speed, (unsigned)(GT_CLOCK_STATE + GT_SCALE_OFF),
+                 (unsigned)(cur * 1000.0f + 0.5f), (unsigned)(want * 1000.0f + 0.5f),
+                 (unsigned)(1440.0f / want / 60.0f + 0.5f),
+                 (unsigned)(60.0f / want + 0.5f));
         LogMsg(msg);
     }
 }
@@ -1300,6 +1506,11 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
      * client's day-night state, a window compare, and a dozen float writes when
      * the preset changed or the keys were lost. */
     SunKeepArc();
+
+    /* sv15's clock hook, right next to the arc and with exactly the same reach:
+     * it is the arc that needs watching cross the sky, and the rungs that never
+     * got the arc never get the speed-up either. */
+    TimeSpeedKeep();
 
     /* the very first chunk to reach Load is audited whole, before the map
      * check and before anything could be written: the crash reports say the
@@ -1918,7 +2129,8 @@ static int Install(void)
              " arena, no hook, b = hook plus an empty call, c = the detour alone"
              " with no call at all, d = the same call from the client's own frame"
              " at 0x6AF5F3, h = hook plus audit, no payload, f = full; a v"
-             " anywhere in the file also turns the diagnostic lines on",
+             " anywhere in the file also turns the diagnostic lines on, and digits up to 99 anywhere in it"
+             " runs the game clock that many times as fast",
              g_mode, g_dir);
     LogVerb(msg);
 
@@ -1936,6 +2148,29 @@ static int Install(void)
                 " 0xce8d90, 0xce8db0, 0xce8d4c and 0xce8d64 stay as the day-night file built them."
                 " mode h needs no .dat and prints the clock, the preset and the arc it wrote, so"
                 " h is the rung to test the sun on; f carries the arc too");
+
+    /* sv15's clock digit: the mode file's third thing, read with the mode above
+     * it so a rung that cannot carry the arc cannot carry the speed-up either.
+     * The mode file's number multiplies the SERVER's scale, which is what the
+     * client last had,
+     * so a server that already sped the day up is sped up from there again. */
+    if (g_time_speed > 1) {
+        snprintf(msg, sizeof msg,
+                 STAMP " clock: shadow-mod.mode had %u, so the game clock's scale at 0x%x, the game clock"
+                        " at " GT_CLOCK_TXT "'s +0x%x, is multiplied by %u at every chunk visit -- h and f"
+                        " only. the day, the sun's phase and the clock the UI shows all run %u times as"
+                        " fast, and the server's own scale is what gets multiplied, so this is a test"
+                        " control, not a shipping one",
+                 (unsigned)g_time_speed, (unsigned)GT_SCALE_ADDR, GT_SCALE_OFF,
+                 (unsigned)g_time_speed, (unsigned)g_time_speed);
+        LogVerb(msg);
+    } else if (g_time_speed == 1) {
+        snprintf(msg, sizeof msg,
+                 STAMP " clock: shadow-mod.mode had 1, so the game clock's scale at 0x%x, the game clock"
+                        " at " GT_CLOCK_TXT "'s +0x%x, is left exactly as the server sent it",
+                 (unsigned)GT_SCALE_ADDR, GT_SCALE_OFF);
+        LogVerb(msg);
+    }
 
     if (g_mode == 'n') {
         /* the inert rung: the .dat is not opened, nothing is allocated, the

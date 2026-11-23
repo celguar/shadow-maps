@@ -1,15 +1,14 @@
-# sv14: the sun travels an arc, and the game's own clock picks it
+# sv15: the sun travels one arc, the game's own clock picks where it applies
 
 Same shadow pipeline as sv13 — the hook, the stubs, the arena, the writes and
-the `.dat` are sv13's byte for byte — plus one new thing: the DLL writes the
-client's own sun key tables, so the sun the client evaluates (the direction
-terrain and objects are shaded from, and the sun disc drawn in the sky) travels
-a real arc instead of the stock one, and **which arc gets written is the
-client's in-game time of day**.
+the `.dat` are sv13's byte for byte — plus sv14's sun writes and one new thing
+of sv15's: a number in the mode file runs the client's own game clock faster,
+so one session can watch the arc cross the sky.
 
 Nothing else in the pipeline changed: no new hook, no new file format, no new
 export, and `verify_dll.py` still reports the same hook, the same three detour
-tables and `Load` at RVA 0x2720.
+tables and `Load` at RVA 0x2830 — that RVA moved from sv14's 0x2720 because the
+module grew, not because the contract did.
 
 ## How it is driven
 
@@ -26,24 +25,24 @@ The DLL never makes a clock of its own. It reads the client's:
 * the read happens at the per-chunk fixup, the one place this DLL already runs
   on every loaded chunk, so the choice is made where the world frames have
   already started stamping the block. A block that was never stamped reads 0,
-  which is midnight, which is `arc-high`'s window — an arc is written from the
-  first chunk visit, and the visit whose clock had not arrived yet is corrected
+  which is midnight, which is the arc's window — the arc is written from the
+  first chunk visit, and a visit whose clock had not arrived yet is corrected
   by the next one.
 
-So, in game: **the hour you entered the world at names the arc.** The preset is
+So, in game: **the hour you entered the world at names the sky.** The preset is
 written at the first chunk visit and re-asserted at every visit after, and a
 chunk visit that finds the clock in another window applies that window's preset,
 once per preset in the log.
 
-The only override is a sidecar file, `shadow-mod.sun`, next to the mode file
+The only sun override is a sidecar file, `shadow-mod.sun`, next to the mode file
 (next to `ShadowMaps.dll`, not next to the sources):
 
 | `shadow-mod.sun` says | effect |
 |---|---|
 | (absent) | the clock decides — the concept, and what you should test first |
 | `clock` | same, written out |
-| `off` or `stock` | leave the stock key tables alone, no arc |
-| `arc-high` `arc-long` `arc-low` `arc-west` `arc-stock` | force that preset every visit, whatever the clock says — how one arc is watched without waiting for the hour |
+| `off` or `stock` | leave the client's own key tables alone, no arc, no write-back |
+| `arc-swnw` `arc-stock` | force that preset every visit, whatever the clock says — how one sky is watched without waiting for the hour |
 
 A word that is neither is logged and the clock decides.
 
@@ -51,14 +50,15 @@ A word that is neither is logged and the clock decides.
 
 The client evaluates four static key tracks through one evaluator, `0x6cf6c0`
 (keys, count, phase), and derives the sun's position as
-`(cos a sin p, sin a sin p, cos p)` of the same phase:
+`(cos a sin p, sin a sin p, cos p)` of the same phase. Stock's own keys, times
+and values, from `0xce8d90` in the order the pin reads them:
 
 | track | address | keys | stock keys, in degrees |
 |---|---|---|---|
 | light azimuth | `0xce8d90` | 4 | 00:00 06:00 12:00 18:00 — all 225° |
-| light polar | `0xce8db0` | 4 | 127 110 127 110 |
+| light polar | `0xce8db0` | 4 | 00:00 127°, 06:00 110°, 12:00 127°, 18:00 110° |
 | disc azimuth | `0xce8d4c` | 3 | 05:30 12:00 21:30 — all 45° |
-| disc polar | `0xce8d64` | 5 | 100 5 5 5 100 |
+| disc polar | `0xce8d64` | 5 | 05:30 100°, 11:55 5°, 12:00 5°, 12:05 5°, 21:30 100° |
 
 The stock disc goes 100° polar at 05:30 to 5° at noon and back to 100° at 21:30
 with its azimuth pinned at 45° on all three keys: a vertical wheel that rises
@@ -70,60 +70,84 @@ with the evidence, and it is also why `MCCF`'s own `+0x2c` light is
 initialized from these same tracks); the stock data simply has nothing to drive
 it.
 
-## What sv14 writes instead
+Read the two pairs as the client does, which is what makes an evening look the
+way stock does:
+
+* the **disc** polar is measured from the sky's top, so 5° is near zenith and
+  100° is under the horizon: stock's disc is at +39° elevation at 08:50, +85° at
+  noon, +0° at 20:31 and −10° at 21:50. Stock's sun is already below the horizon
+  through the evening, and its disc's own size track `0xce8cac` (`06:00 2,
+  06:45 1, 20:15 1, 21:00 2`) is why a night sun draws big when it draws at all.
+* the **light** polar is read as `90° + elevation`, because that vector is the
+  direction light *travels*: 110° is 20° above the horizon and 127° is 37° above
+  it, so stock's light never once comes from below the horizon or from more than
+  37° up. A polar of 80° is not "10° lower than a polar of 90°" — it is a light
+  direction 10° above the horizon, which puts the diffuse term at zero for every
+  up-facing normal and reads as mirrored, over-bright ground. That is the one
+  thing the arc must not touch.
+* the light **azimuth** is the travel direction, so the source bearing is that
+  azimuth plus 180°: stock's 225° is light travelling south-east, light coming
+  from north-west — the same side as its 45° disc. Compass words are map words
+  here: down is south, left is west.
+
+## What the arc writes instead
 
 Every preset keeps the stock key counts, 4 / 4 / 3 / 5, because the count is the
 `edx` to the evaluator and the blocks are adjacent — `0xce8d90 + 0x20` is
 `0xce8db0`, `0xce8d4c + 0x18` is `0xce8d64`, and the key times live right after
 the values at `kv + n` — so a preset that added a key would write over its
-neighbour. Times and values change, shape does not. Two rules, both read off the
-evaluator:
+neighbour. Times and values change, shape does not.
 
-* the azimuth runs monotonically through the wrap and completes exactly 360°
-  over the cycle. `0x6cf6c0` lerps in **value** space and its cyclic search
-  wraps in **time**, so a value that wraps back is a backwards sweep and a value
-  that leaves a gap is a jump at midnight. Monotonic through the wrap is what
-  makes the interpolation one continuous forward rotation. This is why the
-  azimuths below are left unwrapped (495°, not 135°): wrapping is what reverses
-  the sweep, and the client's sin/cos read either spelling the same.
-* the light azimuth is the disc azimuth plus 180°, and the light polar is the
-  disc polar subtracted from 180°, at the same key times. So the direction the
-  shading comes from and the sun you can see are one sun all day. (The stock
-  pair is not antipodal — 225° against 45° in azimuth but 127°/110° against
-  100°/5°/5°/5°/100° in polar. Being antipodal is the deliberate change.)
+sv14 got three things wrong, and an in-game visit showed each of them. What
+sv15 writes is what that visit taught:
 
-The clock windows are five 600-half-minute (five-hour) windows:
+* **the stock disc polar keys are at 11:55, 12:00 and 12:05, not three keys at
+  noon.** `celestial.md:41` and the builders at `0x811510` say the day-night
+  file makes that pair by adding and subtracting 0.0034722 — five minutes. sv14
+  pinned against a table whose noon times were all 0.5, so on a client that had
+  already built its day-night file its own tracks matched neither the stock
+  table nor the all-zero block: the pin refused and the arc was never written.
+  sv15's stock table, and its presets, carry 11:55 and 12:05.
+* **one arc, not five.** A sun crossing one sky cannot be at a different bearing
+  in one window of the clock than in another, and the four tracks are one global
+  block that the day-night file builds once behind the guard bits at `0x6d3a10`
+  and `0x6d3b80`. sv14's five windows gave five different arcs that all kept
+  living in every hour that did not overwrite them.
+* **the evening writes the stock keys back, it does not write nothing.** Not
+  writing is what let a morning arc survive into the evening.
+
+The polar angles stay stock's, and the light azimuth stays the disc azimuth
+plus 180°, at the disc's own key times. Those two rules are the whole point of
+the arc: the bearing the ground and water are shaded from always agrees with the
+bearing of the sun you can see — never 180° off it, never pointing up.
+
+The clock windows are two, not five:
 
 | preset | clock window | disc azimuth → light azimuth | disc polar → light polar |
 |---|---|---|---|
-| `arc-high` | 00:00–05:00 | 315 405 495 @ 05:30 12:00 21:30 → 495 585 675 675 | 100 30 5 30 100 @ 05:30 08:45 12:00 15:15 21:30 → 80 150 175 80 |
-| `arc-long` | 05:00–10:00 | 270 405 540 @ 03:00 12:00 23:00 → 450 585 720 720 | 100 30 5 30 100 @ 03:00 07:30 12:00 16:30 23:00 → 80 150 175 80 |
-| `arc-low` | 10:00–15:00 | 225 315 405 @ 08:00 12:00 16:00 → 405 495 585 585 | 100 60 35 60 100 @ 08:00 10:00 12:00 14:00 16:00 → 80 120 145 80 |
-| `arc-west` | 15:00–20:00 | 180 270 360 @ 06:00 12:00 18:00 → 360 450 540 540 | 100 40 10 40 100 @ 06:00 09:00 12:00 15:00 18:00 → 80 140 170 80 |
-| `arc-stock` | 20:00–24:00 | the stock tables above — **nothing is written** | |
+| `arc-swnw` | 00:00–20:00 | 315 360 405 @ 05:30 12:00 21:30 → 495 517.5 540 585 @ 05:30 08:48 12:00 21:30 | stock's own: 100 5 5 5 100 @ 05:30 11:55 12:00 12:05 21:30 → 127 110 127 110 @ 00:00 06:00 12:00 18:00 |
+| `arc-stock` | 20:00–24:00 | stock's own tables, written back — 45° on all three keys → 225° on all four | stock's own, as above |
 
 Bearing convention: azimuth is clockwise from +X to +Y, 0° = west, 90° = north,
 180° = east, 270° = south, and the light-travel azimuth is the antipode of the
 sun's bearing. Polar is from the sky's top, so 100° is under the horizon.
 
-What each arc looks like in game. The bearings are mod 360 of the preset's own
-keys and the direction names follow the same eight points as the convention
-above — west, northwest, north, northeast, east, southeast, south, southwest —
-and the horizon crossing is where the polar angle passes 90°, interpolated the
-way the client interpolates it, which is why a crossing sits a little past a
-key that is exactly on a cardinal point (`arc-west`'s keys are 180° and 360°,
-its crossings read 188° and 353°):
+What `arc-swnw` looks like in game, off the evaluator — azimuths and elevations
+from the same interpolation the client does, and the crossings are where the
+disc polar passes 90°:
 
-| preset | rise | noon | set |
-|---|---|---|---|
-| `arc-high` | ~05:58, azimuth 321°, southwest of west | azimuth 405° → 45°, northwest, polar 5°, nearly overhead | ~20:36, azimuth 487° → 127°, northeast of north |
-| `arc-long` | ~03:38, azimuth 280°, just west of south | azimuth 405° → 45°, northwest, polar 5° | ~22:04, azimuth 529° → 169°, east — an eighteen-and-a-half-hour day |
-| `arc-low` | ~08:30, azimuth 236°, southeast of south | azimuth 315°, southwest, polar 35°, a short low day | ~15:30, azimuth 394° → 34°, north-northwest |
-| `arc-west` | ~06:30, azimuth 188°, east | azimuth 270°, due south, polar 10° | ~17:30, azimuth 353°, west — the textbook arc |
+| clock | stock | `arc-swnw` |
+|---|---|---|
+| horizon crossings | 06:10 rises, 20:31 sets | 06:10 rises, 20:31 sets — same, because the polar is stock's |
+| Kalimdor 08:50 | disc az 45° north west, elev +39° | disc az 338°, elev +39° |
+| Kalimdor noon | disc az 45° north west, elev +85° | disc az 360°, elev +85° |
+| EK 20:30 | disc az 45° north west, elev +0° | disc az 400°, elev +0° |
+| EK 21:50 | disc az 45° north west, elev −10° | *(not this preset: 21:50 is `arc-stock`, which is stock)* |
 
-`arc-west` is the one to look at first: it is the cleanest arc — rises due east,
-due south and high at noon, sets due west — so if any arc is going to read as
-"the sun moved", this is it.
+So the arc rises south-west of west, passes due west at noon, and comes round
+to north west by dusk — a quarter turn over the day, on stock's own heights —
+and by the time the clock reaches 20:00 its azimuth (404°) is within a degree of
+stock's 405°, which is why `arc-stock` taking over at 20:00 is not a jump.
 
 Before anything is written the four tracks are pinned: each must hold the stock
 keys this build was read from, within the degree a float rounds to, or be an
@@ -143,21 +167,22 @@ python build.py .                  # links out\ShadowMaps.dll
 python verify_dll.py out\ShadowMaps.dll
 ```
 
-The sv14 image is 152,064 bytes.
+The sv15 image is 154,112 bytes.
 
 Ship it as sv13 ships it: `ShadowMaps.dll`, `ShadowMaps.def`, `ShadowMaps.dll.id`
 in `dlls.txt`, and rename the shadow file to `shadowmaps.dat` **next to the
 DLL**.
 
 The mode file decides what runs, and that is how the arc is reached — the first
-letter of `shadow-mod.mode` next to the DLL picks the rung, and a `v` anywhere
-in it turns the diagnostic lines on. A missing file means `f` with quiet
-logging:
+letter of `shadow-mod.mode` next to the DLL picks the rung, a `v` anywhere in it
+turns the diagnostic lines on, and **a number anywhere in it runs the game clock
+that many times as fast**. A missing file means `f` with quiet logging:
 
 | put in `shadow-mod.mode` | what you get |
 |---|---|
 | (no file) | mode `f`, quiet: the arc runs **and** the `.dat` must be there, so a missing `.dat` means `Load` answers 1, the hook is not patched, and VanillaFixes shows its popup — no arc |
 | `h v` | the test rung: hook, the per-chunk audit, **no `.dat` needed**, nothing allocated, no chunk header touched — shadows stay stock and the arc still runs, with the diagnostic lines on |
+| `h 9 v` | the same rung with the day running nine times as fast — an arc crosses the sky in one session |
 | `f v` | the full rung with the diagnostics on: the arc runs and the baked shadows draw |
 | `d v` or `b v` | the silent rungs: the hook is in and the call happens, but the fixup returns before the sun, so **no arc** — their install line says so |
 
@@ -165,67 +190,102 @@ logging:
 install line names which rung you are on. **`h` and `f` are the two rungs that
 carry the arc**, and `h` is the one to test on because it needs no `.dat`.
 
+The number is read as a run of digits: `9` is nine, `45` is forty-five, `2 7` is
+seven because a gap ends a run and the last run wins, and a run is capped at
+99 — 99 is as far as it goes: the client's own setter `0x643820`
+clamps the scale to `[1/60, 60]` game minutes per real second and this DLL keeps
+that clamp too, so a multiplier of 60 or more all land on the same speed — 60
+game minutes per real second, a game day in 24 real seconds. The stock scale is
+1 game minute per real second (`1000` in the milli units the log prints), so 9
+means a game day of 160 real seconds, about 3 real minutes, and an hour of sky
+every 7 real seconds. The multiplier is put on the scale the client
+currently has, which is what the server last sent, so a server that already
+sped the day up is sped up from there again: this is a test control, not a
+shipping one.
+
 Then, in order:
 
 1. Put `h v` in `shadow-mod.mode`, start the game, and look at the log,
    `shadow-mod.log.txt` next to the DLL. The line that matters is the applied
    line, and it says the clock, the preset and the arc's own numbers off the
-   table it just wrote. For a world entered at 10:50 it reads (the clock digits
+   table it just wrote. For a world entered at 08:50 it reads (the clock digits
    vary with the client's own float, the words do not):
 
    ```
-   sv14 sun arc: the client's clock at 0xce9b60+4 reads 10:50 (the float is 0.4514, half-minute 1300 of 2880), so arc-low is the preset written into the client's own key tables at 0xce8d90 (light azimuth and polar), 0xce8d4c (disc azimuth) and 0xce8d64 (disc polar): the disc's azimuth runs from 225 deg to 405 deg, 180 deg over the day, and its polar angle goes from 100 deg through 35 deg back to 100 deg, so the sun crosses the horizon at both ends instead of rocking on one bearing; the light tracks are the disc's antipode, so the shading follows the sun you can see, and 0x6cf6c0 interpolates it every frame. re-asserted at every chunk visit
+   sv15 sun arc: the client's clock at 0xce9b60+4 reads 08:50 (the float is 0.3681, half-minute 1060 of 2880), so arc-swnw is the preset written into the client's own key tables at 0xce8d90 (light azimuth and polar), 0xce8d4c (disc azimuth) and 0xce8d64 (disc polar): the disc's azimuth runs from 315 deg to 405 deg, 90 deg over the day, and its polar angle goes from 100 deg through 5 deg back to 100 deg, so the sun crosses the horizon at both ends instead of rocking on one bearing; the light azimuth is the disc azimuth plus 180, so the shading comes from the bearing the disc is in and the two never disagree about it, while both tracks keep stock's own polar angles, which is what keeps the light between +20 and +37 deg above the horizon all day; 0x6cf6c0 interpolates it every frame. re-asserted at every chunk visit
    ```
 
    One line per preset: the log does not repeat it while the clock stays in the
    same window.
 
-2. Enter at a different hour and check the line's clock and preset move
-   together: 04:00 → `arc-high`, 05:10 → `arc-long`, 10:50 → `arc-low`, 16:50
-   → `arc-west`, 21:50 → `arc-stock`, and 21:50 instead prints
+2. Enter at an evening hour and check the line moves to the write-back instead.
+   At 21:20:
 
    ```
-   sv14 sun: the client's clock at 0xce9b60+4 reads 21:50 (the float is 0.9097, half-minute 2620 of 2880), which is arc-stock's window: that preset is the stock sun, so nothing is written and the world keeps its stock sun. enter at another hour and the same line names the arc that gets written
+   sv15 sun: the client's clock at 0xce9b60+4 reads 21:20 (the float is 0.8889, half-minute 2560 of 2880), which is arc-stock's window: the stock sun keys are WRITTEN back into the client's own tables at 0xce8d90 and 0xce8d4c, so an arc another continent or an earlier hour left cannot survive here. sv14 wrote nothing in this window and that was wrong twice over: the four tracks are one global block and the day-night file builds them once behind the guard bits at 0x6d3a10 and 0x6d3b80, so the last arc written keeps living in every hour that does not overwrite it -- and outside a preset's own key span 0x6cf6c0 takes the leg from its last key back to its first and interpolates ALONG it, so hours the preset never covered get an extrapolated sun whose light polar can come back above 90 deg, a light direction pointing above the horizon, which zeroes the diffuse term of every up-facing normal and reads as mirrored, reflected ground. the world keeps its stock sun here, and enter at another hour and the next line names the arc that gets written
    ```
 
-3. Watch the world, not only the log: the sun disc rises and sets at different
-   compass bearings, its glare sweeps the horizon instead of sliding along one
-   line, and terrain normals light from the direction the disc is actually in —
-   faces that were lit at the stock fixed bearing change through the day, and
-   the disc and the shading agree because the disc azimuth is the light
-   azimuth's antipode.
-4. Force one arc without waiting for the clock: `arc-west` in `shadow-mod.sun`,
-   same folder as the mode file. That is the fastest way to see the cleanest
-   arc, and `off` in that file is the way back to the stock sun — it logs
-   `sv14 sun: shadow-mod.sun said off, so the stock sun key tables are left
-   alone and the world keeps its fixed 45 deg bearing` and touches nothing.
+   An evening that matches stock after that line — sun at or under the horizon,
+   sunset visible, light from the north west — is the write-back working. An
+   evening that is still the morning arc is not.
+
+3. Put a number in the mode file and watch the sky instead of waiting for it:
+   `h 9 v` gives a game day of 160 real seconds — the line prints it as 3 real
+   minutes — and an hour of sky every 7 real seconds, and the clock the UI shows
+   moves with it. The line to look for is
+
+   ```
+   sv15 clock: shadow-mod.mode had 9, so the game clock object's scale at 0xce8564, the game clock at 0xce8538's +0x2c, went from 1000 to 9000 milli-game-minutes per real second, the float 0x643a70 multiplies the real seconds since the last minute by to get the day phase and 0x6435a0 adds dt times to the minute accumulator. a whole game day is 3 real minutes at the new scale and one hour of sky turns in 7 real seconds: the sun's phase, clock Script::GetGameTime returns and the day count all move together. the server re-sends this scale in its time messages -- the 0x47 handler 0x6c5de0 and the 0x42 handler 0x6c5e80 end in 0x643820, which clamps to [1/60, 60] -- so it is re-asserted at every chunk visit
+   ```
+
+   Nothing here makes a clock: `0xce8564` is the scale float inside the client's
+   own game-clock object at `0xce8538` (`benilla-re systems/gametime.md`), and
+   the arc's phase, the day count and the clock the UI shows all read the same
+   accumulator, so the sky and the clock cannot drift apart. The scale is only
+   re-written when the float is not already what this DLL wrote, which is what
+   keeps the server's time messages from compounding.
+
+4. Force one preset without waiting for the clock: `arc-swnw` in `shadow-mod.sun`
+   in the same folder as the mode file, and `off` to leave the client's tables
+   alone.
+
 5. If the day-night file ever rebuilds its tracks after install, the line to
    look for is
 
    ```
-   sv14 sun: the key tables at 0xce8d90 and 0xce8d4c hold the stock keys again under arc-low, so the day-night file built its tracks after install: the keys are written again here, and the next chunk visit keeps them, so a stock sun in game after this line is that rebuild
+   sv15 sun: the key tables at 0xce8d90 and 0xce8d4c hold the stock keys again under arc-swnw, so the day-night file built its tracks after install: the keys are written again here, and the next chunk visit keeps them, so a stock sun in game after this line is that rebuild
    ```
 
-   A stock sun after that line is the rebuild, not the arc failing.
+   A stock sun after that line is the rebuild, not the arc failing. The line
+   never prints under `arc-stock`, which writes the stock keys itself.
 
 What is expected to look wrong, and why it is not this change: the baked `MCSH`
 bearings still come from Salmiak's fixed 45° bake, so a chunk's own baked shadow
 map disagrees with the sun once the sun has moved. That is the data half — the
-same thing every arc row in `docs/sun-lighting-analysis.md` says — and it is not
-in this concept. Leave the shadow payloads stock for the sun test, which is what
-mode `h` gives you without any extra work.
+same thing every arc row in `docs/sun-lighting-analysis.md` says — and re-baking
+is out of scope here. Leave the shadow payloads stock for the sun test, which is
+what mode `h` gives you without any extra work.
 
 ## Not done, deliberately
 
 * No second hook, no per-frame patch site. A per-frame site means pinning a
   second prologue and this branch has not read one; the arc's motion comes from
-  the client's own per-frame evaluation of the keys, so a second hook would buy
-  only the preset switch mid-session — and the preset switch happens on the next
-  chunk visit, which is every chunk the world loads.
-* Five presets, compiled in, one per clock window. No `.sun` payload format yet:
-  the preset shape is what such a payload would carry, and that format belongs in
+  the client's own per-frame evaluation of the keys, and the clock's speed-up
+  comes from the client's own scale float, so a second hook would buy nothing.
+* Two presets, compiled in, and one arc. The five windows sv14 shipped were not
+  one sun crossing one sky; a preset payload format still belongs in
   `shadow_dat.h`, not in the hook.
-* The azimuths are left unwrapped above 360° because that is what keeps the
-  sweep forward. The client's sin/cos do not care; if anything else in the
-  client ever compares these floats with an angle difference, that is a thing to
-  test, not a claim made here.
+* The clock multiplier stays a test control, because it multiplies whatever the
+  client last had, and a server that sends its own time messages sets that base
+  again.
+* The azimuths are left unwrapped above 360° — 495°, not 135° — because `0x6cf6c0`
+  lerps in **value** space and its cyclic search wraps in **time**, so a value
+  that wraps back is a backwards sweep and a value that leaves a gap is a jump at
+  midnight. Monotonic through the wrap is what makes the interpolation one
+  continuous forward rotation. The client's `fsin`/`fcos` read either spelling
+  the same.
+* The arc's light azimuth carries its second key at 08:48 rather than stock's
+  06:00, because stock's own key times would put a non-monotonic pair of
+  azimuths in the small hours and unwind the morning sweep. The night leg —
+  21:30 back to 05:30 — is the cyclic one and interpolates along itself, which
+  is as much of the night as four keys can cover.
