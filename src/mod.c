@@ -494,6 +494,7 @@ static unsigned g_audit_seen;         /* per-chunk header dumps logged so far */
 static int g_silent;                  /* modes b and d: the call returns before
                                           doing anything at all, file I/O included */
 static char g_mode = 'f';             /* the mode letter, see ReadModeFile     */
+static int g_sun_audit;               /* mode letter q: the per-chunk header dump */
 static int g_verbose;                 /* sv13: the diagnostic level is on. Set by
                                          ReadModeFile from a v in the mode file and
                                          forced on by every rung but f, so a shipping
@@ -665,14 +666,27 @@ static char ReadModeFile(void)
             gap = 1;
             continue;
         }
+        if (c == 'q') {
+            /* the per-chunk header dump, back on. It is what filled the log in
+             * a fast session: 2,000 lines of ~300 bytes each is more than the
+             * newest LOG_KEEP_BYTES TrimLog keeps, so the sun lines were
+             * pushed out of what survived. A q asks for them again, and a q is
+             * not a rung letter, so it cannot change what runs. */
+            g_sun_audit = 1;
+            gap = 1;
+            continue;
+        }
         if (c >= '0' && c <= '9') {
-            /* a run of digits is ONE number, two digits deep: "45" is 45 times,
-             * not four then forty-five or four then five. A run that starts
-             * after a gap replaces the run before it, so a file that says 2
-             * then 7 is a session that changed its mind, and the clock is a
-             * test control, not something a rung letter competes about. 99 is
-             * the top: the day then runs in 15 real minutes and the client's
-             * own per-minute work starts skipping minutes. */
+            /* a run of digits is ONE number, two digits deep: "45" is forty-five
+             * game minutes a real second, not four then forty-five or four then
+             * five. A run that starts after a gap replaces the run before it, so
+             * a file that says 2 then 7 is a session that changed its mind, and
+             * the clock is a test control, not something a rung letter competes
+             * about. 99 is the top the mode file can ask for and the client's
+             * own setter clamps it to 60, a game hour a real second and a whole
+             * day in 24 real seconds; the digits are the scale itself, game
+             * minutes per real second, not a multiplier of what the client has,
+             * because the client's own scale is 1/60. */
             d = c - '0';
             if (gap) {
                 g_time_speed = d;
@@ -1109,9 +1123,21 @@ static unsigned g_sun_said_preset;  /* one line per preset applied, bit per  */
 static int g_sun_said_stock;
 static int g_sun_said_off;
 static int g_sun_said_back;
-static unsigned g_sun_said_read;   /* one read-back line per preset index, bit per
-                                     * index: the readback says what the live bytes
-                                     * hold once per window, a crossing says so once */
+/* how the sun lines spend the log. A chunk visit is hot, and at the test speeds
+ * the clock crosses a window boundary every few seconds, so the line with all
+ * 22 live keys in it is only what the first writes of a session get; after that
+ * every write gets the short line, which carries the numbers that decide -- the
+ * disc's bearing and elevation and the shading's. Both are capped, because the
+ * log itself is capped: TrimLog keeps the newest LOG_KEEP_BYTES, and 2,000
+ * per-chunk header dumps alone are more than that, which is why the sun lines
+ * were unreadable in a fast session. The per-chunk dump is what grew, so a q in
+ * the mode file is what puts it back. */
+static unsigned g_sun_full;                /* giant sun lines this session logged */
+static unsigned g_sun_short;               /* short sun lines this session logged */
+static unsigned g_sun_lost;                /* lost-key lines this session logged  */
+#define SUN_FULL_LINES  4u                 /* giant readbacks per session         */
+#define SUN_SHORT_LINES 60u                /* short status lines per session      */
+#define SUN_LOST_LINES  4u                 /* lost-key lines per session          */
 
 /* the clock, in the unit the presets' windows use. The DLL never makes a
  * clock of its own: this is the float the client stamps every rendered world
@@ -1307,6 +1333,44 @@ static int SunBearing(float az)
     return b;
 }
 
+/* is what this DLL wrote still in the client? sv14's per-visit check looks for
+ * the STOCK keys, which is enough to catch the day-night file rebuilding its
+ * tracks, but it says nothing about a write that landed at the wrong address
+ * or a client that put its own values there that are not stock. This one asks
+ * what the armed preset's own table says each first slot holds, so a lost
+ * write is named by what replaced it, whatever that was, and the four live
+ * readings are kept for the line that prints them next to the four wanted.
+ * One key per track, so four float reads per chunk visit: no cost. */
+static float g_sun_live4[4];
+
+static int SunKeysLive(unsigned which)
+{
+    const struct SunPreset *p = &sun_presets[which];
+    unsigned k;
+    int ok = 1;
+
+    for (k = 0; k < 4u; ++k) {
+        const float *kv = (const float *)(size_t)sun_addr[k];
+        double want, deg, d;
+        if (k == 0u)
+            want = (double)p->az_l[0];
+        else if (k == 1u)
+            want = (double)p->pol_l[0];
+        else if (k == 2u)
+            want = (double)p->az_d[0];
+        else
+            want = (double)p->pol_d[0];
+        deg = (double)kv[0] * SUN_R2D;
+        g_sun_live4[k] = (float)deg;
+        d = deg - want;
+        if (d < 0.0)
+            d = -d;
+        if (d > 0.02)
+            ok = 0;
+    }
+    return ok;
+}
+
 /* what the client is showing right now, from its own bytes: the four tracks
  * as they read now, and the two bearings that come out of them at the
  * client's own phase. this is the one line that tells an in-game visit which
@@ -1314,14 +1378,21 @@ static int SunBearing(float az)
  * bearing 180 deg off the disc, and a bearing that never matches the sky
  * under any reading are three different facts about live memory and the
  * azimuth's handedness, and only the live bytes can sort them out. one line
- * per preset window, next to the line that names the preset written. */
-static void SunReadback(unsigned which, unsigned hmin)
+ * per preset window, next to the line that names the preset written -- and
+ * only for the first SUN_FULL_LINES writes: after that the same function
+ * prints the short line, the last five numbers of the giant one with the
+ * phase and the preset named, because at the test speeds the day crosses a
+ * window boundary every few seconds and a session that watched a whole
+ * 24-real-second day would otherwise print the 22 live keys two hundred
+ * times and push everything else out of the log's kept tail. */
+static void SunReport(unsigned which, unsigned hmin)
 {
     const struct SunPreset *p = &sun_presets[which];
     const float *st = (const float *)(size_t)SUN_TOD_STATE;
     float phase = st[SUN_TOD_OFF / 4u];
     float az_l, pol_l, az_d, pol_d;
     int disc_b, disc_el, src_b, src_el, gap;
+    int big;
     char msg[1792]; /* the line prints all four tracks' live key pairs plus the
                       * phase, the preset name and the two bearings: rendered at
                       * the widest addresses and a long preset name it runs past
@@ -1332,9 +1403,13 @@ static void SunReadback(unsigned which, unsigned hmin)
     unsigned tr, i;
     const float *kv;
 
-    if (g_sun_said_read & (1u << which))
-        return;
-    g_sun_said_read |= (1u << which);
+    if (g_sun_full >= SUN_FULL_LINES && g_sun_short >= SUN_SHORT_LINES)
+        return;                      /* both kinds of sun line are used up    */
+    big = (g_sun_full < SUN_FULL_LINES);
+    if (big)
+        ++g_sun_full;
+    else
+        ++g_sun_short;
 
     if (!(phase >= 0.0f) || phase >= 1.0f)
         phase = 0.0f;
@@ -1361,7 +1436,8 @@ static void SunReadback(unsigned which, unsigned hmin)
     if (gap < -180)
         gap += 360;
 
-    snprintf(msg, sizeof msg,
+    if (big) {
+        snprintf(msg, sizeof msg,
              STAMP " sun read back: what the client's own tracks hold now, and what its evaluator"
                     " makes them give at the client's own phase. the phase at 0x%x+%x is 0.%04u,"
                     " half-minute %u of %u, and %s is the preset this visit wrote. the live keys,"
@@ -1397,6 +1473,21 @@ static void SunReadback(unsigned which, unsigned hmin)
              tv[3][0], tv[3][1], tv[3][2], tv[3][3], tv[3][4],
              SunRoundDeg(az_d), SunRoundDeg(pol_d), SunRoundDeg(az_l), SunRoundDeg(pol_l),
              disc_b, disc_el, src_b, src_el, gap);
+    } else {
+        snprintf(msg, sizeof msg,
+                 STAMP " sun status: the client's own phase at 0x%x+%x is 0.%04u, half-minute %u"
+                 " of %u, and %s was the key set this visit wrote into the live keys. what the"
+                 " client's evaluator makes those bytes give: the disc at azimuth %d deg and"
+                 " polar %d deg and the light at azimuth %d deg and polar %d deg, so the disc"
+                 " sits at bearing %d deg, %d deg above the horizon, and the shading comes from"
+                 " bearing %d deg, %d deg high: they are %d deg apart. the live keys themselves"
+                 " are in the giant line, which this session already printed %u times"
+                 ,
+                 SUN_TOD_STATE, SUN_TOD_OFF,
+                 (unsigned)(phase * 10000.0f + 0.5f), hmin, SUN_HMIN_DAY, p->name,
+                 SunRoundDeg(az_d), SunRoundDeg(pol_d), SunRoundDeg(az_l), SunRoundDeg(pol_l),
+                 disc_b, disc_el, src_b, src_el, gap, g_sun_full);
+    }
     LogMsg(msg);
 }
 
@@ -1481,6 +1572,38 @@ static void SunKeepArc(void)
             w = (int)SUN_STOCK_PRESET;
         which = (unsigned)w;
     }
+    /* the same preset armed again: before anything else, is its own first key
+     * still what the client holds? a visit that finds it gone found a write
+     * that was REPLACED between visits, which is a different fact from the
+     * write never landing -- and the two halves are what sort them out. The
+     * giant read back right after a write says the write landed; this line
+     * says it stayed, and the four live readings say what replaced it. */
+    if ((int)which == g_sun_applied && !SunKeysLive(which)) {
+        if (g_sun_lost < SUN_LOST_LINES) {
+            ++g_sun_lost;
+            snprintf(msg, sizeof msg,
+                     STAMP " sun keys lost: %s was armed again and the client's own tables no"
+                            " longer hold what this DLL wrote there. the first key of each track,"
+                            " as the live radians read back, then what the preset's own table"
+                            " wants there: light azimuth 0x%x reads %d deg and wants %d;"
+                            " light polar 0x%x reads %d deg wants %d; disc azimuth 0x%x reads"
+                            " %d deg wants %d; disc polar 0x%x reads %d deg wants %d. the stock"
+                            " keys are 225 127 45 100, so a live four of exactly those is the"
+                            " day-night file building its own tracks behind the guard bits at"
+                            " 0x6d3a10 and 0x6d3b80 and that guard's state is what to look at"
+                            " next; any other four is a write that went somewhere the client"
+                            " does not read. this session prints this line %u of %u times",
+                     sun_presets[which].name,
+                     sun_addr[0], SunRoundDeg(g_sun_live4[0]),
+                     (int)sun_presets[which].az_l[0], sun_addr[1],
+                     SunRoundDeg(g_sun_live4[1]), (int)sun_presets[which].pol_l[0],
+                     sun_addr[2], SunRoundDeg(g_sun_live4[2]),
+                     (int)sun_presets[which].az_d[0], sun_addr[3],
+                     SunRoundDeg(g_sun_live4[3]), (int)sun_presets[which].pol_d[0],
+                     (unsigned)g_sun_lost, (unsigned)SUN_LOST_LINES);
+            LogMsg(msg);
+        }
+    }
     if (which >= SUN_STOCK_PRESET) {
         if (!g_sun_said_stock) {
             g_sun_said_stock = 1;
@@ -1504,7 +1627,7 @@ static void SunKeepArc(void)
             LogMsg(msg);
         }
         SunWrite(which);
-        SunReadback(which, hmin);
+        SunReport(which, hmin);
         g_sun_applied = (int)which;
         return;
     }
@@ -1528,7 +1651,7 @@ static void SunKeepArc(void)
             LogMsg(msg);
         }
         SunWrite(which);
-        SunReadback(which, hmin);
+        SunReport(which, hmin);
         return;
     }
     SunWrite(which);
@@ -1556,7 +1679,7 @@ static void SunKeepArc(void)
                  (unsigned)sun_presets[which].pol_d[4], SUN_EVAL_ADDR);
         LogMsg(msg);
     }
-    SunReadback(which, hmin);
+    SunReport(which, hmin);
 }
 
 /* sv15's test hook, next to the arc: the day runs faster, so an arc can be
@@ -1736,8 +1859,17 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
      * dump is on the diagnostic level, so the quiet path skips the block whole
      * rather than formatting 300 characters per chunk and dropping them, and
      * what names a dying chunk on the quiet level is the exception handler, not
-     * this line's tail. */
-    if (g_verbose && g_audit_seen < AUDIT_LOG_MAX) {
+     * this line's tail.
+     *
+     * sv15: the dump is also now opt-in, and it has to be. A session that runs
+     * the day at 5 game minutes a real second loads hundreds of chunks, and
+     * hundreds of these lines at ~300 bytes each is more than the newest LOG_KEEP_BYTES
+     * TrimLog keeps, so the sun's own lines were pushed out of what survived and
+     * no sky report could be read against a log. A q in the mode file puts them
+     * back on, for the run whose chunk is crashing; without a q only the first
+     * chunk is audited whole, above, and a fast day's sun evidence stays inside
+     * what the log keeps. */
+    if (g_verbose && g_sun_audit && g_audit_seen < AUDIT_LOG_MAX) {
         ++g_audit_seen;
         hdr = (unsigned char *)record_ + 8;
         snprintf(msg, sizeof msg,
@@ -2328,9 +2460,12 @@ static int Install(void)
              " arena, no hook, b = hook plus an empty call, c = the detour alone"
              " with no call at all, d = the same call from the client's own frame"
              " at 0x6AF5F3, h = hook plus audit, no payload, f = full; a v"
-             " anywhere in the file also turns the diagnostic lines on, and digits up to 99 anywhere in it"
+             " anywhere in the file also turns the decision lines on, digits up to 99 anywhere in it"
              " set the game clock's scale to that many game minutes per real second, which 0x643820"
-             " clamps to at most 60, one game hour a real second",
+             " clamps to at most 60 (one game hour a real second, a whole day in 24), and a q is"
+             " what puts the per-chunk header dump back on -- without a q the log holds the sun,"
+             " the clock and the audit of the FIRST chunk only, which is what keeps a fast day's"
+             " evidence inside the newest 64 kB that TrimLog keeps of a 512 kB log",
              g_mode, g_dir);
     LogVerb(msg);
 

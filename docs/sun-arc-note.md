@@ -169,7 +169,7 @@ python build.py .                  # links out\ShadowMaps.dll
 python verify_dll.py out\ShadowMaps.dll
 ```
 
-The sv15 image is 158,720 bytes.
+The sv15 image is 160,768 bytes.
 
 Ship it as sv13 ships it: `ShadowMaps.dll`, `ShadowMaps.def`, `ShadowMaps.dll.id`
 in `dlls.txt`, and rename the shadow file to `shadowmaps.dat` **next to the
@@ -184,14 +184,25 @@ clock's scale to that many game minutes per real second**. A missing file means
 | put in `shadow-mod.mode` | what you get |
 |---|---|
 | (no file) | mode `f`, quiet: the arc runs **and** the `.dat` must be there, so a missing `.dat` means `Load` answers 1, the hook is not patched, and VanillaFixes shows its popup — no arc |
-| `h v` | the test rung: hook, the per-chunk audit, **no `.dat` needed**, nothing allocated, no chunk header touched — shadows stay stock and the arc still runs, with the diagnostic lines on |
-| `h 9 v` | the same rung with the day at 9 game minutes a real second — an arc crosses the sky in one session |
+| `h v` | the test rung: hook, the audit of the **first** chunk only, **no `.dat` needed**, nothing allocated, no chunk header touched — shadows stay stock and the arc still runs, with the decision lines on |
+| `h 5 v` | the same rung with the day at 5 game minutes a real second — a game day of 288 real seconds, under 5 minutes, an hour of sky every 12, so one session watches the arc cross the sky |
+| `h 5 v q` | the same, and a `q` anywhere puts the **per-chunk** header dump back on: 2,000 lines of ~300 bytes, which is more than the newest 64 kB the log keeps, so this is what buries the sun lines — use it when a chunk is crashing, not when the sky is being read |
 | `f v` | the full rung with the diagnostics on: the arc runs and the baked shadows draw |
 | `d v` or `b v` | the silent rungs: the hook is in and the call happens, but the fixup returns before the sun, so **no arc** — their install line says so |
 
 `n`, `a` and `c` never call the fixup at all, so they carry no arc either; the
 install line names which rung you are on. **`h` and `f` are the two rungs that
 carry the arc**, and `h` is the one to test on because it needs no `.dat`.
+
+The log itself is bounded: `TrimLog` cuts a file past 512 kB to its newest 64
+kB of whole lines at load, and the per-chunk header dump is capped at 2,000
+lines. Those two together are why the sun lines were unreadable in a fast
+session — the dump alone is ~600 kB, so it pushed out everything the log keeps.
+The dump is now opt-in (a `q`), and the sun's own lines are capped: 4 giant
+lines, 60 short ones, 4 keys-lost ones. So with `h 5 v` the whole day's evidence
+fits and the file opens at a few tens of kB — the sun lines are near the top of
+it, after install and the first-chunk audit, and everything under them is a
+handful of clock and visit lines. Grep for `sun ` and the whole day is there.
 
 The number is read as a run of digits: `9` is nine, `45` is forty-five, `2 7` is
 seven because a gap ends a run and the last run wins, and a run is capped at 99.
@@ -235,12 +246,12 @@ Then, in order:
    evening that is still the morning arc is not.
 
 3. Put a number in the mode file and watch the sky instead of waiting for it:
-   `h 9 v` puts the day at 9 game minutes a real second — a game day of 160 real
-   seconds, an hour of sky every 7 — and the clock the UI shows moves with it.
-   The line to look for is
+   `h 5 v` puts the day at 5 game minutes a real second — a game day of 288 real
+   seconds, just under 5 minutes, an hour of sky every 12 — and the clock the UI
+   shows moves with it. The line to look for is
 
    ```
-   sv15 clock: shadow-mod.mode had 9, so the game clock object's scale at 0xce8564, the game clock at 0xce8538's +0x2c, went from 17 to 9000 milli-game-minutes per real second. 9 is the mode file's number used as the scale itself rather than as a multiplier of what was there, because the server sends this scale as 0.01666667f, 1/60, which is also what 0x643300 builds the clock with: multiplying that live scale asked for 150 milli, an hour of sky in well under a minute but nowhere near a game minute a second. the float is what 0x643a70 multiplies the real seconds since the last minute by to get the day phase and what 0x6435a0 adds dt times of to the minute accumulator, so a whole game day is 160 real seconds and one hour of sky turns in 7 real seconds: the sun's phase, the clock the UI shows and the day count all move together. 0x643820 clamps the scale to [1/60, 60], 17 to 60000 milli, so digits at or above 60 land on 60, one game hour a real second and a day in 24 real seconds; the server re-sends its own scale in its time messages -- the 0x47 handler 0x6c5de0 and the 0x42 handler 0x6c5e80 both end in 0x643820 -- so the number is set again at every chunk visit
+   sv15 clock: shadow-mod.mode had 5, so the game clock object's scale at 0xce8564, the game clock at 0xce8538's +0x2c, went from 17 to 5000 milli-game-minutes per real second. 5 is the mode file's number used as the scale itself rather than as a multiplier of what was there, because the server sends this scale as 0.01666667f, 1/60, which is also what 0x643300 builds the clock with: multiplying that live scale asked for 83 milli, an hour of sky in well under a minute but nowhere near a game minute a second. the float is what 0x643a70 multiplies the real seconds since the last minute by to get the day phase and what 0x6435a0 adds dt times of to the minute accumulator, so a whole game day is 288 real seconds and one hour of sky turns in 12 real seconds: the sun's phase, the clock the UI shows and the day count all move together. 0x643820 clamps the scale to [1/60, 60], 17 to 60000 milli, so digits at or above 60 land on 60, one game hour a real second and a day in 24 real seconds; the server re-sends its own scale in its time messages -- the 0x47 handler 0x6c5de0 and the 0x42 handler 0x6c5e80 both end in 0x643820 -- so the number is set again at every chunk visit
    ```
 
    Nothing here makes a clock: `0xce8564` is the scale float inside the client's
@@ -252,28 +263,55 @@ Then, in order:
 
 4. Force one preset without waiting for the clock: `arc-swnw` in `shadow-mod.sun`
    in the same folder as the mode file, and `off` to leave the client's tables
-   alone.
+   alone. The file is read once at install, so a fresh session is what applies a
+   changed word — and a world entered at 23:00 is in the stock window by design,
+   so the arc cannot be seen there at all until this file forces it. Forcing it
+   there is the test of the write itself: the sky shows the arc or the client
+   overwrote it, and the keys-lost line says which.
 
-5. Every preset that is written gets one readback line after it, and that line is
+5. Every preset that is written gets a readback line after it, and that line is
    what makes a sky report decisive: it reads the four tracks back out of the
    client, replays the client's own evaluator rule over whatever those bytes
    hold at the client's own phase, and prints the disc's bearing and elevation
    and the bearing the shading comes from. An in-game sky that disagrees with
    this line is a disagreement about the live bytes, not about the tables the
-   source says it wrote:
+   source says it wrote. Only the first four writes of a session get the giant
+   line, with all 22 live keys in it; after that the same numbers come on the
+   short line, because a fast day crosses a window boundary every few seconds
+   and 200 giant lines is more than the log keeps:
 
    ```
    sv15 sun read back: what the client's own tracks hold now, and what its evaluator makes them give at the client's own phase. the phase at 0xce9b60+4 is 0.3681, half-minute 1060 of 2880, and arc-swnw is the preset this visit wrote. the live keys, values then their times, degrees as the radians at each address read back: light azimuth 0xce8d90 = 495 517 540 585 deg at 0.2292 0.3646 0.5000 0.8958; light polar 0xce8db0 = 127 110 127 110 deg at 0.0000 0.2500 0.5000 0.7500; disc azimuth 0xce8d4c = 315 360 405 deg at 0.2292 0.5000 0.8958; disc polar 0xce8d64 = 100 5 5 5 100 deg at 0.2292 0.4965 0.5000 0.5035 0.8958. interpolating those at the phase gives the disc at azimuth 338 deg and polar 51 deg and the light azimuth 518 deg and polar 118 deg, so the disc sits at bearing 338 deg, 39 deg above the horizon, and the shading comes from bearing 338 deg, 28 deg high: they are 0 deg apart. read the two bearings against the sky you are looking at: a disc bearing that matches makes the tables and the handedness right and the arc's own angles are what to change; a shading bearing 180 apart from the disc is the light pointing at the sun rather than away from it; and a disc polar that should keep it below the horizon at a night hour and does not is a key time belonging to another track. the azimuths are 0 = west, 90 = north, 180 = east, 270 = south, the frame the stock sun's own NORTH WEST pins
    ```
 
-   The keys the line prints are the live bytes: the arc's own values, in degrees,
-   with their times. The last five numbers are the ones to compare with the sky —
+   The short line, which every write after the fourth gets:
+
+   ```
+   sv15 sun status: the client's own phase at 0xce9b60+4 is 0.3681, half-minute 1060 of 2880, and arc-swnw was the key set this visit wrote into the live keys. what the client's evaluator makes those bytes give: the disc at azimuth 338 deg and polar 51 deg and the light at azimuth 518 deg and polar 118 deg, so the disc sits at bearing 338 deg, 39 deg above the horizon, and the shading comes from bearing 338 deg, 28 deg high: they are 0 deg apart. the live keys themselves are in the giant line, which this session already printed 4 times
+   ```
+
+   The last five numbers of either line are the ones to compare with the sky —
    the disc's bearing, its elevation, the shading's bearing, its elevation, and
    how far the two bearings are apart. The stock window gets the same line after
    its write-back, so an evening can be checked the same way.
 
-6. If the day-night file ever rebuilds its tracks after install, the line to
-   look for is
+6. The giant line is taken at the write, so it says the write **landed**. What
+   says it **stayed** is the per-visit line, and it is the other half of the
+   evidence: the same preset armed again, and its own first key read back out of
+   the client. A visit that finds the key gone found something that replaced the
+   write between visits, and the line names what replaced it. This kind of fault
+   is not the same as a write that never happened, and the four live readings
+   tell them apart — the stock four are `225 127 45 100`:
+
+   ```
+   sv15 sun keys lost: arc-swnw was armed again and the client's own tables no longer hold what this DLL wrote there. the first key of each track, as the live radians read back, then what the preset's own table wants there: light azimuth 0xce8d90 reads 225 deg and wants 495; light polar 0xce8db0 reads 127 deg wants 127; disc azimuth 0xce8d4c reads 45 deg wants 315; disc polar 0xce8d64 reads 100 deg wants 100. the stock keys are 225 127 45 100, so a live four of exactly those is the day-night file building its own tracks behind the guard bits at 0x6d3a10 and 0x6d3b80 and that guard's state is what to look at next; any other four is a write that went somewhere the client does not read. this session prints this line 1 of 4 times
+   ```
+
+7. The rebuild above, seen from the other side: the client put its own stock
+   keys back, and the line that names that event says so in words. It and the
+   keys-lost line are the same event seen from two checks — the keys-lost line
+   fires first, because it asks what the armed preset wants rather than waiting
+   for the four to be exactly stock's:
 
    ```
    sv15 sun: the key tables at 0xce8d90 and 0xce8d4c hold the stock keys again under arc-swnw, so the day-night file built its tracks after install: the keys are written again here, and the next chunk visit keeps them, so a stock sun in game after this line is that rebuild
