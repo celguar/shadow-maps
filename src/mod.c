@@ -987,11 +987,28 @@ static void InstallHandler(void)
  * and the light azimuth is kept the disc azimuth plus 180 with the light
  * polar the disc polar subtracted from 180, so the direction the shading comes
  * from and the sun you can see are the same sun all day. The count is the
- * edx to the evaluator, not a length inside the block, and the blocks are
- * adjacent -- 0xce8d90 + 0x20 is the polar light track, 0xce8d4c + 0x18 is the
- * disc polar one -- so the key times sit right after the values at kv + n and
- * a preset that added a key would write over its neighbour: every preset keeps
- * the stock 4 / 4 / 3 / 5.
+ * edx to the evaluator, not a length inside the block, and a key is one DNKeyframe:
+ * the TIME at kv + 8k and the VALUE at kv + 8k + 4, so a block is 2n floats and
+ * the blocks are adjacent -- 0xce8d90 + 0x20 is the polar light track, 0xce8d4c
+ * + 0x18 is the disc polar one -- so a preset that added a key would write over
+ * its neighbour: every preset keeps the stock 4 / 4 / 3 / 5 keys.
+ *
+ * The pair's order is not a guess and not only another build's address: wowdecomp
+ * (the 3.3.5a client, DayNight.h:32) spells the struct out, m_time at +0000 and
+ * m_value at +0004, and DayNight.cpp's static sun tables are the same shapes with
+ * the same numbers this build's own tracks hold -- 4 azimuth keys at 0, 0.25, 0.5,
+ * 0.75 all 3.926991 rad (225 deg), 4 polar keys 2.2165682 / 1.9198623 / 2.2165682
+ * / 1.9198623 (127 / 110 / 127 / 110 deg), 3 disc azimuth keys at SUNRISE 0.22916667,
+ * NOON 0.5, SUNSET 0.89583331 all 0.78539819 (45 deg), and 5 disc polar keys 100 / 5
+ * / 5 / 5 / 100 deg at 05:30, 11:55, 12:00, 12:05, 21:30. sv14 read a block as n
+ * values and then n times, and the first in-game log proved that is the other
+ * client's own arrangement: four "sun keys lost" lines said the +0 slot of each
+ * track held 0 deg, 0 deg, 13 deg, 13 deg, and 13 deg is 0.2292 rad, which is
+ * SUNRISE -- stock's key TIME in the slot the evaluator calls the value of, in the
+ * two lighting tracks 0.0, which is their stock first key time. So the client's
+ * own first-use build at 0x6d3a10 and 0x6d3b80 rebuilt the block in the interleaved
+ * shape on top of sv14's write: a wrong layout and a rebuild are the two facts the
+ * same four numbers name, and the layout is the one that has to be right first.
  *
  * The azimuths are left unwrapped (495 deg, not 135) because wrapping is what
  * reverses the sweep; sin and cos read them the same either way. */
@@ -1187,12 +1204,12 @@ static int SunHoldsStock(void)
     for (tr = 0; tr < 4u; ++tr) {
         kv = (const float *)(size_t)sun_addr[tr];
         for (i = 0; i < sun_n[tr]; ++i) {
-            double deg = (double)kv[i] * SUN_R2D;
+            double deg = (double)kv[2u * i + 1u] * SUN_R2D;
             if (deg < (double)sun_stock_v[tr][i] - 0.02 ||
                 deg > (double)sun_stock_v[tr][i] + 0.02)
                 same = 0;
-            if (kv[sun_n[tr] + i] < sun_stock_t[tr][i] - 0.0001f ||
-                kv[sun_n[tr] + i] > sun_stock_t[tr][i] + 0.0001f)
+            if (kv[2u * i] < sun_stock_t[tr][i] - 0.0001f ||
+                kv[2u * i] > sun_stock_t[tr][i] + 0.0001f)
                 same = 0;
         }
     }
@@ -1200,8 +1217,9 @@ static int SunHoldsStock(void)
 }
 
 /* the tracks must be the ones this whole block was read from before anything
- * is written: stock values, or an all-zero block the sun state has not built
- * yet, since 0x6d3a10 and 0x6d3b80 build these at first use behind the guard
+ * is written: stock's own pairs -- its value at +4 and its time at +0 of every
+ * key -- or an all-zero block the sun state has not built yet, since 0x6d3a10
+ * and 0x6d3b80 build these at first use behind the guard
  * bits at 0x6d3b44 and 0x6d3ba4 and that is after this DLL was loaded. A
  * track holding neither is not the shape 0x6cf6c0 names, and the sun is left
  * alone. */
@@ -1216,14 +1234,14 @@ static int SunPin(void)
         zero = 1;
         kv = (const float *)(size_t)sun_addr[tr];
         for (i = 0; i < sun_n[tr]; ++i) {
-            double deg = (double)kv[i] * SUN_R2D;
+            double deg = (double)kv[2u * i + 1u] * SUN_R2D;
             if (deg < (double)sun_stock_v[tr][i] - 0.02 ||
                 deg > (double)sun_stock_v[tr][i] + 0.02)
                 same = 0;
-            if (kv[sun_n[tr] + i] < sun_stock_t[tr][i] - 0.0001f ||
-                kv[sun_n[tr] + i] > sun_stock_t[tr][i] + 0.0001f)
+            if (kv[2u * i] < sun_stock_t[tr][i] - 0.0001f ||
+                kv[2u * i] > sun_stock_t[tr][i] + 0.0001f)
                 same = 0;
-            if (kv[i] != 0.0f || kv[sun_n[tr] + i] != 0.0f)
+            if (kv[2u * i] != 0.0f || kv[2u * i + 1u] != 0.0f)
                 zero = 0;
         }
         if (!same && !zero) {
@@ -1240,16 +1258,17 @@ static int SunPin(void)
     return 1;
 }
 
-/* one preset into the client's own shapes: values first, then the same count
- * of times, which is where the next track begins and why a preset that added
- * a key would write over its neighbour. */
+/* one preset into the client's own shape: one DNKeyframe per key, the time at
+ * kv + 8k and the value at kv + 8k + 4, which is where the next key begins and
+ * why a preset that added a key would write over the next track -- 4 keys is
+ * exactly the 0x20 to 0xce8db0 and 3 exactly the 0x18 to 0xce8d64. */
 static void SunPut(unsigned tr, const float *t, const float *deg)
 {
     float *kv = (float *)(size_t)sun_addr[tr];
     unsigned i;
     for (i = 0; i < sun_n[tr]; ++i) {
-        kv[i] = deg[i] * SUN_D2R;
-        kv[sun_n[tr] + i] = t[i];
+        kv[2u * i] = t[i];
+        kv[2u * i + 1u] = deg[i] * SUN_D2R;
     }
 }
 
@@ -1273,8 +1292,10 @@ static void SunWrite(unsigned which)
  * the first or when no key qualifies; with d = time[i] - time[j] a |d| below
  * 0.001 returns value[j] whole, and a negative d and a negative e = phase -
  * time[j] each take +1 before the lerp, which is what makes a pair whose
- * times straddle midnight a rising leg across it. the angles are the
- * radians the client holds, so they are turned back into degrees here. */
+ * times straddle midnight a rising leg across it. Each key is read as its time
+ * at +8k and its value at +8k+4, the pair wowdecomp's DayNight.h:32 names. the
+ * angles are the radians the client holds, so they are turned back into degrees
+ * here. */
 static float SunEvalTrack(unsigned tr, float phase)
 {
     const float *kv = (const float *)(size_t)sun_addr[tr];
@@ -1292,7 +1313,7 @@ static float SunEvalTrack(unsigned tr, float phase)
         phase = 1.0f;
     i = n;
     for (k = 0; k < n; ++k) {
-        if (phase <= kv[n + k]) {
+        if (phase <= kv[2u * k]) {
             i = k;
             break;
         }
@@ -1300,16 +1321,16 @@ static float SunEvalTrack(unsigned tr, float phase)
     if (i >= n)
         i = 0; /* no key qualified: the leg from the last key to the first */
     j = (i + n - 1u) % n;
-    tj = kv[n + j];
-    d = kv[n + i] - tj;
+    tj = kv[2u * j];
+    d = kv[2u * i] - tj;
     if (d > -0.001f && d < 0.001f)
-        return kv[j] * SUN_R2D;
+        return kv[2u * j + 1u] * SUN_R2D;
     if (d < 0.0f)
         d += 1.0f;
     e = phase - tj;
     if (e < 0.0f)
         e += 1.0f;
-    return (kv[j] + (kv[i] - kv[j]) * (e / d)) * SUN_R2D;
+    return (kv[2u * j + 1u] + (kv[2u * i + 1u] - kv[2u * j + 1u]) * (e / d)) * SUN_R2D;
 }
 
 /* a float's degrees to whole degrees, away from zero at the half. The readback
@@ -1340,8 +1361,14 @@ static int SunBearing(float az)
  * what the armed preset's own table says each first slot holds, so a lost
  * write is named by what replaced it, whatever that was, and the four live
  * readings are kept for the line that prints them next to the four wanted.
- * One key per track, so four float reads per chunk visit: no cost. */
+ * One key per track, so four float reads per chunk visit: no cost.
+ * The value is what a preset chose, so it is the one that decides; the pair's
+ * time is also kept, because a live value that is stock's and a live time that
+ * is stock's together name the day-night file's own rebuild, while a live value
+ * that is neither this preset's nor stock's names something else writing these
+ * tables. */
 static float g_sun_live4[4];
+static float g_sun_live_t4[4];
 
 static int SunKeysLive(unsigned which)
 {
@@ -1360,7 +1387,8 @@ static int SunKeysLive(unsigned which)
             want = (double)p->az_d[0];
         else
             want = (double)p->pol_d[0];
-        deg = (double)kv[0] * SUN_R2D;
+        g_sun_live_t4[k] = kv[0];
+        deg = (double)kv[1] * SUN_R2D;
         g_sun_live4[k] = (float)deg;
         d = deg - want;
         if (d < 0.0)
@@ -1416,8 +1444,8 @@ static void SunReport(unsigned which, unsigned hmin)
     for (tr = 0; tr < 4u; ++tr) {
         kv = (const float *)(size_t)sun_addr[tr];
         for (i = 0; i < sun_n[tr]; ++i) {
-            dv[tr][i] = SunRoundDeg(kv[i] * SUN_R2D);
-            tv[tr][i] = (unsigned)(kv[sun_n[tr] + i] * 10000.0f + 0.5f);
+            dv[tr][i] = SunRoundDeg(kv[2u * i + 1u] * SUN_R2D);
+            tv[tr][i] = (unsigned)(kv[2u * i] * 10000.0f + 0.5f);
         }
     }
     az_l = SunEvalTrack(0u, phase);
@@ -1441,11 +1469,12 @@ static void SunReport(unsigned which, unsigned hmin)
              STAMP " sun read back: what the client's own tracks hold now, and what its evaluator"
                     " makes them give at the client's own phase. the phase at 0x%x+%x is 0.%04u,"
                     " half-minute %u of %u, and %s is the preset this visit wrote. the live keys,"
-                    " values then their times, degrees as the radians at each address read back:"
-                    " light azimuth 0x%x = %d %d %d %d deg at 0.%04u 0.%04u 0.%04u 0.%04u;"
-                    " light polar 0x%x = %d %d %d %d deg at 0.%04u 0.%04u 0.%04u 0.%04u;"
-                    " disc azimuth 0x%x = %d %d %d deg at 0.%04u 0.%04u 0.%04u;"
-                    " disc polar 0x%x = %d %d %d %d %d deg at 0.%04u 0.%04u 0.%04u 0.%04u 0.%04u."
+                    " each key is a time at +0 and a value at +4, printed as a track's times then its"
+                    " values, degrees as the radians at each address read back:"
+                    " light azimuth 0x%x at 0.%04u 0.%04u 0.%04u 0.%04u holds %d %d %d %d deg;"
+                    " light polar 0x%x at 0.%04u 0.%04u 0.%04u 0.%04u holds %d %d %d %d deg;"
+                    " disc azimuth 0x%x at 0.%04u 0.%04u 0.%04u holds %d %d %d deg;"
+                    " disc polar 0x%x at 0.%04u 0.%04u 0.%04u 0.%04u 0.%04u holds %d %d %d %d %d deg."
                     " interpolating those at the phase gives the disc at azimuth %d deg and polar"
                     " %d deg and the light azimuth %d deg and polar %d deg, so the disc sits at"
                     " bearing %d deg, %d deg above the horizon, and the shading comes from bearing"
@@ -1460,17 +1489,17 @@ static void SunReport(unsigned which, unsigned hmin)
              SUN_TOD_STATE, SUN_TOD_OFF,
              (unsigned)(phase * 10000.0f + 0.5f), hmin, SUN_HMIN_DAY, p->name,
              sun_addr[0],
-             dv[0][0], dv[0][1], dv[0][2], dv[0][3],
              tv[0][0], tv[0][1], tv[0][2], tv[0][3],
+             dv[0][0], dv[0][1], dv[0][2], dv[0][3],
              sun_addr[1],
-             dv[1][0], dv[1][1], dv[1][2], dv[1][3],
              tv[1][0], tv[1][1], tv[1][2], tv[1][3],
+             dv[1][0], dv[1][1], dv[1][2], dv[1][3],
              sun_addr[2],
-             dv[2][0], dv[2][1], dv[2][2],
              tv[2][0], tv[2][1], tv[2][2],
+             dv[2][0], dv[2][1], dv[2][2],
              sun_addr[3],
-             dv[3][0], dv[3][1], dv[3][2], dv[3][3], dv[3][4],
              tv[3][0], tv[3][1], tv[3][2], tv[3][3], tv[3][4],
+             dv[3][0], dv[3][1], dv[3][2], dv[3][3], dv[3][4],
              SunRoundDeg(az_d), SunRoundDeg(pol_d), SunRoundDeg(az_l), SunRoundDeg(pol_l),
              disc_b, disc_el, src_b, src_el, gap);
     } else {
@@ -1583,23 +1612,36 @@ static void SunKeepArc(void)
             ++g_sun_lost;
             snprintf(msg, sizeof msg,
                      STAMP " sun keys lost: %s was armed again and the client's own tables no"
-                            " longer hold what this DLL wrote there. the first key of each track,"
-                            " as the live radians read back, then what the preset's own table"
-                            " wants there: light azimuth 0x%x reads %d deg and wants %d;"
-                            " light polar 0x%x reads %d deg wants %d; disc azimuth 0x%x reads"
-                            " %d deg wants %d; disc polar 0x%x reads %d deg wants %d. the stock"
-                            " keys are 225 127 45 100, so a live four of exactly those is the"
+                            " longer hold what this DLL wrote there. each track's first key as the"
+                            " live bytes read it, a time at +0 and a value at +4, then what the"
+                            " preset's own table wants there: light azimuth 0x%x holds 0.%04u and"
+                            " %d deg and wants 0.%04u and %d; light polar 0x%x holds 0.%04u and"
+                            " %d deg wants 0.%04u and %d; disc azimuth 0x%x holds 0.%04u and"
+                            " %d deg wants 0.%04u and %d; disc polar 0x%x holds 0.%04u and"
+                            " %d deg wants 0.%04u and %d. the stock first keys are 0.0000 and 225"
+                            " deg, 0.0000 and 127 deg, 0.2292 and 45 deg and 0.2292 and 100 deg, so"
+                            " a live four of exactly those pairs is the"
                             " day-night file building its own tracks behind the guard bits at"
-                            " 0x6d3a10 and 0x6d3b80 and that guard's state is what to look at"
-                            " next; any other four is a write that went somewhere the client"
-                            " does not read. this session prints this line %u of %u times",
+                            " 0x6d3a10 and 0x6d3b80, and the next write here is what gets them"
+                            " back; any other pair is a table something else writes. this session"
+                            " prints this line %u of %u times",
                      sun_presets[which].name,
-                     sun_addr[0], SunRoundDeg(g_sun_live4[0]),
+                     sun_addr[0], (unsigned)(g_sun_live_t4[0] * 10000.0f + 0.5f),
+                     SunRoundDeg(g_sun_live4[0]),
+                     (unsigned)(sun_presets[which].t_az_l[0] * 10000.0f + 0.5f),
                      (int)sun_presets[which].az_l[0], sun_addr[1],
-                     SunRoundDeg(g_sun_live4[1]), (int)sun_presets[which].pol_l[0],
-                     sun_addr[2], SunRoundDeg(g_sun_live4[2]),
+                     (unsigned)(g_sun_live_t4[1] * 10000.0f + 0.5f),
+                     SunRoundDeg(g_sun_live4[1]),
+                     (unsigned)(sun_presets[which].t_pol_l[0] * 10000.0f + 0.5f),
+                     (int)sun_presets[which].pol_l[0], sun_addr[2],
+                     (unsigned)(g_sun_live_t4[2] * 10000.0f + 0.5f),
+                     SunRoundDeg(g_sun_live4[2]),
+                     (unsigned)(sun_presets[which].t_az_d[0] * 10000.0f + 0.5f),
                      (int)sun_presets[which].az_d[0], sun_addr[3],
-                     SunRoundDeg(g_sun_live4[3]), (int)sun_presets[which].pol_d[0],
+                     (unsigned)(g_sun_live_t4[3] * 10000.0f + 0.5f),
+                     SunRoundDeg(g_sun_live4[3]),
+                     (unsigned)(sun_presets[which].t_pol_d[0] * 10000.0f + 0.5f),
+                     (int)sun_presets[which].pol_d[0],
                      (unsigned)g_sun_lost, (unsigned)SUN_LOST_LINES);
             LogMsg(msg);
         }

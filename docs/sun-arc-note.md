@@ -9,7 +9,7 @@ names the live keys rather than the sky.
 
 Nothing else in the pipeline changed: no new hook, no new file format, no new
 export, and `verify_dll.py` still reports the same hook, the same three detour
-tables and `Load` at RVA 0x2830 — that RVA moved from sv14's 0x2720 because the
+tables and `Load` at RVA 0x27c0 — that RVA moved from sv14's 0x2720 because the
 module grew, not because the contract did.
 
 ## How it is driven
@@ -123,6 +123,17 @@ plus 180°, at the disc's own key times. Those two rules are the whole point of
 the arc: the bearing the ground and water are shaded from always agrees with the
 bearing of the sun you can see — never 180° off it, never pointing up.
 
+One key is one `DNKeyframe`: the TIME at `kv + 8k` and the VALUE at `kv + 8k + 4`
+(`wowdecomp/WoW/Source/WorldClient/DayNight.h:32` says `m_time` at +0000 and
+`m_value` at +0004, and that build's sun tables are the same shapes — 4 azimuth
+keys at 0 0.25 0.5 0.75 all 3.926991, 4 polar keys 2.2165682 / 1.9198623 /
+2.2165682 / 1.9198623, 3 disc azimuth keys at 0.2291667 0.5 0.8958333, 5 disc
+polar keys at 0.2291667 0.4965278 0.5 0.5034722 0.8958333). sv14 wrote values
+first and times second; the first in-game log proved that is the other client's
+arrangement, because the four live first slots it printed were `0 0 13 13` deg —
+which is exactly stock's first-key TIMES, `0.0 0.0 0.2292 0.2292`, in the slot the
+evaluator calls the value of.
+
 The clock windows are two, not five:
 
 | preset | clock window | disc azimuth → light azimuth | disc polar → light polar |
@@ -169,7 +180,7 @@ python build.py .                  # links out\ShadowMaps.dll
 python verify_dll.py out\ShadowMaps.dll
 ```
 
-The sv15 image is 160,768 bytes.
+The sv15 image is 161,280 bytes.
 
 Ship it as sv13 ships it: `ShadowMaps.dll`, `ShadowMaps.def`, `ShadowMaps.dll.id`
 in `dlls.txt`, and rename the shadow file to `shadowmaps.dat` **next to the
@@ -281,7 +292,7 @@ Then, in order:
    and 200 giant lines is more than the log keeps:
 
    ```
-   sv15 sun read back: what the client's own tracks hold now, and what its evaluator makes them give at the client's own phase. the phase at 0xce9b60+4 is 0.3681, half-minute 1060 of 2880, and arc-swnw is the preset this visit wrote. the live keys, values then their times, degrees as the radians at each address read back: light azimuth 0xce8d90 = 495 517 540 585 deg at 0.2292 0.3646 0.5000 0.8958; light polar 0xce8db0 = 127 110 127 110 deg at 0.0000 0.2500 0.5000 0.7500; disc azimuth 0xce8d4c = 315 360 405 deg at 0.2292 0.5000 0.8958; disc polar 0xce8d64 = 100 5 5 5 100 deg at 0.2292 0.4965 0.5000 0.5035 0.8958. interpolating those at the phase gives the disc at azimuth 338 deg and polar 51 deg and the light azimuth 518 deg and polar 118 deg, so the disc sits at bearing 338 deg, 39 deg above the horizon, and the shading comes from bearing 338 deg, 28 deg high: they are 0 deg apart. read the two bearings against the sky you are looking at: a disc bearing that matches makes the tables and the handedness right and the arc's own angles are what to change; a shading bearing 180 apart from the disc is the light pointing at the sun rather than away from it; and a disc polar that should keep it below the horizon at a night hour and does not is a key time belonging to another track. the azimuths are 0 = west, 90 = north, 180 = east, 270 = south, the frame the stock sun's own NORTH WEST pins
+   sv15 sun read back: what the client's own tracks hold now, and what its evaluator makes them give at the client's own phase. the phase at 0xce9b60+4 is 0.3681, half-minute 1060 of 2880, and arc-swnw is the preset this visit wrote. the live keys, each key a time at +0 and a value at +4, printed as a track's times then its values, degrees as the radians at each address read back: light azimuth 0xce8d90 at 0.2292 0.3646 0.5000 0.8958 holds 495 517 540 585 deg; light polar 0xce8db0 at 0.0000 0.2500 0.5000 0.7500 holds 127 110 127 110 deg; disc azimuth 0xce8d4c at 0.2292 0.5000 0.8958 holds 315 360 405 deg; disc polar 0xce8d64 at 0.2292 0.4965 0.5000 0.5035 0.8958 holds 100 5 5 5 100 deg. interpolating those at the phase gives the disc at azimuth 338 deg and polar 51 deg and the light azimuth 518 deg and polar 118 deg, so the disc sits at bearing 338 deg, 39 deg above the horizon, and the shading comes from bearing 338 deg, 28 deg high: they are 0 deg apart. read the two bearings against the sky you are looking at: a disc bearing that matches makes the tables and the handedness right and the arc's own angles are what to change; a shading bearing 180 apart from the disc is the light pointing at the sun rather than away from it; and a disc polar that should keep it below the horizon at a night hour and does not is a key time belonging to another track. the azimuths are 0 = west, 90 = north, 180 = east, 270 = south, the frame the stock sun's own NORTH WEST pins
    ```
 
    The short line, which every write after the fourth gets:
@@ -301,11 +312,20 @@ Then, in order:
    the client. A visit that finds the key gone found something that replaced the
    write between visits, and the line names what replaced it. This kind of fault
    is not the same as a write that never happened, and the four live readings
-   tell them apart — the stock four are `225 127 45 100`:
+   tell them apart — the stock first pairs are `0.0000 / 225 deg, 0.0000 / 127 deg,
+0.2292 / 45 deg, 0.2292 / 100 deg`:
 
    ```
-   sv15 sun keys lost: arc-swnw was armed again and the client's own tables no longer hold what this DLL wrote there. the first key of each track, as the live radians read back, then what the preset's own table wants there: light azimuth 0xce8d90 reads 225 deg and wants 495; light polar 0xce8db0 reads 127 deg wants 127; disc azimuth 0xce8d4c reads 45 deg wants 315; disc polar 0xce8d64 reads 100 deg wants 100. the stock keys are 225 127 45 100, so a live four of exactly those is the day-night file building its own tracks behind the guard bits at 0x6d3a10 and 0x6d3b80 and that guard's state is what to look at next; any other four is a write that went somewhere the client does not read. this session prints this line 1 of 4 times
+   sv15 sun keys lost: arc-swnw was armed again and the client's own tables no longer hold what this DLL wrote there. each track's first key as the live bytes read it, a time at +0 and a value at +4, then what the preset's own table wants there: light azimuth 0xce8d90 holds 0.0000 and 225 deg and wants 0.2292 and 495; light polar 0xce8db0 holds 0.0000 and 127 deg wants 0.0000 and 127; disc azimuth 0xce8d4c holds 0.2292 and 45 deg wants 0.2292 and 315; disc polar 0xce8d64 holds 0.2292 and 100 deg wants 0.2292 and 100. the stock first keys are 0.0000 and 225 deg, 0.0000 and 127 deg, 0.2292 and 45 deg and 0.2292 and 100 deg, so a live four of exactly those pairs is the day-night file building its own tracks behind the guard bits at 0x6d3a10 and 0x6d3b80, and the next write here is what gets them back; any other pair is a table something else writes. this session prints this line 1 of 4 times
    ```
+
+   One batch of four of these at one timestamp is the expected shape of a session:
+   the DLL is loaded before the first frame, so the client builds its own tracks
+   the first frame it is in a world and that is the rebuild this line names. The
+   next visit writes the keys back and the visits after it print nothing. Four
+   lines at one timestamp and none later is that rebuild, and the sun is on the
+   arc from then on; lines that keep coming at later visits mean something
+   replaces the write every visit, and that is what a stock sun in game means.
 
 7. The rebuild above, seen from the other side: the client put its own stock
    keys back, and the line that names that event says so in words. It and the
