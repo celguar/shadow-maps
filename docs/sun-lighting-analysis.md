@@ -434,19 +434,111 @@ reading the bytes rather than by believing them:
 A preset is a pair: the `.dat` shadow set (already the project's job) plus the sun key set.
 The bake's bearing slider must equal the preset's sun bearing at the sampled hour, and its height
 must equal `light polar − 90°`. `README.md:124-128` already lists the vanilla pairs; here they are
-with the sun-key side and the new arc rows filled in.
+with the sun-key side and the arc rows filled in.
 
-| Preset | sun bearing | light polar | bake pair (bearing / height) | vanilla? |
+Stock rows, from the editor's own table — all of them at the stock 45° bearing. Pairs throughout
+this section are `height / rotation`, the order the editor's own table uses
+(`MainWindow.ShadowPanel.cs:219-228`):
+
+| Preset | sun bearing | light polar | bake pair (height / rotation) | vanilla? |
 | --- | --- | --- | --- | --- |
 | Blizzlike — stock | 45° | 127° (midnight/noon), 110° (06/18) | `29 / 33` → 45.5°, 47.2° | yes, a no-op-looking calibration variant |
 | Noon | 45° | 127° | `34 / 43` → 44.7°, 37.3° | yes |
 | Morning | 45° | 110° | `42 / 63` → 45.3°, 19.7° | yes, the set the shipped `.dat` came from |
 | Evening | 45° | 110° | `42 / 63` | identical to Morning in vanilla (`README.md:126`) |
 | Night — white moon | 45° | 35° polar ⇒ the moon's own track | `24 / 26` → 45.4°, 55.2° | vanilla ships one static map for every hour (`README.md:128`) |
-| **Arc, sampled 06:00** | 218° (south east) | 110° (20°) | re-bake at bearing ≈ 218°, height ≈ 20° | new |
-| **Arc, sampled 12:00** | 135° (south west) | 127° (37°) | re-bake at bearing ≈ 135°, height ≈ 37° | new |
-| **Arc, sampled 18:00** | 68° (west of north west) | 110° (20°) | re-bake at bearing ≈ 68°, height ≈ 20° | new |
-| **Arc, sampled 21:00** | 45° (north west) | stock's own — this hour is `arc-stock`, stock written back | `42 / 63` unchanged | the vanilla evening |
+
+The arc rows below are what to actually re-bake: each payload is baked for the stamp where its
+bearing error is smallest over the hours it owns — "owns" meaning the hours nearer that stamp than
+any other, which is the same rule as picking the nearest preset when the clock crosses. Stamps are
+on the whole/half game hour so they dial in directly, and the pair is Salmiak's
+`Sun height` / `Sun rotation` slider value, with the bearing and elevation that pair reproduces
+next to it, and the worst error over the hours it owns.
+
+Pairs below are `height / rotation` again, the order the editor's own table uses
+(`MainWindow.ShadowPanel.cs:219-228`) — so the pair column is slider values, and the
+elevation that pair produces is in the "reproduces" column.
+
+| Re-bake at | serves | sun then (bearing / height) | slider pair | reproduces | worst over its hours |
+| --- | --- | --- | --- | --- | --- |
+| **06:30** | 05:30 – 07:45 | 217° / 22° | `-29 / 295` | 211.5°, 21.7° | 17.6° bearing, 3.3° height |
+| **09:00** | 07:45 – 10:15 | 177° / 29° | `3 / 299` | 176.6°, 29.0° | 17.3°, 4.0° |
+| **11:30** | 10:15 – 13:15 | 142° / 35° | `30 / 312` | 142.2°, 35.4° | 21.2°, 3.4° |
+| **15:00** | 13:15 – 16:45 | 101° / 28° | `60 / 340` | 101.2°, 28.0° | 19.8°, 5.4° |
+| **18:30** | 16:45 – 20:00 | 62° / 22° | `55 / 50` | 61.8°, 21.6° | 19.8°, 4.0° |
+| **21:00 – 05:30** | stock, unchanged | 45° / 26°…37° | `29 / 33` stock payload | 45.5°, 47.2° | 0.5° bearing, 10…26° height |
+
+So: **five re-bakes for the day, plus the stock payload kept for the evening and night.** It is
+the knee of the curve — a 4-payload plan errs up to 27.3° and a 6-payload plan only improves
+21.2° to 17.6° — and the errors are the worst over a payload's own window, at its edges. Bearing error, not height error,
+is what the eye reads: height only travels 20°…37° (`pol_l` 110°…127°) while bearing travels
+180°, so a payload's height is right within ±5° and its bearing is off by up to ~21° at the
+window edges.
+
+#### 4.5.1 Where the payload gets picked, and what that caps
+
+The five day rows share **one sun key set**. The arc's tracks do not change per hour — only the
+payload does — so `sun_presets[]` stays two entries (`arc-senw`, `arc-stock`) and the N-way
+choice lives entirely on the data side. That is the whole reason the sun module and the bake plan
+stay separable.
+
+Swapping payloads mid-session is the part that cannot be done cleanly, and the reason is the
+upload, not the write: the mod's writes happen at chunk init (the hook at `0x6AF5F3`, which is
+where the chunk's `ofsMCSH`/`sizeMCSH` are read and its shadow texture built), so a chunk's
+payload is whatever it was given the last time that chunk was initialized. A chunk already resident
+on screen is never re-initialized, so no in-zone swap can reach it. A map enter or switch
+re-initializes every chunk of the new map, so **map enter is the first point where a different
+payload is guaranteed to take** — that is the plan, latch the payload run at map enter and let
+every chunk write of that visit use it.
+
+What that plan does and does not buy:
+
+* The stamp table above *is* the catalog to latch from, and the nearest-stamp rule is the
+  "closest preset at map enter" rule, so the worst-error columns are exactly what a visit shows
+  when it starts and ends near one stamp: 5 day payloads → 21.2°, 4 → 27.3°, 6 → 17.6°.
+* The drift term is what a latch leaves behind, and stock makes it small. The client's own clock
+  scale word `+0x2c` is `0x3c888889`, **1/60 game minutes per real second** — one game minute per
+  real minute (`benilla-re systems/gametime.md:18-19`), so a stock day is 24 real hours.
+  The arc's bearing travels 180° over the 14.5 game hours of 05:30→20:00, so ~12.4° of bearing
+  per real hour. A payload latched at the nearest stamp is within the table's ~21° for about an
+  hour and a half of uninterrupted play in one map — 1.5 game hours, the edge of its own window —
+  and it takes about seven real hours in the same map to reach the 89.7° that a single payload
+  would give at the far ends of the arc (the arc's mid stamp, 12:00 at 135°, is that far off at
+  both ends). The
+  mod's clock-scale digits exist to compress that for testing, and they are why a bake plan must
+  be read at 1:1 rather than at the test speed.
+* Re-picking per chunk visit is therefore not the answer to a real problem: it would bound the
+  drift and cost memory instead — six runs of the Eastern Kingdoms set is 6 × 66,413 payloads
+  × 512 bytes ≈ 192 MB resident against the 32 MB one run costs today (`README.md:474`) — and it
+  leaves chunks that never re-initialized holding the previous run's shadows, the mixed field
+  gotcha 7 already names. Latch at map enter; nothing else is worth paying for.
+
+So for a continent you stay in for a whole game day, the latched payload is right for the hour you
+entered at and drifts after that; for instances and short visits, the latch is the whole answer.
+
+One more row is worth the slot, and at real-time scale it is not a corner case: from 00:00 to
+05:30 — five and a half real hours of play — `arc-senw` clamps the light at the sunrise bearing,
+225° south east, with height drifting 37°→21°.
+That bearing is **constant**, so a single payload fits it exactly — `-38 / 308` reproduces 224.8°
+and 29.0°: 0.2° bearing error over the whole plateau, 8° of height. It is 180° from the stock
+night payload, so leaving that window stock means shadows point away from the light through
+00:00–05:30.
+
+**The sliders take the whole compass, so every row above is dialable.** The bake's own ranges are
+`Make("Sun height", 0, -80, 80)` and `Make("Sun rotation", 1, 0, 360)`
+(`MainWindow.ShadowPanel.cs:231-232`), and the ray Salmiak builds from them is
+`pitch = clamp(ShadowSunHeight, -80, 80)`, `yaw = ShadowSunRotation` with
+`dir = (-sin pitch, cos pitch cos yaw, -cos pitch sin yaw)`
+(`GlViewport.TerrainBrush.cs:966-973`), in the GL frame `x = -adtY`, `z = -adtX`, `y = height` —
+i.e. an adt-frame direction `(cos H sin R, sin H, cos H cos R)`. Salmiak's own inverse for the
+tooltip is `H = asin(cos e sin A)`, `R = atan2(cos e cos A, sin e)` with `A` the client's raw track
+azimuth toward the sun and `e = light polar − 90` (`MainWindow.ShadowPanel.cs:52`). That inverse
+reproduces the editor's claimed pairs exactly (`29/33` → 45.50°, 47.18°; `42/63` → 45.30°, 19.72°;
+`34/43` → 44.68°, 37.32°; `24/26` → 45.44°, 55.19°), so the numbers above are the editor's own
+convention, not a re-derivation. The README shows only ~45° pairs because Salmiak's five built-in
+presets are all stock-shaped; nothing in the bake rejects 218°, 135° or 68°, and a negative height
+is a legal slider value — it is what the inverse returns for the south-east half of the compass,
+not a below-horizon sun.
 
 The arc rows are the *sampled* hour: one arc crosses the sky, so one baked
 `MCSH` set cannot follow it, and the honest pair is per hour you bake for. That
@@ -629,6 +721,15 @@ Ideas worth borrowing, in the order they would change this project:
    (`0x670db0`, `0x69e280`); nothing documented shows what writes the directional word's alpha
    otherwise. This bounds how far a non-sky-open entity can drift toward the sun direction, not
    whether exteriors follow it.
-3. Whether the bake's bearing slider accepts the full 0–360 compass or is clamped to the
-   north-west quarter. `README.md:122-144` shows only ~45° pairs. The arc presets need 218°,
-   135° and 68° — verify in the bake before shipping those rows.
+3. ~~Whether the bake's bearing slider accepts the full 0–360 compass or is clamped to the
+   north-west quarter~~ — **settled: full compass.** `Make("Sun height", 0, -80, 80)` and
+   `Make("Sun rotation", 1, 0, 360)` (`MainWindow.ShadowPanel.cs:231-232`), and the ray built from
+   them clamps only the pitch, never the yaw (`GlViewport.TerrainBrush.cs:966-973`). Every row of
+   the §4.5 table is therefore dialable as written, negative heights included.
+4. The pre-dawn plateau (00:00–05:30) is the one window whose sun-side fix is cheaper than its
+   data-side fix. It clamps at the sunrise bearing 225° while the stock night payload is at 45°,
+   so the light flips 180° at midnight. Writing the first `az_d` key unwrapped — 405° at
+   t = 0 instead of 225° clamped — would carry it through north east, east, south east into the
+   dawn key, continuous at both ends and covered by the stock payload at midnight. `sin`/`cos` of
+   405° are 45°'s, so nothing else about the arc changes. Untested on the ground, and it is sun-arc
+   work, not bake work.
