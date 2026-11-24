@@ -119,7 +119,9 @@ sv15 writes is what that visit taught:
   writing is what let a morning arc survive into the evening.
 
 The polar angles stay stock's, and the light azimuth stays the disc azimuth
-plus 180°, at the disc's own key times. Those two rules are the whole point of
+plus 180°, at the disc's own key times — plus one light key 20 minutes past the
+disc's first, 05:50, which is what keeps the morning shading within a few degrees
+of the sun instead of tens. Those two rules are the whole point of
 the arc: the bearing the ground and water are shaded from always agrees with the
 bearing of the sun you can see — never 180° off it, never pointing up.
 
@@ -138,8 +140,8 @@ The clock windows are two, not five:
 
 | preset | clock window | disc azimuth → light azimuth | disc polar → light polar |
 |---|---|---|---|
-| `arc-senw` | 00:00–20:00 | 225 135 45 @ 05:30 12:00 20:00 → 405 360 315 225 @ 05:30 08:45 12:00 20:00 | stock's own: 100 5 5 5 100 @ 05:30 11:55 12:00 12:05 21:30 → 127 110 127 110 @ 00:00 06:00 12:00 18:00 |
-| `arc-stock` | 20:00–24:00 | stock's own tables, written back — 45° on all three keys → 225° on all four | stock's own, as above |
+| `arc-senw` | 00:00–21:30 | 225 135 45 @ 05:30 12:00 21:30 → 225 405 315 225 @ 05:30 05:50 12:00 21:30 | stock's own: 100 5 5 5 100 @ 05:30 11:55 12:00 12:05 21:30 → 127 110 127 110 @ 00:00 06:00 12:00 18:00 |
+| `arc-stock` | 21:30–24:00 | stock's own tables, written back — 45° on all three keys → 225° on all four | stock's own, as above |
 
 Bearing convention, pinned by an in-game sky check and not by the bytes: azimuth is
 measured from +X toward +Y and reads **0° = north, 90° = west, 180° = south,
@@ -159,25 +161,43 @@ disc polar passes 90°:
 | clock | stock | `arc-senw` |
 |---|---|---|
 | horizon crossings | 06:10 rises, 20:30 sets | 06:10 rises, 20:30 sets — same, because the polar is stock's |
-| 05:30, stock's sunrise hour | disc az 45° north west, elev −10° | disc az 225° south east, elev −10° |
-| Kalimdor 08:50 | disc az 45° north west, elev +39° | disc az 179° south, elev +39° |
-| Kalimdor noon | disc az 45° north west, elev +85° | disc az 135° south west, elev +85° |
-| 16:00 | disc az 45° north west, elev +45° | disc az 90° west, elev +45° |
-| 19:50 | disc az 45° north west, elev +7° | disc az 47° north west, elev +7° |
-| EK 20:00, the handover | disc az 45° north west, elev +5° | disc az 45° north west, elev +5° — the arc is already stock's bearing there |
-| EK 20:30 | disc az 45° north west, elev +0° | *(not this preset: 20:30 is `arc-stock`, which is stock)* |
-| EK 21:50 | disc az 45° north west, elev −10° | *(not this preset: 21:50 is `arc-stock`, which is stock)* |
+| 05:30, stock's sunrise hour | disc az 45° north west, elev −10° | disc az 225° south east, elev −10°; the shading is still at the night's 45° and swings onto the disc by 05:50 |
+| Kalimdor 08:50 | disc az 45° north west, elev +39° | disc az 179° south, elev +39°; shading from 181°, 2° apart |
+| Kalimdor noon | disc az 45° north west, elev +85° | disc az 135° south west, elev +85°; shading from 135°, 0° apart |
+| 16:00 | disc az 45° north west, elev +45° | disc az 97° west, elev +45°; shading from 97°, 0° apart |
+| 19:55 | disc az 45° north west, elev +6° | disc az 60° north west, elev +6°; shading from 60°, 0° apart |
+| EK 20:00 | disc az 45° north west, elev +5° | disc az 59° north west, elev +5° — **still walking west**, shading from 59° |
+| EK 20:30, the set | disc az 45° north west, elev +0° | disc az 54°, elev +0° — on the horizon and still moving west |
+| EK 21:00 | disc az 45° north west, elev −5° | disc az 50°, elev −5°, still moving west |
+| 21:30, stock's sunset key | disc az 45° north west, elev −10° | disc az 45° north west, elev −10° — the arc is dead on stock's bearing here, and `arc-stock` writes the same keys on |
 
 So the arc rises in the south east, on stock's own sunrise hour, passes due south
-in the morning and due west in the afternoon, and is back on stock's own north
-west bearing by 20:00 — half a turn walked across the south and west, the
-clockwise-on-the-map sense a real sun has, instead of stock's sun, whose azimuth
-never moves off the north west diagonal at all. It is dead on stock's own azimuth at 20:00,
-which is why `arc-stock` taking over at 20:00 is not a jump, and the whole evening
-— the set at 20:30, the light from the north west, the sunset on the horizon at
-21:00 — is stock's own pixels, because the keys written there are stock's own.
-The shading's bearing is the disc's bearing at every hour of that table, which is
-what the readback line's last number, 0 deg apart, says.
+in the morning and due west in the afternoon, and is back on stock's own north west bearing at
+21:30 — half a turn walked across the south and west, the clockwise-on-the-map sense a real sun
+has, instead of stock's sun, whose azimuth never moves off the north west diagonal at all. It is
+dead on stock's own azimuth at 21:30, stock's own sunset key, which is why `arc-stock` taking
+over there is not a jump, and the whole evening — the set at 20:30, the light from the north west,
+the sunset on the horizon at 21:00 — is stock's own light, because the keys written there are
+stock's own.
+
+The reversal the first arc showed in game is what these key times are set by. The earlier arc's
+last azimuth key sat at 20:00, and `0x6cf6c0` is cyclic, not clamped: past the last key it
+interpolates along the leg that closes the day, toward the first key, so the disc turned back from
+north west through west, south west and south while it was still above the horizon and the shading
+followed it. Run the shipped keys through the client's own rule instead, and the disc's azimuth
+descends all the way — 225° at 05:30, 135° at noon, 59° at 20:00, 54° at the set, 50° at 21:00,
+45° at 21:30 — and the shading's bearing is the disc's to 0° over the afternoon and 4.6° at the
+worst over the day (the gap sits at 05:50, the light's own second key, the one the disc does not
+have). That is what the readback line's last number says.
+
+Through the night, 21:30 back to 05:30, the shading does not follow the disc and cannot, because
+the disc sits 10° under the horizon there: `arc-senw` holds stock's own 225° light azimuth at its
+first and its last key both, so the leg that closes the day is flat and the shading stays north
+west the whole way, which is stock's own night. The disc's own azimuth, which three keys cannot
+also make flat, unwinds from 45° at 21:30 to 101° at midnight to 157° at 02:30 to 225° at 05:30
+under that horizon; the one consumer of it that draws is the **sun glare**, which takes the disc's
+position (`benilla-re systems/lighting/celestial.md:85-86`), so what to look for at 02:00 is a
+glare low on the horizon travelling the north west quadrant while the ground stays put.
 
 Before anything is written the four tracks are pinned: each must hold the stock
 keys this build was read from, within the degree a float rounds to, or be an
@@ -246,6 +266,17 @@ and a whole game day in 24 real seconds. At 9 a day is 160 real seconds and an
 hour of sky turns in 7. The scale is only re-written when the live float is not
 already what this DLL wrote, which is what keeps the server re-sending its own
 1/60 from compounding off: this is a test control, not a shipping one.
+
+The lines quoted under the steps below are transcribed from the session that ran the **first**
+arc — the one whose last azimuth key sat at 20:00. The words around the numbers are what the code
+writes and have not changed, and so is the order of the keys, but the arc's own key values and
+times in them are that arc's, not the shipped one's: read the shipped table above
+(`225 405 315 225` at `05:30 05:50 12:00 21:30` for the light azimuth, `225 135 45` at
+`05:30 12:00 21:30` for the disc azimuth), and expect the readback's last number to be 0° over the
+afternoon and 2° at 08:50 rather than 0° at every hour, since the light's second key now sits 20
+minutes past the disc's first rather than at 08:45. The window boundaries in the quoted text are
+the earlier arc's too: `arc-stock` now begins at 21:30, so a world entered at 21:20 gets the arc
+and one entered at 22:00 gets the write-back.
 
 Then, in order:
 
@@ -383,13 +414,16 @@ what mode `h` gives you without any extra work.
   midnight. Monotonic through the wrap is what makes the interpolation one
   continuous forward rotation. The client's `fsin`/`fcos` read either spelling
   the same.
-* The arc's light azimuth carries four keys at the disc's own hours plus 08:45 —
-  05:30, 08:45, 12:00, 20:00 — rather than stock's 00:00 06:00 12:00 18:00, so the
-  two azimuth tracks are the same sweep shifted by 180° at the same hours and the
-  readback says the shading bearing is the disc's bearing at every hour of the day.
-  Keying the two tracks at different hours is what let each interpolate its own
-  leg, and sv14 did exactly that: the shading came from a bearing 180° off the
-  disc at some hours and a few degrees off it at others. The night leg — 20:00
-  back to 05:30 — is the cyclic one and interpolates along itself, which is as
-  much of the night as four keys can cover, and the disc is under the horizon
-  through all of it, so it has nothing to disagree about.
+* The arc's light azimuth carries four keys at the disc's own hours plus one 20 minutes past the
+  disc's first — 05:30, 05:50, 12:00, 21:30 — rather than stock's 00:00 06:00 12:00 18:00, so the
+  two azimuth tracks are the same sweep shifted by 180° at the same hours and the readback says the
+  shading's bearing is the disc's to 0° over the afternoon and 4.6° at its worst, at 05:50. The one
+  key the light has and the disc does not is what buys: keying it at 08:45 instead, where the first
+  arc did, sat the shading 40° behind the disc by 05:50 and 61° by 06:30 while the sun was climbing.
+  Keying the two tracks at different hours is what let each interpolate its own leg, and sv14 did
+  exactly that: the shading came from a bearing 180° off the disc at some hours and a few degrees
+  off it at others. The night leg — 21:30 back to 05:30 — is the cyclic one and is **flat** here,
+  because the light's first and last azimuth keys hold the same 225°: the shading stays north west
+  through all of it, which is stock's own night. The disc's own azimuth is the track that cannot be
+  made flat with three keys and unwinds from 45° through 101° at midnight to 225° under that horizon;
+  the glare is the only thing that reads it.

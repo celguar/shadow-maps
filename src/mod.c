@@ -126,7 +126,7 @@
  *  while turning it into half-minutes. sv14 turns it the same way -- round(tod
  *  * 2880), 2880 being the half-minutes in a day -- and picks the preset whose
  *  window of half-minutes holds it: the day is cut into two windows, arc-senw
- *  from midnight to 20:00 and arc-stock from 20:00 to midnight, so the hour the
+ *  from midnight to 21:30 and arc-stock from 21:30 to midnight, so the hour the
  *  world was entered at names the arc, and arc-stock is the stock sun. sv14 cut
  *  it into five windows, four arcs and the stock sun, which was never one sun
  *  crossing one sky -- see the sv15 note below -- and sv15 also writes the stock
@@ -198,19 +198,22 @@
  *  height, the rise at 06:10, the set at 20:30 and the strength of the day are
  *  stock's hour for hour, and moves only the azimuth: the disc runs 225 deg at
  *  the sunrise hour, south east, 135 deg at noon, south west, and 45 deg at
- *  20:00, north west -- half a turn walked across the south and west, the
- *  clockwise-on-the-map sense a real sun has, and it is dead on stock's own
- *  bearing when arc-stock takes over, so the handover is not a jump and the
- *  evening is stock's own light. Which way the azimuth is counted came from an
- *  in-game sky check and not from the bytes: stock's 45 deg reads north west
- *  under either hand, so only a bearing off that diagonal says which hand it is,
- *  and the arc that shipped first went the wrong way, north east through north
- *  to north west, a southern-hemisphere sun. The light azimuth is kept the
- *  disc's antipode as stock keeps it, so the shading comes from where the disc
- *  is. One arc up to 20:00 and stock's own keys from 20:00, not sv14's five
- *  windows of four arcs and stock: four arcs were never one sun crossing one
- *  sky, and the visits showed the disc, the ground and the objects naming three
- *  different places for the same light.
+ *  21:30, north west, stock's own sunset hour -- half a turn walked across the
+ *  south and west, the clockwise-on-the-map sense a real sun has, and it is dead
+ *  on stock's own bearing when arc-stock takes over, so the handover is not a
+ *  jump and the evening is stock's own light. Which way the azimuth is counted
+ *  came from an in-game sky check and not from the bytes: stock's 45 deg reads
+ *  north west under either hand, so only a bearing off that diagonal says which
+ *  hand it is, and the arc that shipped first went the wrong way, north east
+ *  through north to north west, a southern-hemisphere sun. The light azimuth is
+ *  kept the disc's antipode as stock keeps it, so the shading comes from where
+ *  the disc is, and it keeps stock's own 225 deg through the whole night, from
+ *  the sunset key back to the sunrise key, because the light's first key and its
+ *  last key hold that same value and the leg that closes the day is flat. One
+ *  arc up to 21:30 and stock's own keys from 21:30, not sv14's five windows of
+ *  four arcs and stock: four arcs were never one sun crossing one sky, and the
+ *  visits showed the disc, the ground and the objects naming three different
+ *  places for the same light.
  *
  * runs came back with their install lines and no new crash: mode a (the whole
  * 34 MB arena resident, no hook), mode c (the store and landing at 0x6AF5F0,
@@ -1115,12 +1118,32 @@ static const float sun_stock_t[4][5] = {
  * and that is why it read badly. This arc takes the real one: the disc starts
  * at 225 deg, south east, at the hour stock calls sunrise; it is at 135 deg,
  * south west, at noon, where stock says it is 85 deg up; and it reaches 45
- * deg, north west, at 20:00, the hour its own window ends. It walks half a
- * turn across the south and west instead of a quarter turn across the north,
- * and it is dead on stock's own bearing when arc-stock takes over there, so
- * the handover is not a jump. Only the azimuth keys stop at 20:00: the polar
- * keys stay stock's, 21:30 and all, because the polar is what sets the sun's
- * height and its set at 20:30, and that has to match stock hour for hour.
+ * deg, north west, at 21:30, the hour stock's own sunset key sits on. It walks
+ * half a turn across the south and west instead of a quarter turn across the
+ * north, and it is dead on stock's own bearing when arc-stock takes over there,
+ * so the handover is not a jump. The azimuth keys now run to the same 21:30 as
+ * the polar keys: the sun keeps walking west until the hour it sets, instead of
+ * reaching north west at 20:00 and then walking back, not standing still.
+ * Only the polar keys stay stock's, unchanged, so the sun's height, its rise at
+ * 06:10 and its set at 20:30 match stock hour for hour.
+ *
+ * Why the keys have to run all the way, and what happened when they did not:
+ * 0x6cf6c0 is cyclic, not clamped. With no key at or above the phase it takes
+ * i = 0 and j = the last key and adds 1 to d = time[i] - time[j] and to
+ * e = phase - time[j], so past the last key the track lerps toward the FIRST
+ * key across the day boundary (benilla-re systems/lighting/celestial.md#tracks
+ * and the same rule replayed in SunEvalTrack below). An arc whose last azimuth
+ * key sits at 20:00 therefore does not stop there -- it turns around and walks
+ * back from north west through west, south west and south to the sunrise value,
+ * which is the sun visibly changing direction while it is still above the
+ * horizon, and the shading going the same way behind it. So every hour of the
+ * day needs a key, and the leg that closes the day, from the last key to the
+ * first, is the one that carries the night: the light's last key and its first
+ * key hold the SAME value, so that leg is flat and the shading stays north west
+ * from sunset all the way through midnight to sunrise -- and it is stock's own
+ * 225 deg, so the night is stock's shading. The light only leaves that bearing
+ * at the second key, 20 minutes after the sunrise key, where the day's arc
+ * begins.
  * Five windows holding four arcs and the stock sun were never one sun crossing
  * one sky, and the visits showed it: the disc, the ground and the objects named
  * three different places for the same light. */
@@ -1132,14 +1155,14 @@ static const struct SunPreset {
     float t_az_l[4], t_pol_l[4];           /* their key times                */
     float t_az_d[3], t_pol_d[5];
 } sun_presets[] = {
-    { "arc-senw",    0, 2400,
-      { 405.0f, 360.0f, 315.0f, 225.0f }, { 127.0f, 110.0f, 127.0f, 110.0f },
+    { "arc-senw",    0, 2580,
+      { 225.0f, 405.0f, 315.0f, 225.0f }, { 127.0f, 110.0f, 127.0f, 110.0f },
       { 225.0f, 135.0f,  45.0f },         { 100.0f,   5.0f,   5.0f,   5.0f, 100.0f },
-      { 0.2291667f, 0.3645833f, 0.5f, 0.8333333f },
+      { 0.2291667f, 0.2430556f, 0.5f, 0.8958333f },
       { 0.0f, 0.25f, 0.5f, 0.75f },
-      { 0.2291667f, 0.5f, 0.8333333f },
+      { 0.2291667f, 0.5f, 0.8958333f },
       { 0.2291667f, 0.4965278f, 0.5f, 0.5034722f, 0.8958333f } },
-    { "arc-stock",   2400, SUN_HMIN_DAY,
+    { "arc-stock",   2580, SUN_HMIN_DAY,
       { 225.0f, 225.0f, 225.0f, 225.0f }, { 127.0f, 110.0f, 127.0f, 110.0f },
       {  45.0f,  45.0f,  45.0f },         { 100.0f,   5.0f,   5.0f,   5.0f, 100.0f },
       { 0.0f, 0.25f, 0.5f, 0.75f },

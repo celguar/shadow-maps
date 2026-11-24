@@ -375,45 +375,64 @@ narrow. Three things the sketch assumed were wrong:
   hand. So 315° is north east, 0° is north, and the azimuth the client wants
   **decreases** as the sun walks east through south to west. The arc that ships
   is that half of the sky: **225° (south east) at 05:30, 135° (south west) at
-  noon, 45° (north west) at 20:00**, half a turn walked across the south and
+  noon, 45° (north west) at 21:30**, half a turn walked across the south and
   west, which keeps vanilla's north west at dusk where the shipped `MCSH`
-  presets are and where an evening has to match stock.
+  presets are and where an evening has to match stock — and it ends on stock's
+  own sunset key, not an hour before it.
 * **one arc, not one window per hour.** The four tracks are one global block
   that the day-night file builds once behind the guard bits at `0x6d3a10` and
   `0x6d3b80`; five windows holding five different arcs were never one sun
   crossing one sky, and the visits showed the disc, the ground and the objects
   disagreeing about where the light was. sv15 has two windows: the arc from
-  00:00 to 20:00 and **stock written back** from 20:00 to 24:00 — writing the
+  00:00 to 21:30 and **stock written back** from 21:30 to 24:00 — writing the
   stock keys, not nothing, because writing nothing is what let a morning arc
-  survive into the evening. The arc's azimuth keys end at 0.8333333 (20:00),
-  not at stock's own 0.8958333 (21:30), because at 20:00 the arc's azimuth is
-  already 45°, stock's own: the write-back picks the same bearing up rather than
-  jumping, and the polar tracks keep stock's own times and values, which is what
-  keeps the set at 20:30.
+  survive into the evening. And the arc's own azimuth keys run to stock's own
+  0.8958333 (21:30), not to an hour before it: `0x6cf6c0` is cyclic, not clamped,
+  so with no key at or above the phase it takes i = 0 and j = the last key, adds
+  1 to d = time[i] − time[j] and to e = phase − time[j], and interpolates ALONG
+  that closing leg — an arc whose last azimuth key sits at 20:00 does not stop
+  there, it turns around and walks back from north west through west, south west
+  and south to the sunrise value, which is the sun visibly changing direction
+  while it is still above the horizon, and the shading going the same way behind
+  it. The polar tracks keep stock's own times and values, which is what keeps the
+  set at 20:30.
 
 What ships, `arc-senw` (0° = north, 90° = west, 180° = south, 270° = east; polar from the sky's
 top), in the client's own key counts 4 / 4 / 3 / 5:
 
 | track | time | value |
 | --- | --- | --- |
-| `0xce8d90` light azimuth (4) | 0.2291667 (05:30) | 405° |
-| | 0.3645833 (08:45) | 360° |
+| `0xce8d90` light azimuth (4) | 0.2291667 (05:30) | 225° — stock's own bearing |
+| | 0.2430556 (05:50) | 405° |
 | | 0.5000000 (12:00) | 315° |
-| | 0.8333333 (20:00) | 225° |
+| | 0.8958333 (21:30) | 225° |
 | `0xce8db0` light polar (4) | 0.0 0.25 0.5 0.75 | 127° 110° 127° 110° — stock's own |
-| `0xce8d4c` disc azimuth (3) | 0.2291667 0.5 0.8333333 | 225° 135° 45° |
+| `0xce8d4c` disc azimuth (3) | 0.2291667 0.5 0.8958333 | 225° 135° 45° |
 | `0xce8d64` disc polar (5) | 0.2291667 0.4965278 0.5 0.5034722 0.8958333 | 100° 5° 5° 5° 100° — stock's own, at stock's own times |
 
-The light azimuth is the disc azimuth plus 180° **at the disc's own key times** (405° at 05:30,
-315° at noon, 225° at 20:00) plus the midpoint at 08:45, and stock's own light key times (00:00,
-06:00, 12:00, 18:00) cannot hold that arc: sampled there the disc gives 121°, 218°, 135° and 68°,
-so the first key would sit *below* the second and the leg from midnight to six would run against the
-day's own sweep — `0x6cf6c0` lerps in **value** space, so a pair that reverses unwinds the sweep,
-and the shading comes from the far side of the disc through the small hours: the "180° off" symptom.
-Sampling the disc at its own three keys plus their midpoint keeps the four values **descending**,
-which is the one direction this hand's azimuth has, and makes one continuous sweep across the day.
-The night leg — 20:00 back to 05:30 — is the cyclic one and interpolates along itself, which is as
-much of the night as four keys can cover, and the disc is under the horizon through all of it.
+Three of the light's keys are the disc's azimuth plus 180°, one at each of the disc's own key
+times except the sunrise one — 405° at 05:50, a key 20 minutes past the disc's first, 315° at noon
+and 225° at 21:30 — because stock's own light key times (00:00,
+06:00, 12:00, 18:00) cannot hold this arc: sampled there the disc gives 121°, 218°, 135° and
+68°, so the first key would sit *below* the second and the midnight-to-six leg would run against
+the day's own sweep — `0x6cf6c0` lerps in **value** space, so a pair that reverses unwinds the
+sweep and the shading comes from the far side of the disc through the small hours, the "180° off"
+symptom. The fourth key is not a midpoint any more: it sits at the sunrise time itself and holds
+**stock's own 225°**, the same value as the last key. That makes the leg that closes the day —
+21:30 back around midnight to 05:30 — flat at 225°, which is the shading staying north west from
+sunset through the whole night, and stock's own bearing while it does. The only reversal left in
+the table is the deliberate one: 225° → 405° across the 20 minutes from the sunrise key to the
+next, so the light leaves the night's bearing when the sun starts to rise, not hours before.
+
+The disc's own azimuth descends all the way, 225° at 05:30 to 135° at noon to 45° at 21:30 — 60° at
+19:55, 59° at 20:00 and 54° at 20:30, still walking west while it goes below the horizon. With three
+keys its closing leg cannot also be flat, so through the small hours it unwinds from 45° toward the sunrise
+value while the disc sits 10° under the horizon: the disc does not draw there, but the sun **glare**
+takes the disc's position (`celestial.md:85-86`), so what to look for at 02:00 is a glare sweeping
+the horizon while the ground stays put. Unwrapping the disc's first key instead — −135° rather than
+225° — would carry that leg the other way around through north, east and south east into the dawn
+key, continuous and in the sun's own sense, and would put the morning leg through north instead, so
+it is not free with three keys either.
 
 Two corrections to earlier claims worth keeping, because they were both found by
 reading the bytes rather than by believing them:
@@ -461,18 +480,18 @@ elevation that pair produces is in the "reproduces" column.
 
 | Re-bake at | serves | sun then (bearing / height) | slider pair | reproduces | worst over its hours |
 | --- | --- | --- | --- | --- | --- |
-| **06:30** | 05:30 – 07:45 | 217° / 22° | `-29 / 295` | 211.5°, 21.7° | 17.6° bearing, 3.3° height |
+| **06:30** | 05:50 – 07:45 | 211° / 21° | `-29 / 295` | 211.5°, 21.7° | 17.6° bearing, 3.3° height |
 | **09:00** | 07:45 – 10:15 | 177° / 29° | `3 / 299` | 176.6°, 29.0° | 17.3°, 4.0° |
-| **11:30** | 10:15 – 13:15 | 142° / 35° | `30 / 312` | 142.2°, 35.4° | 21.2°, 3.4° |
-| **15:00** | 13:15 – 16:45 | 101° / 28° | `60 / 340` | 101.2°, 28.0° | 19.8°, 5.4° |
-| **18:30** | 16:45 – 20:00 | 62° / 22° | `55 / 50` | 61.8°, 21.6° | 19.8°, 4.0° |
-| **21:00 – 05:30** | stock, unchanged | 45° / 26°…37° | `29 / 33` stock payload | 45.5°, 47.2° | 0.5° bearing, 10…26° height |
+| **11:30** | 10:15 – 13:30 | 142° / 36° | `30 / 312` | 142.2°, 35.4° | 21.4°, 3.4° |
+| **15:30** | 13:30 – 17:30 | 102° / 27° | `61 / 338` | 101.7°, 26.7° | 19.1°, 6.0° |
+| **19:30** | 17:30 – 21:30 | 64° / 24° | `55 / 44` | 64.1°, 24.4° | 19.1°, 5.5° |
+| **21:30 – 05:50** | stock, unchanged | 45° / 21°…37° | `29 / 33` stock payload | 45.5°, 47.2° | 0.5° bearing, 10…27° height |
 
 So: **five re-bakes for the day, plus the stock payload kept for the evening and night.** It is
 the knee of the curve — a 4-payload plan errs up to 27.3° and a 6-payload plan only improves
-21.2° to 17.6° — and the errors are the worst over a payload's own window, at its edges. Bearing error, not height error,
-is what the eye reads: height only travels 20°…37° (`pol_l` 110°…127°) while bearing travels
-180°, so a payload's height is right within ±5° and its bearing is off by up to ~21° at the
+21.4° to 17.6° — and the errors are the worst over a payload's own window, at its edges. Bearing error, not height error,
+is what the eye reads: height only travels 21°…37° (`pol_l` 111°…127°) while bearing travels
+180°, so a payload's height is right within ±6° and its bearing is off by up to ~21° at the
 window edges.
 
 #### 4.5.1 Where the payload gets picked, and what that caps
@@ -495,16 +514,16 @@ What that plan does and does not buy:
 
 * The stamp table above *is* the catalog to latch from, and the nearest-stamp rule is the
   "closest preset at map enter" rule, so the worst-error columns are exactly what a visit shows
-  when it starts and ends near one stamp: 5 day payloads → 21.2°, 4 → 27.3°, 6 → 17.6°.
+  when it starts and ends near one stamp: 5 day payloads → 21.4°, 4 → 27.3°, 6 → 17.6°.
 * The drift term is what a latch leaves behind, and stock makes it small. The client's own clock
   scale word `+0x2c` is `0x3c888889`, **1/60 game minutes per real second** — one game minute per
   real minute (`benilla-re systems/gametime.md:18-19`), so a stock day is 24 real hours.
-  The arc's bearing travels 180° over the 14.5 game hours of 05:30→20:00, so ~12.4° of bearing
-  per real hour. A payload latched at the nearest stamp is within the table's ~21° for about an
-  hour and a half of uninterrupted play in one map — 1.5 game hours, the edge of its own window —
-  and it takes about seven real hours in the same map to reach the 89.7° that a single payload
-  would give at the far ends of the arc (the arc's mid stamp, 12:00 at 135°, is that far off at
-  both ends). The
+  The arc's bearing travels 180° over the 15.7 game hours of 05:50→21:30, so ~11.5° of bearing
+  per real hour. A payload latched at the nearest stamp is within the table's ~21° for about two
+  hours of uninterrupted play in one map — two game hours, a little past the edge of its own window
+  — and it takes about eight real hours in the same map to reach the 90° that a single payload
+  would give at the far ends of the arc (the arc's mid stamp, 12:00 at 135°, is 90° off at both
+  ends). The
   mod's clock-scale digits exist to compress that for testing, and they are why a bake plan must
   be read at 1:1 rather than at the test speed.
 * Re-picking per chunk visit is therefore not the answer to a real problem: it would bound the
@@ -516,13 +535,14 @@ What that plan does and does not buy:
 So for a continent you stay in for a whole game day, the latched payload is right for the hour you
 entered at and drifts after that; for instances and short visits, the latch is the whole answer.
 
-One more row is worth the slot, and at real-time scale it is not a corner case: from 00:00 to
-05:30 — five and a half real hours of play — `arc-senw` clamps the light at the sunrise bearing,
-225° south east, with height drifting 37°→21°.
-That bearing is **constant**, so a single payload fits it exactly — `-38 / 308` reproduces 224.8°
-and 29.0°: 0.2° bearing error over the whole plateau, 8° of height. It is 180° from the stock
-night payload, so leaving that window stock means shadows point away from the light through
-00:00–05:30.
+The **pre-dawn hour is no longer a row of its own, and that is the one place the new arc paid off
+the bake plan.** With the light's first and last azimuth key holding the same 225°, the shading
+sits at stock's own 45° from 21:30 all the way back to 05:50 — flat, not clamped at the sunrise
+bearing — so the stock night payload (`29 / 33`, 45.5° and 47.2°) covers it at **0.5° of bearing
+error**, and the `-38 / 308` payload the earlier arc needed for 00:00–05:30 has nothing left to
+replace. One stock payload now carries 21:30 → 05:50, which at stock's clock scale is 12 real
+hours of the 24-hour day. What is left is 5 day payloads for the 15.7 game hours where the arc
+actually moves the shading.
 
 **The sliders take the whole compass, so every row above is dialable.** The bake's own ranges are
 `Make("Sun height", 0, -80, 80)` and `Make("Sun rotation", 1, 0, 360)`
@@ -726,10 +746,18 @@ Ideas worth borrowing, in the order they would change this project:
    `Make("Sun rotation", 1, 0, 360)` (`MainWindow.ShadowPanel.cs:231-232`), and the ray built from
    them clamps only the pitch, never the yaw (`GlViewport.TerrainBrush.cs:966-973`). Every row of
    the §4.5 table is therefore dialable as written, negative heights included.
-4. The pre-dawn plateau (00:00–05:30) is the one window whose sun-side fix is cheaper than its
-   data-side fix. It clamps at the sunrise bearing 225° while the stock night payload is at 45°,
-   so the light flips 180° at midnight. Writing the first `az_d` key unwrapped — 405° at
-   t = 0 instead of 225° clamped — would carry it through north east, east, south east into the
-   dawn key, continuous at both ends and covered by the stock payload at midnight. `sin`/`cos` of
-   405° are 45°'s, so nothing else about the arc changes. Untested on the ground, and it is sun-arc
-   work, not bake work.
+4. ~~The pre-dawn plateau (00:00–05:30) needs its own bake row~~ — **settled: it does not, and the
+   arc was re-authored so it would not.** The light's first and last azimuth keys both hold stock's
+   225°, so the closing leg is flat and the shading sits at stock's own 45° from 21:30 back to 05:50;
+   the stock night payload covers that half-day at 0.5° of bearing error (`29 / 33` is 45.5°, 47.2°
+   against the arc's 45° and 29.9°…37.0°…21.4°). The `-38 / 308` row the earlier arc needed for
+   00:00–05:30 has nothing left to replace — see §4.5.
+5. What the shipped arc leaves unverified, and the only place it is visible: the disc's own azimuth
+   through the night. Three keys cannot make the disc's closing leg flat and also keep 225° at
+   sunrise, so from 21:30 the disc unwinds 45° → 101° at midnight → 225° at 05:30 while it sits
+   10° under the horizon — it does not draw, but the **sun glare** takes the disc's position
+   (`benilla-re systems/lighting/celestial.md:85-86`), so an in-game check at 02:00 should show a
+   glare low on the horizon sweeping the north west quadrant while the ground stays north west. The
+   alternative is unwrapping the disc's first key to −135°, which carries the night leg the other
+   way around through north — continuous, but it puts the morning leg through north east, which is
+   the wrong half of the sky, so it is not free with three keys either. Sun-arc work, not bake work.
