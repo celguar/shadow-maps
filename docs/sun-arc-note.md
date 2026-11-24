@@ -44,7 +44,7 @@ The only sun override is a sidecar file, `shadow-mod.sun`, next to the mode file
 | (absent) | the clock decides — the concept, and what you should test first |
 | `clock` | same, written out |
 | `off` or `stock` | leave the client's own key tables alone, no arc, no write-back |
-| `arc-swnw` `arc-stock` | force that preset every visit, whatever the clock says — how one sky is watched without waiting for the hour |
+| `arc-senw` `arc-stock` | force that preset every visit, whatever the clock says — how one sky is watched without waiting for the hour |
 
 A word that is neither is logged and the clock decides.
 
@@ -77,7 +77,7 @@ way stock does:
 
 * the **disc** polar is measured from the sky's top, so 5° is near zenith and
   100° is under the horizon: stock's disc is at +39° elevation at 08:50, +85° at
-  noon, +0° at 20:31 and −10° at 21:50. Stock's sun is already below the horizon
+  noon, +0° at 20:30 and −10° at 21:50. Stock's sun is already below the horizon
   through the evening, and its disc's own size track `0xce8cac` (`06:00 2,
   06:45 1, 20:15 1, 21:00 2`) is why a night sun draws big when it draws at all.
 * the **light** polar is read as `90° + elevation`, because that vector is the
@@ -138,29 +138,46 @@ The clock windows are two, not five:
 
 | preset | clock window | disc azimuth → light azimuth | disc polar → light polar |
 |---|---|---|---|
-| `arc-swnw` | 00:00–20:00 | 315 360 405 @ 05:30 12:00 21:30 → 495 517.5 540 585 @ 05:30 08:45 12:00 21:30 | stock's own: 100 5 5 5 100 @ 05:30 11:55 12:00 12:05 21:30 → 127 110 127 110 @ 00:00 06:00 12:00 18:00 |
+| `arc-senw` | 00:00–20:00 | 225 135 45 @ 05:30 12:00 20:00 → 405 360 315 225 @ 05:30 08:45 12:00 20:00 | stock's own: 100 5 5 5 100 @ 05:30 11:55 12:00 12:05 21:30 → 127 110 127 110 @ 00:00 06:00 12:00 18:00 |
 | `arc-stock` | 20:00–24:00 | stock's own tables, written back — 45° on all three keys → 225° on all four | stock's own, as above |
 
-Bearing convention: azimuth is clockwise from +X to +Y, 0° = west, 90° = north,
-180° = east, 270° = south, and the light-travel azimuth is the antipode of the
-sun's bearing. Polar is from the sky's top, so 100° is under the horizon.
+Bearing convention, pinned by an in-game sky check and not by the bytes: azimuth is
+measured from +X toward +Y and reads **0° = north, 90° = west, 180° = south,
+270° = east**, so it DECREASES as the sun walks east through south to west, which
+is the clockwise-on-the-map sense a real sun has (down is south, left is west).
+Stock's 45° disc and 225° light are both on the north west either way the azimuth
+is turned, which is why the bytes alone cannot name the hand — the arc that
+shipped first was, and its disc rose in the north east and set in the north west,
+which said the other hand was the one in front of the bytes. The light-travel
+azimuth is the antipode of the sun's bearing, so the source bearing is that
+azimuth plus 180°. Polar is from the sky's top, so 100° is under the horizon.
 
-What `arc-swnw` looks like in game, off the evaluator — azimuths and elevations
+What `arc-senw` looks like in game, off the evaluator — azimuths and elevations
 from the same interpolation the client does, and the crossings are where the
 disc polar passes 90°:
 
-| clock | stock | `arc-swnw` |
+| clock | stock | `arc-senw` |
 |---|---|---|
-| horizon crossings | 06:10 rises, 20:31 sets | 06:10 rises, 20:31 sets — same, because the polar is stock's |
-| Kalimdor 08:50 | disc az 45° north west, elev +39° | disc az 338°, elev +39° |
-| Kalimdor noon | disc az 45° north west, elev +85° | disc az 360°, elev +85° |
-| EK 20:30 | disc az 45° north west, elev +0° | disc az 400°, elev +0° |
+| horizon crossings | 06:10 rises, 20:30 sets | 06:10 rises, 20:30 sets — same, because the polar is stock's |
+| 05:30, stock's sunrise hour | disc az 45° north west, elev −10° | disc az 225° south east, elev −10° |
+| Kalimdor 08:50 | disc az 45° north west, elev +39° | disc az 179° south, elev +39° |
+| Kalimdor noon | disc az 45° north west, elev +85° | disc az 135° south west, elev +85° |
+| 16:00 | disc az 45° north west, elev +45° | disc az 90° west, elev +45° |
+| 19:50 | disc az 45° north west, elev +7° | disc az 47° north west, elev +7° |
+| EK 20:00, the handover | disc az 45° north west, elev +5° | disc az 45° north west, elev +5° — the arc is already stock's bearing there |
+| EK 20:30 | disc az 45° north west, elev +0° | *(not this preset: 20:30 is `arc-stock`, which is stock)* |
 | EK 21:50 | disc az 45° north west, elev −10° | *(not this preset: 21:50 is `arc-stock`, which is stock)* |
 
-So the arc rises south-west of west, passes due west at noon, and comes round
-to north west by dusk — a quarter turn over the day, on stock's own heights —
-and by the time the clock reaches 20:00 its azimuth (404°) is within a degree of
-stock's 405°, which is why `arc-stock` taking over at 20:00 is not a jump.
+So the arc rises in the south east, on stock's own sunrise hour, passes due south
+in the morning and due west in the afternoon, and is back on stock's own north
+west bearing by 20:00 — half a turn walked across the south and west, the
+clockwise-on-the-map sense a real sun has, instead of stock's sun, whose azimuth
+never moves off the north west diagonal at all. It is dead on stock's own azimuth at 20:00,
+which is why `arc-stock` taking over at 20:00 is not a jump, and the whole evening
+— the set at 20:30, the light from the north west, the sunset on the horizon at
+21:00 — is stock's own pixels, because the keys written there are stock's own.
+The shading's bearing is the disc's bearing at every hour of that table, which is
+what the readback line's last number, 0 deg apart, says.
 
 Before anything is written the four tracks are pinned: each must hold the stock
 keys this build was read from, within the degree a float rounds to, or be an
@@ -180,7 +197,7 @@ python build.py .                  # links out\ShadowMaps.dll
 python verify_dll.py out\ShadowMaps.dll
 ```
 
-The sv15 image is 161,280 bytes.
+The sv15 image is 161,792 bytes.
 
 Ship it as sv13 ships it: `ShadowMaps.dll`, `ShadowMaps.def`, `ShadowMaps.dll.id`
 in `dlls.txt`, and rename the shadow file to `shadowmaps.dat` **next to the
@@ -239,7 +256,7 @@ Then, in order:
    vary with the client's own float, the words do not):
 
    ```
-   sv15 sun arc: the client's clock at 0xce9b60+4 reads 08:50 (the float is 0.3681, half-minute 1060 of 2880), so arc-swnw is the preset written into the client's own key tables at 0xce8d90 (light azimuth and polar), 0xce8d4c (disc azimuth) and 0xce8d64 (disc polar): the disc's azimuth runs from 315 deg to 405 deg, 90 deg over the day, and its polar angle goes from 100 deg through 5 deg back to 100 deg, so the sun crosses the horizon at both ends instead of rocking on one bearing; the light azimuth is the disc azimuth plus 180, so the shading comes from the bearing the disc is in and the two never disagree about it, while both tracks keep stock's own polar angles, which is what keeps the light between +20 and +37 deg above the horizon all day; 0x6cf6c0 interpolates it every frame. re-asserted at every chunk visit
+   sv15 sun arc: the client's clock at 0xce9b60+4 reads 08:50 (the float is 0.3681, half-minute 1060 of 2880), so arc-senw is the preset written into the client's own key tables at 0xce8d90 (light azimuth and polar), 0xce8d4c (disc azimuth) and 0xce8d64 (disc polar): the disc's azimuth runs DOWN from 225 deg to 45 deg, 180 deg over the day, so the sun walks south east through south and west to north west, the clockwise-on-the-map sense a real sun has, and its polar angle goes from 100 deg through 5 deg back to 100 deg, so the sun crosses the horizon at both ends instead of rocking on one bearing; the light azimuth is the disc azimuth plus 180, so the shading comes from the bearing the disc is in and the two never disagree about it, while both tracks keep stock's own polar angles, which is what keeps the light between +20 and +37 deg above the horizon all day; 0x6cf6c0 interpolates it every frame. re-asserted at every chunk visit
    ```
 
    One line per preset: the log does not repeat it while the clock stays in the
@@ -272,7 +289,7 @@ Then, in order:
    re-written when the float is not already what this DLL wrote, which is what
    keeps the server's time messages from compounding.
 
-4. Force one preset without waiting for the clock: `arc-swnw` in `shadow-mod.sun`
+4. Force one preset without waiting for the clock: `arc-senw` in `shadow-mod.sun`
    in the same folder as the mode file, and `off` to leave the client's tables
    alone. The file is read once at install, so a fresh session is what applies a
    changed word — and a world entered at 23:00 is in the stock window by design,
@@ -292,13 +309,13 @@ Then, in order:
    and 200 giant lines is more than the log keeps:
 
    ```
-   sv15 sun read back: what the client's own tracks hold now, and what its evaluator makes them give at the client's own phase. the phase at 0xce9b60+4 is 0.3681, half-minute 1060 of 2880, and arc-swnw is the preset this visit wrote. the live keys, each key a time at +0 and a value at +4, printed as a track's times then its values, degrees as the radians at each address read back: light azimuth 0xce8d90 at 0.2292 0.3646 0.5000 0.8958 holds 495 517 540 585 deg; light polar 0xce8db0 at 0.0000 0.2500 0.5000 0.7500 holds 127 110 127 110 deg; disc azimuth 0xce8d4c at 0.2292 0.5000 0.8958 holds 315 360 405 deg; disc polar 0xce8d64 at 0.2292 0.4965 0.5000 0.5035 0.8958 holds 100 5 5 5 100 deg. interpolating those at the phase gives the disc at azimuth 338 deg and polar 51 deg and the light azimuth 518 deg and polar 118 deg, so the disc sits at bearing 338 deg, 39 deg above the horizon, and the shading comes from bearing 338 deg, 28 deg high: they are 0 deg apart. read the two bearings against the sky you are looking at: a disc bearing that matches makes the tables and the handedness right and the arc's own angles are what to change; a shading bearing 180 apart from the disc is the light pointing at the sun rather than away from it; and a disc polar that should keep it below the horizon at a night hour and does not is a key time belonging to another track. the azimuths are 0 = west, 90 = north, 180 = east, 270 = south, the frame the stock sun's own NORTH WEST pins
+   sv15 sun read back: what the client's own tracks hold now, and what its evaluator makes them give at the client's own phase. the phase at 0xce9b60+4 is 0.3681, half-minute 1060 of 2880, and arc-senw is the preset this visit wrote. the live keys, each key a time at +0 and a value at +4, printed as a track's times then its values, degrees as the radians at each address read back: light azimuth 0xce8d90 at 0.2292 0.3646 0.5000 0.8333 holds 405 360 315 225 deg; light polar 0xce8db0 at 0.0000 0.2500 0.5000 0.7500 holds 127 110 127 110 deg; disc azimuth 0xce8d4c at 0.2292 0.5000 0.8333 holds 225 135 45 deg; disc polar 0xce8d64 at 0.2292 0.4965 0.5000 0.5035 0.8958 holds 100 5 5 5 100 deg. interpolating those at the phase gives the disc at azimuth 179 deg and polar 51 deg and the light azimuth 359 deg and polar 118 deg, so the disc sits at bearing 179 deg, 39 deg above the horizon, and the shading comes from bearing 179 deg, 28 deg high: they are 0 deg apart. read the two bearings against the sky you are looking at: a disc bearing that matches makes the tables and the handedness right and the arc's own angles are what to change; a shading bearing 180 apart from the disc is the light pointing at the sun rather than away from it; and a disc polar that should keep it below the horizon at a night hour and does not is a key time belonging to another track. the azimuths are 0 = north, 90 = west, 180 = south, 270 = east, a frame an in-game sky check pinned and not the bytes, because stock's own 45 deg reads north west either way round
    ```
 
    The short line, which every write after the fourth gets:
 
    ```
-   sv15 sun status: the client's own phase at 0xce9b60+4 is 0.3681, half-minute 1060 of 2880, and arc-swnw was the key set this visit wrote into the live keys. what the client's evaluator makes those bytes give: the disc at azimuth 338 deg and polar 51 deg and the light at azimuth 518 deg and polar 118 deg, so the disc sits at bearing 338 deg, 39 deg above the horizon, and the shading comes from bearing 338 deg, 28 deg high: they are 0 deg apart. the live keys themselves are in the giant line, which this session already printed 4 times
+   sv15 sun status: the client's own phase at 0xce9b60+4 is 0.3681, half-minute 1060 of 2880, and arc-senw was the key set this visit wrote into the live keys. what the client's evaluator makes those bytes give: the disc at azimuth 179 deg and polar 51 deg and the light at azimuth 359 deg and polar 118 deg, so the disc sits at bearing 179 deg, 39 deg above the horizon, and the shading comes from bearing 179 deg, 28 deg high: they are 0 deg apart. the live keys themselves are in the giant line, which this session already printed 4 times
    ```
 
    The last five numbers of either line are the ones to compare with the sky —
@@ -316,7 +333,7 @@ Then, in order:
 0.2292 / 45 deg, 0.2292 / 100 deg`:
 
    ```
-   sv15 sun keys lost: arc-swnw was armed again and the client's own tables no longer hold what this DLL wrote there. each track's first key as the live bytes read it, a time at +0 and a value at +4, then what the preset's own table wants there: light azimuth 0xce8d90 holds 0.0000 and 225 deg and wants 0.2292 and 495; light polar 0xce8db0 holds 0.0000 and 127 deg wants 0.0000 and 127; disc azimuth 0xce8d4c holds 0.2292 and 45 deg wants 0.2292 and 315; disc polar 0xce8d64 holds 0.2292 and 100 deg wants 0.2292 and 100. the stock first keys are 0.0000 and 225 deg, 0.0000 and 127 deg, 0.2292 and 45 deg and 0.2292 and 100 deg, so a live four of exactly those pairs is the day-night file building its own tracks behind the guard bits at 0x6d3a10 and 0x6d3b80, and the next write here is what gets them back; any other pair is a table something else writes. this session prints this line 1 of 4 times
+   sv15 sun keys lost: arc-senw was armed again and the client's own tables no longer hold what this DLL wrote there. each track's first key as the live bytes read it, a time at +0 and a value at +4, then what the preset's own table wants there: light azimuth 0xce8d90 holds 0.0000 and 225 deg and wants 0.2292 and 405; light polar 0xce8db0 holds 0.0000 and 127 deg wants 0.0000 and 127; disc azimuth 0xce8d4c holds 0.2292 and 45 deg wants 0.2292 and 225; disc polar 0xce8d64 holds 0.2292 and 100 deg wants 0.2292 and 100. the stock first keys are 0.0000 and 225 deg, 0.0000 and 127 deg, 0.2292 and 45 deg and 0.2292 and 100 deg, so a live four of exactly those pairs is the day-night file building its own tracks behind the guard bits at 0x6d3a10 and 0x6d3b80, and the next write here is what gets them back; any other pair is a table something else writes. this session prints this line 1 of 4 times
    ```
 
    One batch of four of these at one timestamp is the expected shape of a session:
@@ -334,7 +351,7 @@ Then, in order:
    for the four to be exactly stock's:
 
    ```
-   sv15 sun: the key tables at 0xce8d90 and 0xce8d4c hold the stock keys again under arc-swnw, so the day-night file built its tracks after install: the keys are written again here, and the next chunk visit keeps them, so a stock sun in game after this line is that rebuild
+   sv15 sun: the key tables at 0xce8d90 and 0xce8d4c hold the stock keys again under arc-senw, so the day-night file built its tracks after install: the keys are written again here, and the next chunk visit keeps them, so a stock sun in game after this line is that rebuild
    ```
 
    A stock sun after that line is the rebuild, not the arc failing. The line
@@ -360,14 +377,19 @@ what mode `h` gives you without any extra work.
   float, and a server that sends its own time messages sets that float again —
   this DLL re-asserts its number at every chunk visit rather than compounding on
   it.
-* The azimuths are left unwrapped above 360° — 495°, not 135° — because `0x6cf6c0`
+* The azimuths are left unwrapped above 360° — 405°, not 45° — because `0x6cf6c0`
   lerps in **value** space and its cyclic search wraps in **time**, so a value
   that wraps back is a backwards sweep and a value that leaves a gap is a jump at
   midnight. Monotonic through the wrap is what makes the interpolation one
   continuous forward rotation. The client's `fsin`/`fcos` read either spelling
   the same.
-* The arc's light azimuth carries its second key at 08:45 rather than stock's
-  06:00, because stock's own key times would put a non-monotonic pair of
-  azimuths in the small hours and unwind the morning sweep. The night leg —
-  21:30 back to 05:30 — is the cyclic one and interpolates along itself, which
-  is as much of the night as four keys can cover.
+* The arc's light azimuth carries four keys at the disc's own hours plus 08:45 —
+  05:30, 08:45, 12:00, 20:00 — rather than stock's 00:00 06:00 12:00 18:00, so the
+  two azimuth tracks are the same sweep shifted by 180° at the same hours and the
+  readback says the shading bearing is the disc's bearing at every hour of the day.
+  Keying the two tracks at different hours is what let each interpolate its own
+  leg, and sv14 did exactly that: the shading came from a bearing 180° off the
+  disc at some hours and a few degrees off it at others. The night leg — 20:00
+  back to 05:30 — is the cyclic one and interpolates along itself, which is as
+  much of the night as four keys can cover, and the disc is under the horizon
+  through all of it, so it has nothing to disagree about.

@@ -125,10 +125,10 @@
  *  #light-state), and the light table build reads that same float at 0xce9b64
  *  while turning it into half-minutes. sv14 turns it the same way -- round(tod
  *  * 2880), 2880 being the half-minutes in a day -- and picks the preset whose
- *  window of half-minutes holds it: the day is cut into two windows, arc-swnw
+ *  window of half-minutes holds it: the day is cut into two windows, arc-senw
  *  from midnight to 20:00 and arc-stock from 20:00 to midnight, so the hour the
  *  world was entered at names the arc, and arc-stock is the stock sun. sv14 cut
- *  it into five windows holding five different arcs, which was never one sun
+ *  it into five windows, four arcs and the stock sun, which was never one sun
  *  crossing one sky -- see the sv15 note below -- and sv15 also writes the stock
  *  keys back in this window instead of asking for nothing. An
  *  unstamped block reads 0, which is midnight and the arc's window, so the
@@ -191,19 +191,26 @@
  *  that was lit far past what stock does -- and the shading seemed to come from
  *  the far side of the disc. And sv14's polar key times put the disc 67 deg up
  *  at 08:50 where stock has it 39 deg up, and made its day rise at 03:39 and
- *  set at 22:04 instead of stock's 06:11 and 20:30, so the sun was too high and
+ *  set at 22:04 instead of stock's 06:10 and 20:30, so the sun was too high and
  *  the sunset came at the wrong hours. sv15 keeps the polar keys of all four
  *  tracks exactly as stock has them, the disc at 100 deg at 05:30 and 21:30 and
  *  5 deg at noon, the light at 127/110/127/110 on stock's own times, so the
- *  height, the rise at 06:11, the set at 20:30 and the strength of the day are
- *  stock's hour for hour, and moves only the azimuth: the disc runs 315 deg at
- *  sunrise, due west at noon, 405 deg at sunset -- a south west sunrise and a
- *  north west sunset on the map, the direction the player asked for -- with the
- *  light azimuth kept the disc's antipode as stock keeps it, so the shading
- *  comes from where the disc is. One arc up to 20:00 and stock's own keys from
- *  20:00, not four windows of four arcs: four arcs were never one sun crossing
- *  one sky, and the visits showed the disc, the ground and the objects naming
- *  three different places for the same light.
+ *  height, the rise at 06:10, the set at 20:30 and the strength of the day are
+ *  stock's hour for hour, and moves only the azimuth: the disc runs 225 deg at
+ *  the sunrise hour, south east, 135 deg at noon, south west, and 45 deg at
+ *  20:00, north west -- half a turn walked across the south and west, the
+ *  clockwise-on-the-map sense a real sun has, and it is dead on stock's own
+ *  bearing when arc-stock takes over, so the handover is not a jump and the
+ *  evening is stock's own light. Which way the azimuth is counted came from an
+ *  in-game sky check and not from the bytes: stock's 45 deg reads north west
+ *  under either hand, so only a bearing off that diagonal says which hand it is,
+ *  and the arc that shipped first went the wrong way, north east through north
+ *  to north west, a southern-hemisphere sun. The light azimuth is kept the
+ *  disc's antipode as stock keeps it, so the shading comes from where the disc
+ *  is. One arc up to 20:00 and stock's own keys from 20:00, not sv14's five
+ *  windows of four arcs and stock: four arcs were never one sun crossing one
+ *  sky, and the visits showed the disc, the ground and the objects naming three
+ *  different places for the same light.
  *
  * runs came back with their install lines and no new crash: mode a (the whole
  * 34 MB arena resident, no hook), mode c (the store and landing at 0x6AF5F0,
@@ -1010,8 +1017,13 @@ static void InstallHandler(void)
  * shape on top of sv14's write: a wrong layout and a rebuild are the two facts the
  * same four numbers name, and the layout is the one that has to be right first.
  *
- * The azimuths are left unwrapped (495 deg, not 135) because wrapping is what
- * reverses the sweep; sin and cos read them the same either way. */
+ * The azimuths are left unwrapped -- the light's first key is 405 deg, not 45 --
+ * because 0x6cf6c0 lerps in value space and wraps only in time: a key that jumps
+ * back across a turn between two neighbours makes the leg between them sweep the
+ * long way round, and a leg that sweeps the long way is the sun going backwards.
+ * Kept inside one turn's span, all moving the same way, every leg is the short
+ * sweep, which is the one the disc needs; sin and cos read them the same either
+ * way. */
 #define SUN_TOD_STATE  0xce9b60u   /* the day-night state's block of globals */
 #define SUN_TOD_OFF    0x04u       /* +4: time of day, kept in [0,1)         */
 #define SUN_HMIN_DAY   2880u       /* half-minutes in a day, the unit the     */
@@ -1083,7 +1095,7 @@ static const float sun_stock_t[4][5] = {
  * then invert, the ground reads mirrored and over-bright and the shading
  * seems to come from the far side of the sun -- the exact symptom a morning
  * visit showed. sv15 keeps the polar keys as stock's own, unchanged, so the
- * day's height, its rise at 06:11, its set at 20:30 and its strength match
+ * day's height, its rise at 06:10, its set at 20:30 and its strength match
  * stock hour for hour, and only the azimuth moves.
  *
  * and the azimuth keeps stock's own relation between the two tracks: the light
@@ -1091,13 +1103,27 @@ static const float sun_stock_t[4][5] = {
  * disc is. Stock has 45 deg on the disc and 225 on the light, and both read on
  * the map as NORTH WEST -- the fixed point every arc is pinned to.
  *
- * One arc, not four. Azimuth runs 0 = W, 90 = N, 180 = E, 270 = S, clockwise,
- * so a sun that rises in the south west is at 315 deg and the same sun setting
- * in the north west is at 405 deg, one quarter turn later, and it passes due
- * west at noon -- which is what stock's own hours and heights give once the
- * azimuth is free to move at all. Four windows holding four different arcs
- * were never one sun crossing one sky, and the visits showed it: the disc, the
- * ground and the objects disagreed about where the light was. */
+ * One arc, not four, and one sense. Which way the azimuth counts was NOT
+ * readable off the bytes: stock sits dead on the north west to south east
+ * diagonal, so both hands put its 45 deg in the north west. The first arc
+ * shipped broke that diagonal, and the sky named what it gave: a disc at
+ * azimuth 315 at 05:30, 360 at noon and 405 at dusk rose in the NORTH EAST
+ * and set in the NORTH WEST. So azimuth is 0 = N, 90 = W, 180 = S, 270 = E,
+ * and it DECREASES as the sun walks east through south to west, the
+ * clockwise-on-the-map sense a real sun has. That first arc was the other
+ * sense, north east through north to north west, a southern-hemisphere sun,
+ * and that is why it read badly. This arc takes the real one: the disc starts
+ * at 225 deg, south east, at the hour stock calls sunrise; it is at 135 deg,
+ * south west, at noon, where stock says it is 85 deg up; and it reaches 45
+ * deg, north west, at 20:00, the hour its own window ends. It walks half a
+ * turn across the south and west instead of a quarter turn across the north,
+ * and it is dead on stock's own bearing when arc-stock takes over there, so
+ * the handover is not a jump. Only the azimuth keys stop at 20:00: the polar
+ * keys stay stock's, 21:30 and all, because the polar is what sets the sun's
+ * height and its set at 20:30, and that has to match stock hour for hour.
+ * Five windows holding four arcs and the stock sun were never one sun crossing
+ * one sky, and the visits showed it: the disc, the ground and the objects named
+ * three different places for the same light. */
 static const struct SunPreset {
     const char name[16];
     unsigned short h0, h1;                 /* the clock's window             */
@@ -1106,12 +1132,12 @@ static const struct SunPreset {
     float t_az_l[4], t_pol_l[4];           /* their key times                */
     float t_az_d[3], t_pol_d[5];
 } sun_presets[] = {
-    { "arc-swnw",    0, 2400,
-      { 495.0f, 517.5f, 540.0f, 585.0f }, { 127.0f, 110.0f, 127.0f, 110.0f },
-      { 315.0f, 360.0f, 405.0f },         { 100.0f,   5.0f,   5.0f,   5.0f, 100.0f },
-      { 0.2291667f, 0.3645833f, 0.5f, 0.8958333f },
+    { "arc-senw",    0, 2400,
+      { 405.0f, 360.0f, 315.0f, 225.0f }, { 127.0f, 110.0f, 127.0f, 110.0f },
+      { 225.0f, 135.0f,  45.0f },         { 100.0f,   5.0f,   5.0f,   5.0f, 100.0f },
+      { 0.2291667f, 0.3645833f, 0.5f, 0.8333333f },
       { 0.0f, 0.25f, 0.5f, 0.75f },
-      { 0.2291667f, 0.5f, 0.8958333f },
+      { 0.2291667f, 0.5f, 0.8333333f },
       { 0.2291667f, 0.4965278f, 0.5f, 0.5034722f, 0.8958333f } },
     { "arc-stock",   2400, SUN_HMIN_DAY,
       { 225.0f, 225.0f, 225.0f, 225.0f }, { 127.0f, 110.0f, 127.0f, 110.0f },
@@ -1343,9 +1369,14 @@ static int SunRoundDeg(float deg)
     return (int)(deg >= 0.0f ? deg + 0.5f : deg - 0.5f);
 }
 
-/* degrees to the map's, in the frame the stock sun pins: the client's azimuth
- * 0 is due west and the angle grows through north, so a bearing is the
- * azimuth with whole turns taken out. */
+/* degrees to the map's, in the frame an in-game sky check pinned: the client's
+ * azimuth 0 is due north and the angle grows through west, so 90 is due west,
+ * 180 is due south and 270 is due east. Stock's disc azimuth 45 is north west
+ * in this frame, which is where stock's sun is, so this frame is not a guess
+ * about stock -- stock sits on the north west south east diagonal and reads
+ * north west either way round, so only an arc's bearing off that diagonal, in
+ * the sky, says which hand it is. A bearing is then the azimuth with whole
+ * turns taken out. */
 static int SunBearing(float az)
 {
     int b = SunRoundDeg(az) % 360;
@@ -1483,9 +1514,9 @@ static void SunReport(unsigned which, unsigned hmin)
                     " handedness right and the arc's own angles are what to change; a shading bearing"
                     " 180 apart from the disc is the light pointing at the sun rather than away from"
                     " it; and a disc polar that should keep it below the horizon at a night hour and"
-                    " does not is a key time belonging to another track. the azimuths are 0 = west,"
-                    " 90 = north, 180 = east, 270 = south, the frame the stock sun's own NORTH WEST"
-                    " pins",
+                    " does not is a key time belonging to another track. the azimuths are 0 = north,"
+                    " 90 = west, 180 = south, 270 = east, a frame an in-game sky check pinned and"
+                    " not the bytes, because stock's own 45 deg reads north west either way round",
              SUN_TOD_STATE, SUN_TOD_OFF,
              (unsigned)(phase * 10000.0f + 0.5f), hmin, SUN_HMIN_DAY, p->name,
              sun_addr[0],
@@ -1704,8 +1735,10 @@ static void SunKeepArc(void)
                  STAMP " sun arc: the client's clock at 0x%x+%x reads %02u:%02u (the float is 0.%04u,"
                         " half-minute %u of %u), so %s is the preset written into the client's own key"
                         " tables at 0x%x (light azimuth and polar), 0x%x (disc azimuth) and"
-                        " 0x%x (disc polar): the disc's azimuth runs from %u deg to %u deg,"
-                        " %u deg over the day, and its polar angle goes from %u deg through"
+                        " 0x%x (disc polar): the disc's azimuth runs DOWN from %u deg to %u deg,"
+                        " %u deg over the day, so the sun walks south east through south and west"
+                        " to north west, the clockwise-on-the-map sense a real sun has, and its"
+                        " polar angle goes from %u deg through"
                         " %u deg back to %u deg, so the sun crosses the horizon at both ends"
                         " instead of rocking on one bearing; the light azimuth is the disc azimuth plus"
                         " 180, so the shading comes from the bearing the disc is in and the two never"
@@ -1714,9 +1747,14 @@ static void SunKeepArc(void)
                         " interpolates it every frame. re-asserted at every chunk visit",
                  SUN_TOD_STATE, SUN_TOD_OFF, hmin / 120u, (hmin % 120u) / 2u, clock, hmin, SUN_HMIN_DAY,
                  sun_presets[which].name, sun_addr[0], sun_addr[2], sun_addr[3],
-                 /* the arc's own numbers, read off the table so the line can be checked */
+                 /* the arc's own numbers, read off the table so the line can be checked. The
+                  * span is the absolute difference: the azimuth walks down now that the sun
+                  * goes east through south to west, and a bare subtraction would print the
+                  * difference as 4294967206, which reads as a number no arc has. */
                  (unsigned)sun_presets[which].az_d[0], (unsigned)sun_presets[which].az_d[2],
-                 (unsigned)(sun_presets[which].az_d[2] - sun_presets[which].az_d[0]),
+                 (unsigned)(sun_presets[which].az_d[2] > sun_presets[which].az_d[0]
+                            ? sun_presets[which].az_d[2] - sun_presets[which].az_d[0]
+                            : sun_presets[which].az_d[0] - sun_presets[which].az_d[2]),
                  (unsigned)sun_presets[which].pol_d[0], (unsigned)sun_presets[which].pol_d[2],
                  (unsigned)sun_presets[which].pol_d[4], SUN_EVAL_ADDR);
         LogMsg(msg);

@@ -66,9 +66,17 @@ Vanilla contents (angles are π × a constant, shown in degrees; times are clock
 | disc polar | `0xce8d64` | `float[10]` = 5 keys | 05:30 **100°**, 11:55 **5°**, 12:00 **5°**, 12:05 **5°**, 21:30 **100°** |
 | disc size | `0xce8cac` | `float[8]` = 4 keys | 06:00 2, 06:45 1, 20:15 1, 21:00 2 |
 
-Compass, spelled out because it is not the intuitive one (`README.md:137-144`): on a north-up map
-the client's azimuth runs **clockwise** from +X to +Y, so 0° = west, 90° = north, 180° = east,
-270° = south, and +X itself is west. **45° = north-west**, **225° = south-east**.
+Compass, spelled out because it is not the intuitive one, and pinned in game rather than off the
+bytes: on a north-up map the client's azimuth runs **counter-clockwise** from +X to +Y, with **+X
+north and +Y west**, so **0° = north, 90° = west, 180° = south, 270° = east**; **45° = north-west**
+and **225° = south-east**. It therefore DECREASES as the sun walks east through south to west,
+which is the clockwise-on-the-map sense a real sun has. An earlier draft of this document had the
+other hand, 0° = west, 90° = north, and called +X west: the bytes cannot tell the two apart, because
+stock's 45° disc and 225° light travel both read **north west** whichever way the azimuth is turned
+— the whole stock sun sits on that diagonal. What named the hand was an in-game sky check: the arc
+that shipped first put its disc at 315° at 05:30, 360° at noon and 405° at dusk, and in game that
+rose in the **north east** and set in the **north west**, so 315° is north east and 0° is north.
+Compass words are map words throughout: down is south, left is west.
 
 ### 1.1 It is one constant, but the constant is data
 
@@ -267,6 +275,11 @@ and a live world (`src/mod.c`'s detour runs on chunk loads), or re-assert the wr
 
 ### 4.4 Shape C — a real arc, by re-timing the existing keys
 
+*(The sketch is the design record, kept as it was written. Its compass glosses are in the hand the
+document first had — 0° = west — which the in-game sky check of §4.4.1 later reversed. Read the
+sketch's numbers as bearings relative to stock's own north-west diagonal, and the map words of
+§4.4.1 as the ones that shipped.)*
+
 The key **count** is a parameter to `0x6cf6c0` (in `edx`), so growing a table means patching that
 literal as well as writing — and `0xce8d90` (`float[8]`) is immediately followed by `0xce8db0`, so
 there is no room to grow in place. Work with 4 light keys, 3 disc-azimuth keys, 5 disc-polar keys.
@@ -339,8 +352,8 @@ Two things to know about this table:
 
 ### 4.4.1 What sv15 actually wrote, and where the sketch above changed
 
-The sketch is the design record; sv15 wrote something narrower, and an in-game
-visit is what made it narrow. Three things the sketch assumed were wrong:
+The sketch is the design record; sv15 wrote something narrower, and in-game visits are what made it
+narrow. Three things the sketch assumed were wrong:
 
 * **the 180° sweep with new polar keys was not taken.** sv14 moved the light
   polar down to 80°, under 90°, and in game the ground came out mirrored and
@@ -348,14 +361,23 @@ visit is what made it narrow. Three things the sketch assumed were wrong:
   light direction pointing up makes the diffuse term of every up-facing normal
   zero, so the shading reads as reflected. The fix that holds is the simple one:
   **keep the polar keys stock's own, unchanged.** Then the day's heights, its
-  rise at 06:10 and its set at 20:31 and its strength are stock's hour for hour,
+  rise at 06:10 and its set at 20:30 and its strength are stock's hour for hour,
   and only the azimuth moves — which is also the thing the player asked for, an
   evening that matches stock.
-* **the sweep is a quarter turn, not a half one.** With stock's hours and
-  heights, a sun that rises south-west (315° at 05:30) and sets north-west
-  (405° at 21:30) passes **due west** at noon (360°), not north-west: a
-  90° sweep across the day. That keeps vanilla's north-west at dusk, which is
-  where the shipped `MCSH` presets are and where an evening has to match stock.
+* **the sweep's hand was wrong, and that is what named the hand.** The first
+  arc sv15 shipped, `arc-swnw`, was the sketch's: 315° at 05:30, 360° at noon,
+  405° at dusk, a 90° sweep. Its own log numbers say 315 → 360 → 405, but the
+  **sky** says what that meant: the disc rose in the north east and set in the
+  north west. That is a sun crossing the northern horizon, a southern-hemisphere
+  sun, and it is what the player never sees in Kalimdor — and it is the only
+  thing in the whole change that could tell the two hands of the azimuth apart,
+  because stock's own disc at 45° and light at 225° read north west under either
+  hand. So 315° is north east, 0° is north, and the azimuth the client wants
+  **decreases** as the sun walks east through south to west. The arc that ships
+  is that half of the sky: **225° (south east) at 05:30, 135° (south west) at
+  noon, 45° (north west) at 20:00**, half a turn walked across the south and
+  west, which keeps vanilla's north west at dusk where the shipped `MCSH`
+  presets are and where an evening has to match stock.
 * **one arc, not one window per hour.** The four tracks are one global block
   that the day-night file builds once behind the guard bits at `0x6d3a10` and
   `0x6d3b80`; five windows holding five different arcs were never one sun
@@ -363,30 +385,35 @@ visit is what made it narrow. Three things the sketch assumed were wrong:
   disagreeing about where the light was. sv15 has two windows: the arc from
   00:00 to 20:00 and **stock written back** from 20:00 to 24:00 — writing the
   stock keys, not nothing, because writing nothing is what let a morning arc
-  survive into the evening.
+  survive into the evening. The arc's azimuth keys end at 0.8333333 (20:00),
+  not at stock's own 0.8958333 (21:30), because at 20:00 the arc's azimuth is
+  already 45°, stock's own: the write-back picks the same bearing up rather than
+  jumping, and the polar tracks keep stock's own times and values, which is what
+  keeps the set at 20:30.
 
-What it writes, `arc-swnw` (0° = west, 90° = north, clockwise; polar from the sky's
+What ships, `arc-senw` (0° = north, 90° = west, 180° = south, 270° = east; polar from the sky's
 top), in the client's own key counts 4 / 4 / 3 / 5:
 
 | track | time | value |
 | --- | --- | --- |
-| `0xce8d90` light azimuth (4) | 0.2291667 (05:30) | 495° |
-| | 0.3645833 (08:45) | 517.5° |
-| | 0.5000000 (12:00) | 540° |
-| | 0.8958333 (21:30) | 585° |
+| `0xce8d90` light azimuth (4) | 0.2291667 (05:30) | 405° |
+| | 0.3645833 (08:45) | 360° |
+| | 0.5000000 (12:00) | 315° |
+| | 0.8333333 (20:00) | 225° |
 | `0xce8db0` light polar (4) | 0.0 0.25 0.5 0.75 | 127° 110° 127° 110° — stock's own |
-| `0xce8d4c` disc azimuth (3) | 0.2291667 0.5 0.8958333 | 315° 360° 405° |
+| `0xce8d4c` disc azimuth (3) | 0.2291667 0.5 0.8333333 | 225° 135° 45° |
 | `0xce8d64` disc polar (5) | 0.2291667 0.4965278 0.5 0.5034722 0.8958333 | 100° 5° 5° 5° 100° — stock's own, at stock's own times |
 
-The light azimuth is the disc azimuth plus 180° **at the disc's own key times**
-(495° at 05:30, 540° at noon, 585° at 21:30) plus their midpoint at 08:45, and
-stock's own light key times (00:00, 06:00, 12:00, 18:00) cannot hold that arc:
-sampled there the disc gives 557°, 499°, 540° and 571°, so the first key is
-*above* the second and the leg from midnight to six runs backwards 58° —
-`0x6cf6c0` lerps in value space, so a descending pair unwinds the morning sweep
-and the shading comes from the far side of the disc through the small hours, the
-"180° off" symptom. Sampling the disc at its own three keys plus their midpoint
-keeps the four values ascending, which is what makes the one sweep continuous.
+The light azimuth is the disc azimuth plus 180° **at the disc's own key times** (405° at 05:30,
+315° at noon, 225° at 20:00) plus the midpoint at 08:45, and stock's own light key times (00:00,
+06:00, 12:00, 18:00) cannot hold that arc: sampled there the disc gives 121°, 218°, 135° and 68°,
+so the first key would sit *below* the second and the leg from midnight to six would run against the
+day's own sweep — `0x6cf6c0` lerps in **value** space, so a pair that reverses unwinds the sweep,
+and the shading comes from the far side of the disc through the small hours: the "180° off" symptom.
+Sampling the disc at its own three keys plus their midpoint keeps the four values **descending**,
+which is the one direction this hand's azimuth has, and makes one continuous sweep across the day.
+The night leg — 20:00 back to 05:30 — is the cyclic one and interpolates along itself, which is as
+much of the night as four keys can cover, and the disc is under the horizon through all of it.
 
 Two corrections to earlier claims worth keeping, because they were both found by
 reading the bytes rather than by believing them:
@@ -397,7 +424,7 @@ reading the bytes rather than by believing them:
   stock's own tracks nor an all-zero block, so `SunPin` refuses and the arc is
   never written on a client that has built its day-night file. sv15 carries the
   real times.
-* the azimuth is left **unwrapped** (495°, not 135°) because `0x6cf6c0` lerps in
+* the azimuth is left **unwrapped** (405°, not 45°) because `0x6cf6c0` lerps in
   value space and wraps only in time: a wrapped value is a backwards sweep and a
   gap is a jump at midnight. The client's `fsin`/`fcos` read either spelling the
   same.
@@ -416,10 +443,10 @@ with the sun-key side and the new arc rows filled in.
 | Morning | 45° | 110° | `42 / 63` → 45.3°, 19.7° | yes, the set the shipped `.dat` came from |
 | Evening | 45° | 110° | `42 / 63` | identical to Morning in vanilla (`README.md:126`) |
 | Night — white moon | 45° | 35° polar ⇒ the moon's own track | `24 / 26` → 45.4°, 55.2° | vanilla ships one static map for every hour (`README.md:128`) |
-| **Arc, sampled 06:00** | 318° (south west) | 110° (20°) | re-bake at bearing ≈ 318°, height ≈ 20° | new |
-| **Arc, sampled 12:00** | 360° (due west) | 127° (37°) | re-bake at bearing ≈ 360°, height ≈ 37° | new |
-| **Arc, sampled 18:00** | 388° (north west) | 110° (20°) | re-bake at bearing ≈ 388°, height ≈ 20° | new |
-| **Arc, sampled 21:00** | 403° (north west) | stock's own — this hour is `arc-stock`, stock written back | `42 / 63` unchanged | the vanilla evening |
+| **Arc, sampled 06:00** | 218° (south east) | 110° (20°) | re-bake at bearing ≈ 218°, height ≈ 20° | new |
+| **Arc, sampled 12:00** | 135° (south west) | 127° (37°) | re-bake at bearing ≈ 135°, height ≈ 37° | new |
+| **Arc, sampled 18:00** | 68° (west of north west) | 110° (20°) | re-bake at bearing ≈ 68°, height ≈ 20° | new |
+| **Arc, sampled 21:00** | 45° (north west) | stock's own — this hour is `arc-stock`, stock written back | `42 / 63` unchanged | the vanilla evening |
 
 The arc rows are the *sampled* hour: one arc crosses the sky, so one baked
 `MCSH` set cannot follow it, and the honest pair is per hour you bake for. That
@@ -427,9 +454,10 @@ re-bake is the data half of the same row every other arc row names — Salmiak's
 bake is at a fixed 45°, and re-baking is out of scope for this change, which is
 why the sun test runs with stock shadow payloads.
 
-The payoff worth selling: with the arc, Morning and Evening become genuinely different payloads
-(shadows run NE vs SW) instead of the same bytes twice, which is exactly the difference `README.md:126`
-says vanilla cannot make.
+The payoff worth selling: with the arc, Morning (sun low in the south east, shadows running north
+west) and Evening (the vanilla north-west light, shadows south east) become genuinely different
+payloads instead of the same bytes twice, which is exactly the difference `README.md:126` says
+vanilla cannot make.
 
 ---
 
@@ -602,5 +630,5 @@ Ideas worth borrowing, in the order they would change this project:
    otherwise. This bounds how far a non-sky-open entity can drift toward the sun direction, not
    whether exteriors follow it.
 3. Whether the bake's bearing slider accepts the full 0–360 compass or is clamped to the
-   north-west quarter. `README.md:122-144` shows only ~45° pairs. The arc presets need 315° and
-   135° — verify in the bake before shipping those rows.
+   north-west quarter. `README.md:122-144` shows only ~45° pairs. The arc presets need 218°,
+   135° and 68° — verify in the bake before shipping those rows.
