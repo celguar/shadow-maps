@@ -7,6 +7,11 @@ so one session can watch the arc cross the sky, and every preset that gets
 written is read back out of the client's bytes and printed, so a sky report
 names the live keys rather than the sky.
 
+Everything below is sv15's, and it is still true of the sv16 build except for
+the `.dat`: sv16 grows the format so ONE file carries several shadow presets per
+map, matched to the same clock that picks the sun's window. That part is the
+section at the end.
+
 Nothing else in the pipeline changed: no new hook, no new file format, no new
 export, and `verify_dll.py` still reports the same hook, the same three detour
 tables and `Load` at RVA 0x27c0 — that RVA moved from sv14's 0x2720 because the
@@ -427,3 +432,122 @@ what mode `h` gives you without any extra work.
   through all of it, which is stock's own night. The disc's own azimuth is the track that cannot be
   made flat with three keys and unwinds from 45° through 101° at midnight to 225° under that horizon;
   the glare is the only thing that reads it.
+
+## sv16: one `.dat` carries six shadow sets of one map, and the clock picks
+
+The sun half of sv15 is finished and the user confirmed it in game: the arc
+crosses the sky, the EK 21:00 sunset matches stock, the ground is not over-bright
+and the shading's bearing agrees with the sun's. What that leaves is the data
+half, and the reason the data half is six sets rather than one is written out
+once, because it is the whole point of the format change:
+
+* `MCSH` bodies are **direction-independent**. The fixup repoints a chunk's
+  `MCNK` header at a payload; it never rotates one. So a shadow map baked at
+  bearing A cannot be made to read as bearing B at runtime — a bearing change is
+  a re-bake.
+* the arc moves the sun's bearing through the day: 225 at 05:30, 135 at noon,
+  45 at 21:30. One baked set therefore agrees with the sun at one moment and
+  disagrees with it everywhere else.
+* so a day needs one baked set per bearing, and the thing that decides which one
+  is live is the same clock that decides the sun's window — which is why the
+  `.dat`'s map table grows a clock word instead of the DLL growing a second
+  mechanism.
+
+Six presets is what the user bakes: `06:30`, `09:00`, `11:30`, `15:30`, `19:30`
+and the stock one stamped `21:30`. Six, not five, because the stock-hours set is
+baked for the whole continent rather than left to the client's own `MCSH`: the
+custom zones the user bakes are not in the client's `.adt`s, so stock hours need
+a baked set too or those zones lose their shadows at night.
+
+### The format, and the pick
+
+Version 2's map record is 32 bytes instead of 28: `char name[24]`, `entryCount`,
+and `h0` — where this record's entries take over in the day, half-minutes from
+midnight, the same unit `SunHalfMinute` reads the client's clock in (`SUN_HMIN_DAY`
+is 2880, so `06:30` is 780 and `21:30` is 2580). A map with several sets is several
+records sharing one name, adjacent in the table and strictly ascending in `h0`; the
+loader refuses a name that appears in two places, refuses two windows of one name
+that overlap, and refuses a window outside a day.
+
+The pick, `PickRunIdx` at the chunk's fixup, right after the name gate:
+
+```
+the clock is not read for a one-record map at all
+otherwise  the record of the matched name whose h0 is the greatest at or below the clock
+           wrapping to the biggest h0 when the clock precedes all of them
+```
+
+The wrap is not cosmetic: it is what gives a set stamped at 21:30 the window
+`21:30 -> 05:50` across midnight, i.e. what keeps stock shadows through sunset, the
+whole night and the pre-dawn hours, and switches to the first baked set at the arc's
+own dawn crossing instead. That is the user's rule — "after sunset till dawn it
+should use stock preset. Only when closer to sunrise it should pick 6 30 preset" —
+implemented as one window that crosses midnight rather than as a special case.
+
+Windows the loader sees are therefore not windows the bake was aimed at: the
+bake's stamp says where the sun was when those shadows were cast, the record's
+`h0` says where the day starts using them. Both matter and only the second is
+machine-checked, so `extract_shadowmaps.py` prints both, as a `windows:` line,
+because a set paired with the wrong archive is a silently wrong day and one
+printed line is not.
+
+Day tiling the six sets ship in, and the same set of numbers in both roles:
+
+| bake stamp | record `h0` | half-minutes |
+|---|---|---|
+| `06:30` | `05:50` | 700 |
+| `09:00` | `07:45` | 930 |
+| `11:30` | `10:15` | 1230 |
+| `15:30` | `13:30` | 1620 |
+| `19:30` | `17:30` | 2100 |
+| `21:30` | `21:30` | 2580 |
+
+The first `h0` is the arc's dawn crossing and the last is the arc's sunset handover
+key, both from the shipped arc, not from the stamps; the four in between are midpoints
+of neighbouring stamps, which is a guess for the hours between two bakes, and `--open`
+is the flag that replaces a guess.
+
+### What was built, and what is guessed in it
+
+A real multi-preset `.dat` now exists in the game folder:
+`shadowmaps-6sets-test.dat`, 177,610,696 bytes, version 2, header map word `Azeroth`
+(not `MULTI` — one map name, six records), variant `6sets-standin`, `mapCount 6`,
+589,793 entries, 333,072 distinct payloads = 170,532,864 payload bytes, and
+`124 + 6*32 + 589793*12 + 170532864 == filesize`. It was built out of the full-size
+Azeroth bakes that already exist, one archive per `--set`:
+
+```
+shadows-Azeroth-morning  06:30      shadows-Azeroth-dusk      15:30
+shadows-Azeroth-noon     09:00      shadows-Azeroth-blizzlike 19:30
+shadows-Azeroth-day      11:30      patch-S                   21:30
+```
+
+**Say what is wrong in it, because it is the point of the file:** those five bakes
+were run at Salmiak's old angles, so their bearings do not agree with the arc's sun
+at those hours. What this file proves is the *selection* machinery — six sets under
+one name, a per-chunk pick against the client's clock, a 162.6 MB arena, a version-2
+table the loader accepts — not the look. The `patch-S` set stamped 21:30 is only 174
+tiles and 38,257 entries, so at night hours most of Azeroth has no entry at all and
+falls back to the client's own `MCSH`; that is the known gap the user's own
+whole-continent 21:30 bake closes.
+
+Measured footprint, printed by the loader before it asks for the arena: **162.6 MB
+of payload arena plus 4.5 MB of key arrays** for one six-set Azeroth. A six-set
+Azeroth plus a six-set Kalimdor is the same order of magnitude — call it ~400 MB,
+not the ~192 MB an earlier round of numbers implied, which was one continent's EK-side
+figure and never both of them. The payload cap went to `0x30000000` (768 MiB) with an
+honest refusal line, so a file too big for a 32-bit client refuses with its MB
+counted rather than half-fitting and drawing from a short table.
+
+### What sv16 does not do
+
+* No per-chunk re-pick of the set. The pick happens at the chunk's fixup, so a
+  preset changes at the next chunk visit after a window crossing, not mid-chunk.
+  Re-picking inside one chunk would mean re-searching per chunk header for a
+  difference no one can see; the latch is deliberate.
+* No compression of the payload pool. Six sets of one continent is 162 MB of arena
+  today, and interning identical bodies already saved 43% of the entries; anything
+  more belongs in the file, not in a client that has to decompress per chunk.
+* The sun sidecar `shadow-mod.sun` forces sun presets, not shadow sets. A
+  shadow-set override would be a second thing to keep in sync with the clock, and
+  the clock drives both, so it does not have one.

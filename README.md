@@ -147,6 +147,48 @@ Run one variant end to end at a time: a fresh whole-map bake drops the packed
 bits the previous walk left in memory, so export (or discard) the morning set
 before starting the noon one.
 
+### The six-set plan: what ships
+
+Shipping one low-sun variant was the old shape of this project. It is not the
+shape now, and the reason is the one the sun fix produced: the DLL walks the
+client's sun along a real east→south→west arc, so the sun's *bearing* changes
+through the day, and a shadow map is baked at exactly one bearing. `MCSH` bodies
+are direction-independent — the fixup only repoints a chunk at a payload — so
+every bearing change is a re-bake. Six bearings a day is what the user ships, and
+one `.dat` carries all six per map, matched to the client's own day clock by the
+version-2 record's `h0` word (see the table above).
+
+| Set | Baked at | Its window opens | What the sun is doing there |
+| --- | --- | --- | --- |
+| 1 | `06:30` | `05:50` | the arc's dawn crossing: the sun is low in the east, this is the first set the day uses |
+| 2 | `09:00` | `07:45` | mid-morning |
+| 3 | `11:30` | `10:15` | late morning |
+| 4 | `15:30` | `13:30` | early afternoon |
+| 5 | `19:30` | `17:30` | the last set before the arc hands over |
+| 6 | `21:30` | `21:30` | the arc's dusk crossing, so this set owns sunset, the whole night and the pre-dawn hours until the next `05:50` — the set that must read like stock |
+
+Set 6 opens at its own stamp rather than at a midpoint because that is where the
+DLL's arc stops moving the sun, and set 1 opens at `05:50`, the arc's dawn
+crossing, because before it the light is still stock's and stock shadows are the
+ones that match the ground. The four openings in between are midpoints of
+neighbouring stamps — a guess for the hours between two bakes, and what `--open`
+is for.
+
+The set stamped `21:30` is the one the user bakes at the stock angles for the
+whole continent, not the patch's stock shadows: that is why the plan says six
+presets rather than five-plus-whatever-the-client-already-has, and it is what
+lets stock hours carry custom-zone shadows too.
+
+Honest arena numbers for that file — measured, not extrapolated, from the stand-in
+six-set test `.dat` in the game folder (see the section below): 589,793 entries
+over 333,072 distinct payloads, so **162.6 MB of arena** plus 4.5 MB of key
+arrays, in a 177,610,696-byte file, all six sets of one Azeroth. A real six-set
+Azeroth plus a real six-set Kalimdor is the same order of magnitude — call it
+~400 MB, not the ~192 MB an earlier round of numbers implied, which was one
+continent's EK-side figure. The DLL logs the footprint before it asks for the
+arena and refuses over `0x30000000` (768 MiB) of payloads rather than half-fitting
+one.
+
 ## Files
 
 | File | What it is |
@@ -168,26 +210,27 @@ All little-endian, packed at natural sizes, nothing aligned to anything else.
 The file must be **exactly** as long as its own header says, and the loader
 refuses a short file (truncated) *and* a long one (junk appended), because
 either means the counts and the archive disagree and a shadow set would be
-applied from a half-read table. Two lengths are legal, and the header's last
-word picks which:
+applied from a half-read table. Two lengths are legal at each version, and the
+header's last word picks which:
 
 ```
-mapCount == 0            124 + entryCount*8   + payloadBytes   (legacy, one map)
-mapCount 1..64           124 + mapCount*28 + entryCount*12 + payloadBytes
+mapCount == 0                 124 + entryCount*8   + payloadBytes   (legacy, one map)
+mapCount 1..64   version 1    124 + mapCount*28 + entryCount*12 + payloadBytes
+mapCount 1..256  version 2    124 + mapCount*32 + entryCount*12 + payloadBytes
 ```
 
 | Field | Bytes | Meaning |
 | --- | --- | --- |
 | `magic` | 4 | `SHDW` |
-| `version` | 4 | `1` (`SHADOW_DAT_VERSION`) |
-| `map` | 24 | map name, NUL-terminated inside the 24 (`Azeroth`), or `MULTI` when the file carries several maps |
+| `version` | 4 | `1` or `2` (`SHADOW_DAT_VERSION` is the newest one this DLL reads); 2 says a map record carries a clock |
+| `map` | 24 | map name, NUL-terminated inside the 24 (`Azeroth`), or `MULTI` when the file carries several maps — a six-set continent is still ONE name here |
 | `variant` | 40 | label for the log line, NUL-terminated inside the 40 |
-| `entryCount` | 4 | chunks with a payload, all maps together |
+| `entryCount` | 4 | chunks with a payload, all maps and sets together |
 | `payloadUnique` | 4 | distinct payloads (`payloadBytes == payloadUnique*512`) |
-| `tiles` | 4 | tiles this set covers, all maps together |
+| `tiles` | 4 | tiles this set covers, all maps together (sets of one map share their tiles) |
 | tile/chunk bounds | 8 × `int32` | `tx0,ty0,tx1,ty1` then `cx0,cy0,cx1,cy1`, over every map |
-| `mapCount` | 4 | `0` for the single-map file the format had before, `1..64` for a file that carries a map table |
-| map records | `mapCount` × 28 | `char name[24]` NUL-terminated inside the 24, then that map's `entryCount` — only present when `mapCount` is not 0 |
+| `mapCount` | 4 | `0` for the single-map file the format had before, `1..64` for a file that carries a map table at version 1, `1..256` at version 2 — it counts RECORDS, so a map with six shadow sets costs six |
+| map records | `mapCount` × 28 (v1) or × 32 (v2) | `char name[24]` NUL-terminated inside the 24, then that record's `entryCount`; version 2 adds one dword after the count, `h0`, where this record's run of entries starts in the day, half-minutes from midnight (`06:30` is 780, `21:30` is 2580) |
 | entries | `entryCount` × 8 or × 12 | `key`, `payloadOffset`, then the entry's row in the map table — the third word is there only when `mapCount` is not 0 |
 | payload area | `payloadUnique` × 512 | packed `MCSH` bodies, 64×64 texels, LSB-first |
 
@@ -222,6 +265,21 @@ shadow. With `mapCount 1` the table still gets a row, and the header's `map`
 word keeps the real map name so an older reader that ignores the table still
 gates on the right map; with several maps the header says `MULTI`, so an older
 reader refuses outright instead of drawing one map's shadows onto another's.
+
+Version 2 is the same table with one more word per row, so **a row is a shadow SET
+of a map, not a map**: six rows all named `Azeroth` is one continent's six presets.
+The extra dword, `h0`, is where that row's entries take over in the day, in the
+same half-minutes-from-midnight the DLL's `SunHalfMinute` reads the client's clock
+in. The contract the loader enforces is that a name's rows are **adjacent** in the
+table — the gate walks them as one group and refuses a name that appears in two
+places — and **strictly ascending in `h0`** inside the group, because the pick is
+"the row whose `h0` is the greatest at or below the clock", wrapping to the biggest
+`h0` when the clock precedes all of them. That wrap is what makes a set stamped at
+the arc's dusk crossing own the night: its window is `21:30 → 05:50` across
+midnight. `h0 == 0xFFFFFFFF` (`SHADOW_DAT_H0_ALL`) is only legal on a one-row map,
+where there is nothing to pick between and the clock is never read. The rows are
+written in that order by `extract_shadowmaps.py`, which prints the `windows:` line
+it settled on so a set paired with the wrong archive is visible rather than silent.
 
 **An entry's `payloadOffset` addresses the payload area, which starts after BOTH
 tables** — the map-record table, then the entry table — so byte 0 of the pool is file
@@ -410,6 +468,11 @@ build chose, so an off-by-eight is a build failure, not an in-game crash.
 
 ## What this machine produces
 
+The sv16 build, i.e. what this branch's HEAD is: `out\ShadowMaps.dll`
+**165,888 bytes**, i686, exports `Load`, accepted by `verify_dll.py` with zero
+complaints, and its log banner reads `sv16`. The paragraphs below are the sv13
+round's record of the game folder and keep their own numbers.
+
 `out\ShadowMaps.dll` 146,944 bytes and `build\Release\ShadowMaps.dll` 147,968
 bytes, both i686, both exporting `Load` (at RVA `0x2530` and `0x2760`), both
 importing only `KERNEL32.dll`, both accepted by `verify_dll.py` with zero
@@ -433,6 +496,23 @@ re-tested by renaming back) and `shadowmaps-Kalimdor.dat` (7,818,452 bytes, Kali
 125 tiles and 27,723 entries). Both legacy files report `mapCount 0` and pass the
 8-byte rule, which is the point of `mapCount 0`: swapping between the two shapes is one
 file rename, no rebuild.
+
+Beside them sits the six-set test file, `shadowmaps-6sets-test.dat` (177,610,696 bytes,
+`SHDW` **v2**, header map word `Azeroth`, variant `6sets-standin`, `mapCount 6` records of
+32 bytes, 589,793 entries, 333,072 payloads = 170,532,864 payload bytes = **162.6 MB of
+arena**, 498 tiles, and `124 + 6*32 + 589793*12 + 170532864 == filesize`). Its six runs are
+one per full-size Azeroth bake in the folder — `shadows-Azeroth-morning` stamped 06:30,
+`-noon` 09:00, `-day` 11:30, `-dusk` 15:30, `-blizzlike` 19:30 and `patch-S` 21:30 — at
+windows 05:50, 07:45, 10:15, 13:30, 17:30, 21:30. **Say what is guessed in it:** those five
+bakes were run at Salmiak's old wrong angles, so their bearings do not agree with the arc's
+sun at those hours; the file is a stand-in whose purpose is to exercise the *selection*
+machinery — six sets of one map, a name that appears six times, a per-chunk pick against
+the clock, 162 MB of arena — not to look right. The `patch-S` 21:30 run is only 174 tiles
+and 38,257 entries, so at night hours most of Azeroth has no entry and falls back to the
+client's own `MCSH`; that is the known gap the user's own whole-continent 21:30 bake closes.
+Build the file with `--set` once per archive in the same order, so an off-by-one there would
+put noon's shadows in morning's window, and the script prints the `windows:` line it settled
+on so a wrong pairing is visible rather than silent.
 
 There is **no `shadow-mod.mode` in the folder**, which is the whole point of the sv13 image
 sitting there: the state being tested is the state a user gets, and a launch from it writes

@@ -215,6 +215,32 @@
  *  visits showed the disc, the ground and the objects naming three different
  *  places for the same light.
  *
+ *  What sv16 adds: one .dat carries SEVERAL SHADOW SETS of a map, and the day
+ *  clock picks which one a chunk draws. A shadow map is baked at one clock and
+ *  baked bytes do not rotate, so a sun that walks an arc can only be matched on
+ *  the ground by a set per clock and a pick that follows the sky's own crossing
+ *  -- the same crossing, the same clock, so the ground and the shading never
+ *  name two different places for one light. The header's version word, pinned
+ *  at 1 until now, says whether a map record carries a clock: 1 keeps the
+ *  28-byte name+count record every file so far wrote, 2 makes it 32 with one
+ *  h0 word after the count -- where in the day this record's run of entries
+ *  starts, in the half-minutes SunHalfMinute returns, so 06:30 is 780 and 21:30
+ *  is 2580. A map with several sets is several records sharing one name,
+ *  contiguous and ascending in h0, and the loader refuses rather than guesses
+ *  when that stops being true, because all three failures draw another map's
+ *  shadows: a name in two places, two records claiming one window, a group of
+ *  several claiming every clock. PickRunIdx answers a chunk with the record
+ *  whose h0 is the greatest at or below the client's own clock, wrapping to the
+ *  biggest when the clock is before all of them, so a set stamped 21:30 owns
+ *  21:30 through midnight through 05:49 -- stock shadows through the night,
+ *  which is what the lighting does there -- and the morning set starts where the
+ *  light starts moving. A map with one set reads no clock at all, so a one-set
+ *  file pays exactly what it paid before. mapCount counts RECORDS now, and its
+ *  cap went to 256 because a six-set continent is six records; the arena is the
+ *  whole pool whatever map loads, so the honest MB is printed BEFORE the
+ *  VirtualAlloc rather than left to a NULL -- one continent's set is ~34 MB,
+ *  its six is ~204 MB, and the refusal cap is 768 MB named in MB.
+ *
  * runs came back with their install lines and no new crash: mode a (the whole
  * 34 MB arena resident, no hook), mode c (the store and landing at 0x6AF5F0,
  * no call) and mode d (the call with its arguments read from [ebp+8] on the
@@ -303,13 +329,15 @@
 #include <string.h>
 #include "../shadow_dat.h"
 
-#define STAMP "sv15" /* build stamp, printed in every log line: an old build of
+#define STAMP "sv16" /* build stamp, printed in every log line: an old build of
                      * this DLL sitting next to a new .dat is the most common
                      * confusion, so the line says which build made it, and the
                      * mode line below names which of the seven rungs ran. sv11
                      * and sv12 are sv10 with only the .dat's chunk addressing
                      * changed -- sv12 fixes which byte the payload area starts
                      * at, and neither touches the hook, the stubs or the writes
+                     * -- and sv16 only changes how a .dat is read, so a sv15
+                     * version-1 file and a sv16 one draw the same shadows
                      * -- so an sv10, sv11 or sv12 log line means the same thing
                      * about the hook and differs only in which .dat shape built
                      * it. sv13 changes neither the hook nor the format: it moves
@@ -426,6 +454,13 @@ static const char *k_table_cc[] = {"MCVT", "MCNR", "MCLY", "MCRF", "MCAL",
  * directly, so this is now only a trail that says how far the walk got, and
  * 2000 lines is enough for that without a log the size of the run */
 #define AUDIT_LOG_MAX 2000u
+/* the line naming which of a map's shadow sets the clock picked is one per
+ * change of pick, and a session that runs the day at 60 game minutes a real
+ * second crosses the six window edges hundreds of times, so the cap is what
+ * keeps the switch trail inside the newest LOG_KEEP_BYTES rather than a wall of
+ * the same six lines: 40 covers the switches of the first few days and says so
+ * when it stops */
+#define SET_LOG_MAX 40u
 /* sv13 keeps the log bounded so several launches cannot leave a file the size of
  * the run: at load, a log already past LOG_MAX_BYTES is cut to its newest LOG_KEEP
  * _BYTES, and the cut starts at a newline so a line is never split in half. A log
@@ -449,17 +484,29 @@ static unsigned *g_offs;              /* payload byte offset inside arena   */
 /* one .dat can carry several maps (see shadow_dat.h's map-record table): a
  * chunk key is only unique INSIDE a map -- tile 14,20 chunk 3,5 of Azeroth and
  * of Kalimdor are the same number -- so the file's entries are kept in one
- * contiguous run per map and the per-chunk name gate picks the run to search.
+ * contiguous run per record and the per-chunk name gate picks the run to search.
  * A file that predates the map table (its header's mapCount word is 0) is
  * treated as exactly one run named by the header's map field, which is what
  * every single-map .dat written so far already is. g_dat_map is then only the
  * file's own label, and g_dat_maps_txt is the joined list of gate names, used
- * by the one mismatch line the per-chunk gate prints. */
-static unsigned g_mapCount;                                   /* 1..64 runs */
+ * by the one mismatch line the per-chunk gate prints.
+ * From version 2 a run is a shadow SET of a map, not a map: several runs share
+ * one name, each opens at a clock word (g_map_h0, half-minutes from midnight,
+ * the unit SunHalfMinute returns), and the gate takes the run of the matched
+ * map whose window the client's own clock falls in -- the greatest h0 at or
+ * below it, wrapping to the biggest h0 when the clock is earlier than all of
+ * them, so the preset stamped at sunset owns the night and a map whose runs
+ * carry no clock word keeps exactly the one-run behaviour it had before. */
+static unsigned g_mapCount;                                   /* 1..256 runs */
 static unsigned g_map_start[SHADOW_DAT_MAP_MAX];    /* first entry of a run  */
 static unsigned g_map_len[SHADOW_DAT_MAP_MAX];      /* entries in that run    */
+static unsigned g_map_h0[SHADOW_DAT_MAP_MAX];       /* clock the run opens at  */
 static char g_map_name[SHADOW_DAT_MAP_MAX][24];     /* gate name of a run     */
-static char g_dat_maps_txt[512];                    /* every run, for the log */
+static char g_dat_maps_txt[512];  /* every DISTINCT gate name, for the log: a
+                                    * map with six sets is one name here, not six */
+static char g_dat_set_txt[640];   /* each map's window opens, one log line   */
+static int g_set_last = -1;       /* record the per-chunk gate picked last   */
+static unsigned g_set_logs;       /* switch-of-set lines logged this session */
 static unsigned char *g_arena;        /* payloadUnique x 512 live shadow maps */
 static unsigned char *g_stub;         /* the executable page holding the detour */
 static unsigned char g_dat_map[24];   /* header's map name, NUL-terminated  */
@@ -1867,6 +1914,71 @@ static void TimeSpeedKeep(void)
 
 /* ---------------------------------------------------- the per-chunk fix **/
 
+/* which of a map's records answers the client's own clock. The gate above found
+ * the map's first record; a map with one record is that record and the clock is
+ * never read, so a single-set file pays exactly what it paid before. A map with
+ * several is a group of contiguous records whose clocks were validated at load
+ * to be strictly ascending, so the answer is the last one at or below the
+ * clock, and when the clock is earlier than every one of them the biggest clock
+ * owns the wrap: the window that opened at 21:30 covers 21:30 -> midnight ->
+ * 05:49, which is what hands the night to the stock set and starts the morning
+ * set where the light starts moving. The clock read is the same SunHalfMinute
+ * the sun's key tables are picked by, so the ground and the shading change at
+ * the same crossing the sky does -- and both change at the next chunk visit
+ * after that crossing, which is the latch the user's plan expects.
+ * The pick is logged when it changes and only for a map that HAS several sets,
+ * capped, naming the clock and the window it opened: the ground can then be
+ * read against the sky's own crossing rather than guessed from a screenshot. */
+static int PickRunIdx(unsigned first)
+{
+    unsigned n = 1u, i, hmin = 0u, h0;
+    int chosen = (int)first;
+    char msg[512];
+
+    for (i = first + 1u; i < g_mapCount; ++i) {
+        if (!CiEqName((const char *)g_map_name[i], (const char *)g_map_name[first]))
+            break;
+        ++n;
+    }
+    if (n > 1u) {
+        hmin = SunHalfMinute(NULL);
+        for (i = 0; i < n; ++i) {
+            if (g_map_h0[first + i] <= hmin)
+                chosen = (int)(first + i);
+            else
+                break; /* the group is ascending: nothing after is at or below */
+        }
+        if (g_map_h0[first] > hmin)
+            chosen = (int)(first + n - 1u); /* the clock is before every window,
+                                              * so the last one wraps and owns it */
+    }
+    if (n > 1u && chosen != g_set_last) {
+        g_set_last = chosen;
+        if (g_set_logs < SET_LOG_MAX) {
+            ++g_set_logs;
+            h0 = g_map_h0[chosen];
+            snprintf(msg, sizeof msg,
+                     STAMP " shadows: map '%s' picked set %u of %u, the window opened at %02u:%02u"
+                            " (h0 %u of %u half-minutes), with the client's own clock read as %02u:%02u"
+                            " (hmin %u) and %u entries in that run; the sun's key tables are picked by"
+                            " the same clock, so this is the set the ground draws",
+                     (const char *)g_map_name[chosen],
+                     (unsigned)(chosen - (int)first + 1), n,
+                     h0 / 120u, (h0 % 120u) / 2u, h0, SUN_HMIN_DAY,
+                     hmin / 120u, (hmin % 120u) / 2u, hmin, g_map_len[chosen]);
+            LogMsg(msg);
+        } else if (g_set_logs == SET_LOG_MAX) {
+            ++g_set_logs;
+            snprintf(msg, sizeof msg,
+                     STAMP " shadows: the switch-of-set lines reached their cap (%u): later crossings"
+                            " still change what the ground draws, they just say nothing",
+                     (unsigned)SET_LOG_MAX);
+            LogMsg(msg);
+        }
+    }
+    return chosen;
+}
+
 /* Called by the asm entry with thiscall layout: this in ecx, record on the
  * stack. Runs on whatever thread loads the chunk; touches only immutable
  * post-install state, the chunk's own header, and one-shot log flags. */
@@ -2018,7 +2130,12 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
      * when a session changes map, and it names which of the file's runs to
      * search: a key that two maps share cannot answer with the wrong map's
      * shadow. A single-map file is one run and one string compare, exactly as
-     * before, so nothing about the common case got slower. */
+     * before, so nothing about the common case got slower.
+     * From version 2 a name is not one run: the find below lands on the map's
+     * FIRST record and PickRunIdx moves it to the record of that map whose
+     * window the client's own day clock falls in -- the same clock the sun's
+     * key tables were picked by above, so the ground follows the same crossing
+     * the sky does. A map with one record is that record, clock not read. */
     client_map = (const unsigned char *)ADDR_MAP_NAME;
     which = -1;
     for (i = 0; i < g_mapCount; ++i) {
@@ -2037,6 +2154,7 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
         }
         return;
     }
+    which = PickRunIdx((unsigned)which);
 
     gx = ((const unsigned *)(const char *)((char *)self_ + FIELD_GLOBAL_COL))[0];
     gy = ((const unsigned *)(const char *)((char *)self_ + FIELD_GLOBAL_ROW))[0];
@@ -2533,7 +2651,8 @@ static int Install(void)
     long fsize;
     unsigned char *ent;
     unsigned char *rec;
-    unsigned i, prev_key, mapCount, stride, run, start, shown;
+    unsigned i, prev_key, mapCount, stride, run, start, shown, recStride;
+    unsigned grp_start[SHADOW_DAT_MAP_MAX], grp_len[SHADOW_DAT_MAP_MAX], grpCount, maxSets;
     int fresh; /* the entry loop: 1 at a run's first entry */
     unsigned char *arena;
     unsigned char *site = (unsigned char *)(size_t)ADDR_LOAD;
@@ -2787,11 +2906,19 @@ static int Install(void)
         fclose(f);
         return 0;
     }
-    if (head.version != SHADOW_DAT_VERSION) {
-        LogMsg(STAMP " shadowmaps.dat version is not 1 (re-extract with the current script): refusing to patch");
+    if (head.version < SHADOW_DAT_VERSION_MIN || head.version > SHADOW_DAT_VERSION) {
+        LogMsg(STAMP " shadowmaps.dat version is neither 1 nor 2 (re-extract with the current script): refusing to patch");
         fclose(f);
         return 0;
     }
+    /* the stride comes from the version and is never guessed: a version-2 file
+     * read with 28-byte records slides the h0 word into the next record's name
+     * and a version-1 file read with 32 slides every name after the first, and
+     * both then draw another map's shadows. 1 is what every writer so far made
+     * and has no clock word, so its runs answer for the whole day; 2 adds one
+     * h0 word per record and is what lets one map carry several shadow sets */
+    recStride = (head.version >= SHADOW_DAT_VERSION) ? SHADOW_DAT_MAP_RECORD_V2
+                                                     : SHADOW_DAT_MAP_RECORD_V1;
     if (head.map[23] != 0) { /* need a NUL inside the 24 to compare safely */
         LogMsg(STAMP " shadowmaps.dat map name is not NUL-terminated: refusing to patch");
         fclose(f);
@@ -2810,8 +2937,24 @@ static int Install(void)
         fclose(f);
         return 0;
     }
-    if (head.payloadBytes > 0x40000000u) { /* 1 GiB arena: far past any real set */
-        LogMsg(STAMP " shadowmaps.dat payload area is too big to keep resident: refusing to patch");
+    if (head.payloadBytes > 0x30000000u) { /* 768 MiB arena: a 32-bit client has a
+                                             * 2 GB address space, and this DLL
+                                             * keeps the WHOLE pool resident as
+                                             * one block the chunk headers point
+                                             * into. A shadow set of one full
+                                             * continent is ~34 MB, so a six-set
+                                             * file over two continents is already
+                                             * near half of what is left here and
+                                             * the next set has to be refused with
+                                             * the number, not fail in game */
+        snprintf(msg, sizeof msg,
+                 STAMP " shadowmaps.dat payload area is %u MB of resident arena, past the %u MB this"
+                       " DLL will keep: one shadow set of a full continent is ~34 MB and every set in"
+                       " the one file pays for itself, so cut the file down or merge sets -- refusing"
+                       " to patch",
+                 (unsigned)(head.payloadBytes / (1024u * 1024u)),
+                 (unsigned)(0x30000000u / (1024u * 1024u)));
+        LogMsg(msg);
         fclose(f);
         return 0;
     }
@@ -2825,24 +2968,39 @@ static int Install(void)
      * the rule has to say how long the file is WITH the record table. mapCount 0
      * is the single-map file the format had before -- one run, named by the
      * header's map field, 8-byte entries -- so every .dat written so far still
-     * loads unchanged. mapCount 1..64 puts a table of 28-byte records between the
-     * header and the entries, and every entry then carries its run's index, which
-     * is what lets one .dat carry several maps: a chunk key is only unique inside
-     * one map, so the run the per-chunk gate searches is what keeps Azeroth's
-     * shadows off Kalimdor's chunks. */
+     * loads unchanged. mapCount 1..256 puts a table of recStride-byte records
+     * between the header and the entries, and every entry then carries its
+     * record's index, which is what lets one .dat carry several maps: a chunk
+     * key is only unique inside one map, so the run the per-chunk gate searches
+     * is what keeps Azeroth's shadows off Kalimdor's chunks.
+     * From version 2 a record is a shadow SET of a map rather than a map, so
+     * mapCount counts records and several of them share one name. Three things
+     * about that table are refused rather than tolerated, because each one
+     * turns into a wrong map's shadow rather than a crash: a name that appears
+     * in two places is two groups for the same map and the per-chunk walk only
+     * ever sees the first; a group whose clocks are not strictly ascending has
+     * two records claiming one window; and a group of several carrying the
+     * whole-day marker would have two records claiming every clock. */
     mapCount = head.mapCount;
     stride = 8u;
     rec_bytes = 0;
     rec = NULL;
+    grpCount = 0;
+    maxSets = 0u;
     if (mapCount > SHADOW_DAT_MAP_MAX) {
-        LogMsg(STAMP " shadowmaps.dat names too many maps (want at most 64): refusing to patch");
+        snprintf(msg, sizeof msg,
+                 STAMP " shadowmaps.dat has more map records than the loader keeps room for"
+                       " (it has %u records over %u map name(s), want at most %u -- a map with"
+                       " six shadow sets costs six records): refusing to patch",
+                 mapCount, mapCount, (unsigned)SHADOW_DAT_MAP_MAX);
+        LogMsg(msg);
         fclose(f);
         return 0;
     }
     if (mapCount) {
         unsigned total = 0;
         stride = 12u;
-        rec_bytes = (size_t)mapCount * SHADOW_DAT_MAP_RECORD_BYTES;
+        rec_bytes = (size_t)mapCount * recStride;
         rec = (unsigned char *)malloc(rec_bytes);
         if (!rec) {
             LogMsg(STAMP " out of memory for the map record table: refusing to patch");
@@ -2857,7 +3015,7 @@ static int Install(void)
         }
         start = 0;
         for (i = 0; i < mapCount; ++i) {
-            const unsigned char *r = rec + (size_t)i * SHADOW_DAT_MAP_RECORD_BYTES;
+            const unsigned char *r = rec + (size_t)i * recStride;
             if (r[0] == 0 || r[23] != 0) {
                 LogMsg(STAMP " a map record has no name or one that does not fit its 24 bytes: refusing to patch");
                 free(rec);
@@ -2866,9 +3024,25 @@ static int Install(void)
             }
             memcpy(g_map_name[i], r, 24);
             g_map_name[i][23] = 0;
-            /* the record's entryCount is at +24 */
+            /* the record's entryCount is at +24, and a version-2 record's clock
+             * word right after it at +28: half-minutes from midnight, the same
+             * unit SunHalfMinute returns */
             g_map_start[i] = start;
             g_map_len[i] = ((const unsigned *)(r + 24))[0];
+            g_map_h0[i] = SHADOW_DAT_H0_ALL;
+            if (recStride >= SHADOW_DAT_MAP_RECORD_V2) {
+                g_map_h0[i] = ((const unsigned *)(r + 28))[0];
+                if (g_map_h0[i] != SHADOW_DAT_H0_ALL && g_map_h0[i] >= SUN_HMIN_DAY) {
+                    snprintf(msg, sizeof msg,
+                             STAMP " map record %u says its window opens at %u half-minutes, past the"
+                                   " %u of a day: refusing to patch",
+                             i, g_map_h0[i], (unsigned)SUN_HMIN_DAY);
+                    LogMsg(msg);
+                    free(rec);
+                    fclose(f);
+                    return 0;
+                }
+            }
             start += g_map_len[i];
             total += g_map_len[i];
         }
@@ -2878,28 +3052,127 @@ static int Install(void)
             fclose(f);
             return 0;
         }
+        /* the groups: a name's records must be one contiguous span, and inside a
+         * span of several the windows must open strictly later than the one
+         * before. Built here because the per-chunk walk and the install lines
+         * both want them. */
+        {
+            unsigned g0 = 0;
+            while (g0 < mapCount) {
+                unsigned g1 = g0 + 1u, j;
+                while (g1 < mapCount && CiEqName(g_map_name[g1], g_map_name[g0]))
+                    ++g1;
+                if (g1 - g0 > maxSets)
+                    maxSets = g1 - g0;
+                for (j = g0 + 1u; j < g1; ++j) {
+                    if (g_map_h0[j] == SHADOW_DAT_H0_ALL || g_map_h0[g0] == SHADOW_DAT_H0_ALL) {
+                        snprintf(msg, sizeof msg,
+                                 STAMP " map '%s' has %u records and one of them carries the whole-day"
+                                       " marker instead of a clock: refusing to patch",
+                                 (const char *)g_map_name[g0], g1 - g0);
+                        LogMsg(msg);
+                        free(rec);
+                        fclose(f);
+                        return 0;
+                    }
+                    if (g_map_h0[j] <= g_map_h0[j - 1u]) {
+                        snprintf(msg, sizeof msg,
+                                 STAMP " map '%s' has two records opening at the same or an earlier"
+                                       " clock (%u then %u): refusing to patch",
+                                 (const char *)g_map_name[g0], g_map_h0[j - 1u], g_map_h0[j]);
+                        LogMsg(msg);
+                        free(rec);
+                        fclose(f);
+                        return 0;
+                    }
+                }
+                for (j = 0; j < grpCount; ++j) {
+                    if (CiEqName(g_map_name[grp_start[j]], g_map_name[g0])) {
+                        snprintf(msg, sizeof msg,
+                                 STAMP " map '%s' appears in the record table twice, with other maps"
+                                       " between: its records have to be adjacent, refusing to patch",
+                                 (const char *)g_map_name[g0]);
+                        LogMsg(msg);
+                        free(rec);
+                        fclose(f);
+                        return 0;
+                    }
+                }
+                grp_start[grpCount] = g0;
+                grp_len[grpCount] = g1 - g0;
+                ++grpCount;
+                g0 = g1;
+            }
+        }
         g_mapCount = mapCount;
     } else {
         /* one run, named by the header */
         g_mapCount = 1;
         g_map_start[0] = 0;
         g_map_len[0] = head.entryCount;
+        g_map_h0[0] = SHADOW_DAT_H0_ALL;
         memcpy(g_map_name[0], head.map, 24);
         g_map_name[0][23] = 0;
+        grp_start[0] = 0;
+        grp_len[0] = 1u;
+        grpCount = 1;
+        maxSets = 1u;
     }
     memcpy(g_dat_map, head.map, 24); /* the file's label: a several-map writer
                                        * puts "MULTI" here, and the names that
-                                       * gate a chunk are g_map_name's */
-    /* the joined list the mismatch line prints, so a wrong-map run says every
-     * name the file does answer for, not just one */
+                                       * gate a chunk are the records' */
+    /* the joined list the mismatch line prints: every DISTINCT name the file
+     * answers for, so a six-set map says its name once rather than six times */
     g_dat_maps_txt[0] = 0;
     shown = 0;
-    for (i = 0; i < g_mapCount; ++i) {
+    for (i = 0; i < grpCount; ++i) {
         if (shown + 32 >= sizeof g_dat_maps_txt)
             break;
         snprintf(g_dat_maps_txt + shown, sizeof g_dat_maps_txt - shown,
-                 "%s%s", shown ? " " : "", g_map_name[i]);
-        shown += (unsigned)strlen(g_map_name[i]) + (shown ? 1u : 0u);
+                 "%s%s", shown ? " " : "", g_map_name[grp_start[i]]);
+        shown += (unsigned)strlen(g_map_name[grp_start[i]]) + (shown ? 1u : 0u);
+    }
+    /* and the windows, so a run that draws the wrong set can be read against
+     * the clock instead of guessed: one line per map that has several sets */
+    g_dat_set_txt[0] = 0;
+    {
+        size_t used = 0;
+        for (i = 0; i < grpCount; ++i) {
+            unsigned j;
+            int n;
+            if (grp_len[i] < 2u)
+                continue;
+            if (used + 96 >= sizeof g_dat_set_txt)
+                break;
+            n = snprintf(g_dat_set_txt + used, sizeof g_dat_set_txt - used,
+                         "%s%s %u sets windows ",
+                         used ? " |" : "", (const char *)g_map_name[grp_start[i]], grp_len[i]);
+            if (n < 0)
+                break;
+            used += (size_t)n;
+            for (j = 0; j < grp_len[i]; ++j) {
+                unsigned h0 = g_map_h0[grp_start[i] + j];
+                n = snprintf(g_dat_set_txt + used, sizeof g_dat_set_txt - used,
+                             "%s%02u:%02u", used ? " " : "", h0 / 120u, (h0 % 120u) / 2u);
+                if (n < 0)
+                    break;
+                used += (size_t)n;
+                if (used >= sizeof g_dat_set_txt)
+                    break;
+            }
+            if (used >= sizeof g_dat_set_txt)
+                break;
+            g_dat_set_txt[used++] = ';';
+            if (used >= sizeof g_dat_set_txt)
+                break;
+            g_dat_set_txt[used++] = ' ';
+            if (used >= sizeof g_dat_set_txt)
+                break;
+        }
+        if (used >= sizeof g_dat_set_txt)
+            g_dat_set_txt[sizeof g_dat_set_txt - 1] = 0;
+        else
+            g_dat_set_txt[used] = 0;
     }
 
     table_bytes = (size_t)head.entryCount * stride;
@@ -3005,12 +3278,40 @@ static int Install(void)
      * run that proved this reservation harmless: it holds the whole 34 MB arena
      * resident and returns before the hook, and a real sv9 run of it entered the
      * world with no crash, so nothing about the earlier 0xC0000005 is memory. */
+    /* the number first, and the honest one: the arena is committed here, not on
+     * demand, and it is the whole pool whatever map is loaded. dedupe has little
+     * to share once the shadows actually move, so a set of a full continent
+     * (~34 MB for Eastern Kingdoms' 114,328 chunks, 66,413 distinct maps) pays
+     * for itself and every set in the same .dat adds another one of those --
+     * which is why the write that asks for 200 MB has to name it before the
+     * call rather than after a NULL */
+    {
+        unsigned mb = (unsigned)(head.payloadBytes / (1024u * 1024u));
+        snprintf(msg, sizeof msg,
+                 STAMP " footprint before the arena: %u payloads = %u MB of resident shadow pool,"
+                        " plus %u entries x 4 bytes x 2 key arrays = %u MB, over %u map name(s)"
+                        " and %u records, the most %u sets of one map. dedupe only shares bytes two"
+                        " chunks literally have, so a full-continent set is ~34 MB and its 6 shadows"
+                        " over the day are ~204 MB for one continent and ~400 MB for both: the client"
+                        " is 32-bit with a 2 GB space the game already part-fills, and this arena is"
+                        " committed at load, so a run that dies loading a zone with a huge .dat has"
+                        " its number in this line rather than in a NULL from VirtualAlloc",
+                 head.payloadUnique, mb, head.entryCount,
+                 (unsigned)((head.entryCount * 8u) / (1024u * 1024u)),
+                 grpCount, mapCount, maxSets);
+        if (maxSets > 1u || mb >= 128u)
+            LogMsg(msg);
+        else
+            LogVerb(msg);
+    }
     arena = (unsigned char *)VirtualAlloc(NULL, (SIZE_T)head.payloadBytes,
                                           0x00003000u, 0x00000004u);
     if (!arena) {
         snprintf(msg, sizeof msg, STAMP " VirtualAlloc for the shadow arena failed"
-                 " (asked %u bytes, dwFlags 0x3000, protect 0x4), GetLastError"
-                 " %#x: refusing to patch", head.payloadBytes, GetLastError());
+                 " (asked %u bytes, %u MB, dwFlags 0x3000, protect 0x4), GetLastError"
+                 " %#x: refusing to patch",
+                 head.payloadBytes, (unsigned)(head.payloadBytes / (1024u * 1024u)),
+                 GetLastError());
         LogMsg(msg);
         fclose(f);
         return 0;
@@ -3040,16 +3341,27 @@ static int Install(void)
      * for gy 517 gx 448 and the ground showed the baked shadows) */
     g_arena = arena;
 
-    /* one line naming every run the file answers for, entry counts included, so
-     * a run that draws nothing can be read against the client's own map without
-     * guessing which map the file was cut for -- and a file that carries several
-     * says so here, which is the point of the map table */
-    snprintf(msg, sizeof msg, STAMP " shadowmaps.dat answers for %u map(s):", g_mapCount);
+    /* one line naming every map NAME the file answers for, entry counts summed
+     * over that name's sets, so a run that draws nothing can be read against the
+     * client's own map without guessing which map the file was cut for. mapCount
+     * counts RECORDS, so a six-set continent is one name here with six runs
+     * behind it, and the line after it spells the windows those runs own --
+     * which set the ground draws is a question the clock answers, so its bounds
+     * have to be in the log and not in a screenshot */
+    snprintf(msg, sizeof msg,
+             STAMP " shadowmaps.dat version %u (records are %u bytes) answers for %u map name(s)"
+                    " over %u records:",
+             head.version, recStride, grpCount, mapCount);
     {
         size_t used = strlen(msg);
-        for (i = 0; i < g_mapCount; ++i) {
+        for (i = 0; i < grpCount; ++i) {
+            unsigned j, ents = 0;
             int n;
-            n = snprintf(msg + used, sizeof msg - used, " %s %u entries", g_map_name[i], g_map_len[i]);
+            for (j = 0; j < grp_len[i]; ++j)
+                ents += g_map_len[grp_start[i] + j];
+            n = snprintf(msg + used, sizeof msg - used,
+                         " %s %u set(s) %u entries", (const char *)g_map_name[grp_start[i]],
+                         grp_len[i], ents);
             if (n < 0)
                 break;
             used += (size_t)n;
@@ -3063,17 +3375,26 @@ static int Install(void)
         }
     }
     LogVerb(msg);
+    if (maxSets > 1u) {
+        snprintf(msg, sizeof msg,
+                 STAMP " .dat windows per map: %s: a map's set is picked by the client's own day"
+                        " clock, the window opened at or before it and wrapping to the last, so the set"
+                        " stamped at sunset owns the night through the following morning crossing",
+                 g_dat_set_txt);
+        LogMsg(msg);
+    }
 
     if (g_mode == 'a') {
         snprintf(msg, sizeof msg,
                  STAMP " mode a installed footprint only: map '%s' variant '%s',"
-                 " entries %u, payloads %u, arena %u MB resident at %#x..%#x."
+                 " %u map name(s) up to %u sets, entries %u, payloads %u, arena %u MB resident at %#x..%#x."
                  " NO hook, no fixup call, no chunk header touched, so the"
                  " client runs its own code path whole: if it crashes entering"
                  " the world here while mode n was clean, the reservation is"
                  " the cause and the arena has to become bounded, and the popup"
                  " is expected because this mode patches nothing on purpose",
                  (const char *)head.map, (const char *)head.variant,
+                 grpCount, maxSets,
                  head.entryCount, head.payloadUnique,
                  (unsigned)(head.payloadBytes / (1024u * 1024u)),
                  (unsigned)(size_t)arena,
@@ -3098,7 +3419,8 @@ static int Install(void)
     memcpy(g_dat_map, head.map, 24);
     g_ready = 1;
     snprintf(msg, sizeof msg,
-             STAMP " mode f installed: map '%s' variant '%s', entries %u,"
+             STAMP " mode f installed: map '%s' variant '%s', %u map name(s) up to %u sets,"
+                    " entries %u,"
                     " payloads %u, arena %u MB at %#x..%#x, hook 0x6AF5F3 patched"
                     " with resume 0x6AF5F8 -- d's shape, the one the clean mode-d run proved,"
                     " NOT b's frame, detour at %#x; matched chunks"
@@ -3106,7 +3428,8 @@ static int Install(void)
                     " hdr+0x30 = 512, so the client's own gate, CreateShadowTexture"
                     " and the decoders read live .dat bytes. logging: %s (add a v"
                     " to '%s\\shadow-mod.mode' for the audit and per-chunk trail)",
-             (const char *)head.map, (const char *)head.variant, head.entryCount,
+             (const char *)head.map, (const char *)head.variant,
+             grpCount, maxSets, head.entryCount,
              head.payloadUnique,
              (unsigned)(head.payloadBytes / (1024u * 1024u)),
              (unsigned)(size_t)arena,

@@ -527,10 +527,8 @@ What that plan does and does not buy:
   mod's clock-scale digits exist to compress that for testing, and they are why a bake plan must
   be read at 1:1 rather than at the test speed.
 * Re-picking per chunk visit is therefore not the answer to a real problem: it would bound the
-  drift and cost memory instead — six runs of the Eastern Kingdoms set is 6 × 66,413 payloads
-  × 512 bytes ≈ 192 MB resident against the 32 MB one run costs today (`README.md:474`) — and it
-  leaves chunks that never re-initialized holding the previous run's shadows, the mixed field
-  gotcha 7 already names. Latch at map enter; nothing else is worth paying for.
+  drift and cost memory instead — six runs of the continent set is what costs, not one run.
+  Latch at map enter; nothing else is worth paying for.
 
 So for a continent you stay in for a whole game day, the latched payload is right for the hour you
 entered at and drifts after that; for instances and short visits, the latch is the whole answer.
@@ -570,6 +568,34 @@ The payoff worth selling: with the arc, Morning (sun low in the south east, shad
 west) and Evening (the vanilla north-west light, shadows south east) become genuinely different
 payloads instead of the same bytes twice, which is exactly the difference `README.md:126` says
 vanilla cannot make.
+
+#### 4.5.2 What sv16 shipped for it
+
+The five day rows plus the stock row are now one file, not six: the `.dat`'s map
+record grew a clock word so a record is a shadow SET of a map, and the loader's
+per-chunk gate picks the record whose `h0` is the greatest at or below the
+client's clock, wrapping to the biggest when the clock precedes all of them
+(`PickRunIdx`, run right after the map-name gate). Version 1 keeps the 28-byte
+record and no clock word, so every file produced without `--set` is byte-identical
+to what the earlier rounds wrote.
+
+The stamp table above and the `h0` table shipped are the same hours in two roles:
+the stamp says where the sun was when a set was baked, `h0` says where the day
+starts using it, and the only two `h0` values that come from the arc rather than
+from a midpoint are the dawn crossing 700 (05:50) and the sunset handover 2580
+(21:30). That wrap is what makes one row own 21:30 → 05:50 across midnight, which
+is the row this section's last entry describes, so the arc's flat 225° night leg
+and the format's wrap-around window are the same decision seen from two sides.
+
+Honest memory for it, measured on the stand-in six-set file in the game folder
+rather than extrapolated: 589,793 entries over 333,072 distinct payloads, so
+**162.6 MB of arena plus 4.5 MB of key arrays** for six sets of one continent. An
+earlier round quoted 192 MB for "six runs of EK", which was a per-set estimate for
+one continent and never the figure for both of them; the pair of continents is the
+same order of magnitude larger, call it ~400 MB, and dungeons are far below that.
+The loader prints that footprint before it asks for the arena, so a user whose
+file does not fit sees the MB rather than a half-resident table, and the payload
+cap is `0x30000000` (768 MiB).
 
 ---
 
