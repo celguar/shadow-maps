@@ -10,12 +10,14 @@ names the live keys rather than the sky.
 Everything below is sv15's, and it is still true of the sv16 build except for
 the `.dat`: sv16 grows the format so ONE file carries several shadow presets per
 map, matched to the same clock that picks the sun's window. That part is the
-section at the end.
+section at the end, and sv17's section after it is the one pass that re-picks
+chunks that are already standing — it changes nothing else.
 
 Nothing else in the pipeline changed: no new hook, no new file format, no new
 export, and `verify_dll.py` still reports the same hook, the same three detour
-tables and `Load` at RVA 0x27c0 — that RVA moved from sv14's 0x2720 because the
-module grew, not because the contract did.
+tables and `Load` at RVA `0x27c0` — that RVA moved from sv14's `0x2720` because
+the module grew, not because the contract did. (sv17's image has it at `0x2cc0`
+for the same reason: growth.)
 
 ## How it is driven
 
@@ -551,3 +553,103 @@ counted rather than half-fitting and drawing from a short table.
 * The sun sidecar `shadow-mod.sun` forces sun presets, not shadow sets. A
   shadow-set override would be a second thing to keep in sync with the clock, and
   the clock drives both, so it does not have one.
+
+## sv17: chunks that are already standing get the set the clock picked
+
+sv16's rule — a chunk is picked at its own fixup, so a window crossing changes
+the set at the next chunk that loads — says nothing about chunks that are
+already loaded, and a first login is exactly that case.
+
+The evidence, in the client's bytes:
+
+* The clock is not known while the world boots. `systems/gametime.md`: the
+  clock object is `0xce8538` (0x70 bytes), its minute at `[0xce8538]` and hour
+  at `[0xce853c]`, and the day fraction the sun reads is `(minute + 60·hour) ·
+  (1/1440)` through `0x6c5f60`/`0x642be0`. Its handlers — `0x6c5de0`, `0x6c5e80`
+  (`ReceiveNewTimeSpeed`, the opcode `0x42` packet that carries the time),
+  `0x6c6010`, `0x6c6080`, `0x6c6120` — are registered by
+  `ClientInitializeGameTime 0x6c5d70` through `0x5ab650`, and the per-frame
+  advance is `0x6c5d50` from the client's tick handler `0x401ec0`. An earlier
+  round of this work read the clock as `-1`/`-1` during every initial chunk
+  load, i.e. the day fraction is 0: at those loads the pick is made by a clock
+  that reads midnight, and sv16's wrap rule lands on the record with the
+  biggest `h0`, the one stamped at sunset.
+* Nothing rebuilds a resident chunk. `systems/terrain/chunk.md` and
+  `systems/mapupdate.md`: the map pass re-creates chunks it *destroyed*
+  (`0x6984f0`, windows `0x6c1f70`, windows computed by `0x672730`), a forced
+  reload is `CWorld::UnloadAreas 0x66fc80(position)` or the rebuild at
+  `0x6985d0`, and `CWorld::BeginFrame 0x66fd50` recomputes windows from the
+  camera position only. A player standing where the game booted him loads no
+  further chunk, so `CMapChunk::Load 0x6af5f0` — the one hook, and the one
+  place sv16 picks a set — never runs for his chunks again.
+* A resident chunk's shadows can still be replaced. `CreateShadowTexture
+  0x6b0030` stores the MCSH address it was handed at `chunk+0x144`; `AcquireChunkTexture
+  0x6aed20` builds the texture at `chunk+0x140` whose fill callback `0x6b1180`
+  runs `DecodeShadow 0x6b02b0`, which reads `+0x144` again; the combined-shader
+  texture at `chunk+0x13c` (`0x6b00a0` → `0x6b02f0` → `0x6b0350`) reads the same
+  `+0x144`. So `+0x144` is the one place a chunk's shadow bytes are named, and
+  both textures read from it.
+* Asking for a re-fill is `GxTexUpdateRect 0x58ac70`. Its full-body signature in
+  `bundle/signature.tsv` (line 16419) cleans `ret 0x10`, so four stack dwords,
+  and reads only `[ebp+8]`, `[ebp+0xc]`, `[ebp+0x10]`, `[ebp+0x14]`: the
+  documented sixth word is never read. The chunk layer's call at `0x6b001e`
+  passes `0,0,size,size`; the minimap's at `0x4ecef8` passes four zeros, which
+  is the whole texture. Four zeros is what the refill asks.
+* `fixup_chunk` is handed `(this, record)` and the chunk's own absolute map
+  indices are at `+0x8c` (column) and `+0x90` (row) — `systems/terrain/chunk.md`
+  says an area's chunk object lives at `area + 0x278 + index·4` and the chunk's
+  `+0x8c`/`+0x90` are the area's base plus the grid index, so the chunk's own
+  pair is enough: the area-table deref is not needed, and no area pointer is in
+  hand at the hook. `LinkNeighbours 0x6c29c0` reads index −16, +1, +16, −1 with
+  the edge arms at 240 + column, −15, +15 and −1, i.e. column and row both
+  0..15: a 16×16 grid.
+
+What sv17 does with that:
+
+* `fixup_chunk` keeps four dwords per installed chunk — the chunk, the entry
+  key, the map's FIRST record and the record the pick chose — up to
+  `REFILL_MAX 8192`, and counts installs past the cap in `g_refill_dropped`.
+  The first record is kept because the refill re-picks with
+  `PickRunIdx(first_record)`: the load's pick and the refill's cannot disagree
+  about which record owns the moment.
+* `RefillShadowTextures` re-picks every recorded chunk, bisects its key inside
+  the record the clock picked, checks the payload is still an MCSH of
+  `FIELD_MCSH_SIZE`, writes the new address at `chunk+0x144` and asks
+  `GxTexUpdateRect` with four zeros for the texture the chunk is drawing —
+  `+0x13c` when bit 12 of `0xC89F44` or of `0xC9A31C` is set, which is the
+  client's own gate at `0x6af71f`, else `+0x140`.
+* A chunk is written to only when it still answers as the chunk this run
+  installed: `+0x144` inside `[g_arena, g_arena + g_arena_bytes)` — only this
+  DLL put an address there — and `+0x8c`/`+0x90` still making the recorded key.
+  A destroyed and freed chunk, or a recycled heap block, fails one of those.
+* Two triggers, one pass. `RefillKeep` runs from `fixup_chunk`, next to the arc
+  and with the same reach, and is one volatile read per chunk once the pass
+  happened; the pass fires when the clock stops reading midnight. The other
+  half is `RefillWatchdog`, a thread of this DLL started from
+  `EnsureInitialized` after the install, which waits up to twenty real minutes
+  for the clock to leave midnight and then asks — that is the half that covers
+  the player who stands still. `InterlockedCompareExchange` on `g_refill_taken`
+  is what keeps the pass to once per session whichever got there first.
+* `g_arena_bytes` is set at the install next to `g_arena`, and the pass logs one
+  line naming how many chunks were re-filled, how many now draw a different
+  set than they were built with, how many have no tile in the picked record,
+  how many stopped answering and were left alone, and how many installs were
+  past the cap.
+
+What sv17 does not do, and says so:
+
+* The refill cannot take a shadow back. A tile the picked record has no entry
+  for keeps the payload the load gave it, which is the previous record's shadow,
+  not the client's stock `MCSH`. Only a chunk loaded after the crossing draws
+  stock there. The line counts those chunks as `absent`.
+* The pass can land between the client's own frames — the watchdog is not on the
+  client's thread. The writes are one pointer per chunk plus the client's own
+  dirty-rect call, and the chunk currently inside `Load` is never in the record
+  list yet, because the record is appended at the end of `fixup_chunk` and the
+  refill runs at the start of it.
+* A session whose server time really is midnight is indistinguishable from a
+  login whose clock is still unknown, so those chunks keep the record the load
+  picked. The watchdog's twenty-minute bound is what makes that a visible
+  absence rather than a silent one.
+* Chunks the client destroyed and rebuilt on its own, and chunks this run never
+  installed, are left alone: their shadows are the client's to set.

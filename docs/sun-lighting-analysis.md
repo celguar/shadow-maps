@@ -597,6 +597,24 @@ The loader prints that footprint before it asks for the arena, so a user whose
 file does not fit sees the MB rather than a half-resident table, and the payload
 cap is `0x30000000` (768 MiB).
 
+#### 4.5.3 What sv17 added on top of it
+
+Six sets per map made the unknown-at-boot clock visible, and sv17 is what
+answers it. A first login builds the chunks around the character while the
+client's own clock still reads midnight — `ClientInitializeGameTime 0x6c5d70`
+registers the time handlers and the day fraction `(minute + 60·hour) · (1/1440)`
+is 0 through the whole initial load — so the per-chunk pick lands on the wrap,
+the set stamped at sunset, and vanilla never rebuilds a chunk that is already
+standing (`CWorld::BeginFrame 0x66fd50` recomputes windows from the camera, the
+rebuild paths are `0x6985d0` and `0x66fc80`, and neither runs for a standing
+player). One pass over the chunks this run installed, at the moment the clock
+leaves midnight, re-points each one's `chunk+0x144` at the record the clock
+picked and asks the client's `GxTexUpdateRect 0x58ac70` for a whole-texture
+re-fill of the texture at `+0x140`, or `+0x13c` on a shader client. No chunk
+destroyed, no header rewritten, no `.adt` touched — which is the whole reason
+the sv3..sv8 and sv10-b header-shape attempts died. See `sun-arc-note.md`'s
+sv17 section for the byte-by-byte record and for what the pass does not do.
+
 ---
 
 ## 5. Risks and gotchas

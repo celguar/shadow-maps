@@ -189,6 +189,15 @@ continent's EK-side figure. The DLL logs the footprint before it asks for the
 arena and refuses over `0x30000000` (768 MiB) of payloads rather than half-fitting
 one.
 
+That plan needs the sv17 refill to be visible at a first login, which is where
+the client has already built the chunks around the character while its clock
+still read midnight: the set that owns the real hour is picked by a clock that
+does not know the hour yet, and a resident chunk is never built again. The pass
+described in the refill section re-picks exactly those chunks the moment the
+clock leaves midnight, so the ground the player stands on comes back with the
+set the sky is in. A chunk that loads *after* the crossing needs none of it: its
+own load sees the real clock.
+
 ## Files
 
 | File | What it is |
@@ -466,12 +475,91 @@ the client's old `ebx` was. `verify_dll.py` reads `fixup_chunk`'s epilogue out o
 the linked image and requires the stub's `add` to match whichever `ret` form this
 build chose, so an off-by-eight is a build failure, not an in-game crash.
 
+## Re-filling chunks that are already resident (sv17)
+
+The selection machinery has one thing on top of sv16 that a first login makes
+visible. The client builds the chunks around the character before the server's
+time packet arrives, so during those loads the day clock reads midnight
+(benilla-re `systems/gametime.md`: the clock object at `0xce8538` starts at
+midnight and the same `0x6435a0` advance that later moves it has not run yet
+with a day count to carry). A `.dat` with several sets per map is then picked by
+that unknown clock, and the rule wraps to the record with the biggest opening,
+i.e. the set stamped at sunset. Nothing in vanilla re-runs
+`CMapChunk::Load 0x6af5f0` for a chunk that is already resident — the map pass
+only re-creates chunks it *destroyed* (`0x6984f0`, `0x66fc80`, `0x66fd50`
+recomputes windows from the camera, never a standing player's chunks) — so the
+record that owns the real hour would otherwise never be drawn at that login.
+
+The refill is what sv17 adds: one pass over the chunks this run gave a shadow to,
+as soon as the client's own clock stops reading midnight. The primitive is the
+client's own, from `systems/terrain/chunk.md`: `CreateShadowTexture 0x6b0030`
+stores the MCSH address it was handed at `chunk+0x144`, `AcquireChunkTexture
+0x6aed20` builds the texture at `chunk+0x140` through the fill callback
+`0x6b1180`, and `DecodeShadow 0x6b02b0` re-reads `+0x144` when it fills — so
+re-pointing `+0x144` and asking the device to re-fill the texture gives a
+standing chunk new shadows **without destroying it and without touching its
+`.adt` header**, which is the whole reason the sv3..sv8 and sv10-b header
+rewrites died. Asking is `GxTexUpdateRect 0x58ac70` with four zero rectangles:
+the minimap's `0x4ecef8` calls it that way and means the whole texture, while
+the chunk layer's own `0x6b001e` passes the tile size twice; whole is the form
+that needs no sub-record bounds. On a shader client the chunk's one texture is
+at `+0x13c` (shadow packed with the layer alphas, `0x6b00a0`/`0x6b02f0`/
+`0x6b0350`, read from the same `+0x144`), and the client picks between the two
+on bit 12 of `0xC89F44`/`0xC9A31C` at its `0x6af71f` — the refill asks the same
+way, so it re-fills the texture the chunk is actually drawing.
+
+What is kept per installed chunk is four dwords — the chunk, the entry key its
+payload came from, the map's **first** record and the record the pick chose —
+up to `REFILL_MAX 8192` of them, and the refill re-picks with
+`PickRunIdx(first_record)` so the load and the refill cannot disagree about
+which set is current. `g_refill_dropped` counts installs past the cap, because a
+big city block can exceed 8192 chunks and the refill line names what was never
+offered rather than leave it unstated.
+
+A recorded chunk is only written to when it still answers as the chunk this run
+installed: its `+0x144` must still be inside `[g_arena, g_arena + arena bytes)`
+— only this DLL put an address there — and its own global column and row at
+`+0x8c`/`+0x90`, the same pair the load made the key from, must still make the
+recorded key. A chunk the client destroyed and freed, or a heap block reused by
+another object, fails one of those and is left alone. (The area-table
+dereference, `area+0x278` with the grid's 16×16 indices, is *not* used: the
+chunk's own `+0x8c`/`+0x90` are its absolute map indices, and no area pointer
+is in hand at the hook.)
+
+Two triggers reach that pass, and an exchange makes it one pass per session
+whichever gets there first. The chunk hook's half (`RefillKeep`, called from
+`fixup_chunk` next to the arc) fires when chunks keep loading: it is one
+volatile read per chunk after the pass. The other half is a thread of this DLL
+started after the install, which waits up to twenty real minutes for the clock
+to leave midnight and then asks — that is what covers a first-login player who
+stands where the game booted him and never loads another chunk.
+
+Honest about what a re-fill does and does not do:
+
+* it lands between the client's own frames, on a thread of this DLL: the writes
+  are one pointer per chunk plus the client's dirty-rect call, and a texture the
+  device is mid-upload on is refilled when the device next refills it.
+* a tile the picked record has no entry for keeps the shadow the load gave it,
+  which is the old record's shadow, not the client's stock one: a refill can
+  only hand a chunk a new shadow, it cannot take one back. A chunk loaded
+  *after* the crossing is the one that would draw stock there.
+* a chunk this run never installed is not touched: its shadows are the
+  client's, and the two liveness tests also catch a chunk that stopped being
+  the chunk this run installed.
+* a session whose server time really *is* midnight cannot be told from a login
+  whose clock is still unknown, so those chunks keep the record the load
+  picked, the record that owns the night — the watchdog's twenty-minute bound is
+  what makes that visible rather than silent, and raising it watches a night
+  session cross into the day.
+
 ## What this machine produces
 
-The sv16 build, i.e. what this branch's HEAD is: `out\ShadowMaps.dll`
-**165,888 bytes**, i686, exports `Load`, accepted by `verify_dll.py` with zero
-complaints, and its log banner reads `sv16`. The paragraphs below are the sv13
-round's record of the game folder and keep their own numbers.
+The sv17 build, i.e. what this branch's HEAD is: `out\ShadowMaps.dll`
+**168,960 bytes**, i686, exports `Load` at RVA `0x2cc0`, accepted by `verify_dll.py`
+with zero complaints, and its log banner reads `sv17`. The sv16 image was
+165,888 bytes with `Load` at RVA `0x2c90`; what the refill added is the four
+per-chunk arrays, the pass and the watchdog thread. The paragraphs below are the
+sv13 round's record of the game folder and keep their own numbers.
 
 `out\ShadowMaps.dll` 146,944 bytes and `build\Release\ShadowMaps.dll` 147,968
 bytes, both i686, both exporting `Load` (at RVA `0x2530` and `0x2760`), both
@@ -513,6 +601,14 @@ client's own `MCSH`; that is the known gap the user's own whole-continent 21:30 
 Build the file with `--set` once per archive in the same order, so an off-by-one there would
 put noon's shadows in morning's window, and the script prints the `windows:` line it settled
 on so a wrong pairing is visible rather than silent.
+
+What that file tests on an sv17 image, once it is renamed to the fixed name next to the
+DLL and `f 5 v` is in the mode file: one install line naming 6 records and max sets 6, the
+`.dat windows` line with the six openings, one refill line at first login, and
+one switch line per window crossing as the day is sped up. The refill line is the sv17
+evidence — its "already drawn from the record the clock picked" count is what says the
+pass found the chunks rather than found none, and its "stopped answering" count is what
+says it left alone what it was told to leave alone.
 
 There is **no `shadow-mod.mode` in the folder**, which is the whole point of the sv13 image
 sitting there: the state being tested is the state a user gets, and a launch from it writes
