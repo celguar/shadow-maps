@@ -329,7 +329,7 @@
 #include <string.h>
 #include "../shadow_dat.h"
 
-#define STAMP "sv17" /* build stamp, printed in every log line: an old build of
+#define STAMP "sv18" /* build stamp, printed in every log line: an old build of
                      * this DLL sitting next to a new .dat is the most common
                      * confusion, so the line says which build made it, and the
                      * mode line below names which of the seven rungs ran. sv11
@@ -352,7 +352,18 @@
                      * note.md says what the arc does and what it does not do.
                      * The hook, the stubs, the writes and the .dat are sv13's
                      * unchanged, so an sv14 line about a shadow is an sv13
-                     * line about the same shadow. */
+                                         * line about the same shadow. sv16 reads a .dat that carries
+                     * several shadow records per map, picked by the client's own
+                     * day clock, and sv17 makes a record that became current
+                     * after a chunk was loaded reach the chunks that are already
+                     * resident -- the first-login case, where the clock was still
+                     * unknown and nothing re-runs CMapChunk::Load. sv18 is that
+                     * pass with its identity test repaired: the load keys a chunk
+                     * as (row << 10) | column and sv17 decoded it the other way
+                     * round, so every recorded chunk was counted as left alone and
+                     * the refill line printed 0 of 0. Nothing else moved, so an
+                     * sv17 refill line and an sv18 one about the same .dat differ
+                     * only in what that test accepted. */
 
 /* ---------------------------------------------------------------- pinned **/
 
@@ -2413,11 +2424,17 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
  * minimap calls at 0x4ecef8 with four zeros to mean the whole texture. */
 static void RefillShadowTextures(void)
 {
-    unsigned i, hmin, clock, refilled = 0u, moved = 0u, absent = 0u, stale = 0u;
-    unsigned same = 0u;
+    unsigned i, hmin, clock, refilled = 0u, moved = 0u, absent = 0u;
+    unsigned dead = 0u, unown = 0u, same = 0u;
+    int logged_dead = 0, logged_unown = 0; /* the half that rejects gets one
+                                            * line naming the chunk and the two
+                                            * addresses it compared, so a run
+                                            * that fills nothing says which of
+                                            * the two tests failed, not just
+                                            * that one of them did */
     GxTexUpdateRectT gx_update_rect =
         (GxTexUpdateRectT)(size_t)ADDR_GXTEX_UPDATE_RECT;
-    char msg[512];
+    char msg[1024]; /* the split summary line is the longest of the three */
 
     /* one pass per session, whichever trigger got there first: the chunk hook
      * and the watchdog below both ask for this, and the watchdog is on another
@@ -2488,13 +2505,48 @@ static void RefillShadowTextures(void)
          * client's to set, so it is left alone. */
         cur = ((const unsigned *)((char *)chunk + FIELD_SHADOW_OFS))[0];
         if (!((unsigned)(size_t)g_arena <= (unsigned)(size_t)cur &&
-              (unsigned)(size_t)cur < (unsigned)(size_t)g_arena + g_arena_bytes))
-            ++stale;
-        else if (((key >> SHADOW_DAT_KEY_SHIFT) !=
+              (unsigned)(size_t)cur < (unsigned)(size_t)g_arena + g_arena_bytes)) {
+            ++dead; /* its shadow is not one of this arena's payloads */
+            if (!logged_dead) {
+                logged_dead = 1;
+                snprintf(msg, sizeof msg,
+                         STAMP " refill first dead chunk: this %#x, its + %#x reads"
+                         " %#x, this arena is %#x..%#x, it was recorded under key"
+                         " %u -- its shadow is not one of this arena's payloads,"
+                         " which means the load left its own shadow there or the"
+                         " client overwrote it after CreateShadowTexture",
+                         (unsigned)(size_t)chunk, (unsigned)FIELD_SHADOW_OFS, cur,
+                         (unsigned)(size_t)g_arena,
+                         (unsigned)(size_t)g_arena + g_arena_bytes, key);
+                LogMsg(msg);
+            }
+        }
+        else if (((key & SHADOW_DAT_COORD_MAX) !=
                   ((const unsigned *)((char *)chunk + FIELD_GLOBAL_COL))[0]) ||
-                 ((key & SHADOW_DAT_COORD_MAX) !=
-                  ((const unsigned *)((char *)chunk + FIELD_GLOBAL_ROW))[0]))
-            ++stale;
+                 ((key >> SHADOW_DAT_KEY_SHIFT) !=
+                  ((const unsigned *)((char *)chunk + FIELD_GLOBAL_ROW))[0])) {
+            ++unown; /* its own column and row no longer make the key it was
+                      * recorded under: the load built the key as
+                      * (row << 10) | column, so the decode takes the row off
+                      * the top and the column out of the low 10 bits -- the
+                      * same pair, read the same way fixup_chunk read them. */
+            if (!logged_unown) {
+                logged_unown = 1;
+                snprintf(msg, sizeof msg,
+                         STAMP " refill first unowned chunk: this %#x is at column"
+                         " %u row %u now and was recorded under key %u, which is"
+                         " column %u row %u, so either the chunk was reused for"
+                         " another tile or its chunk+%#x and chunk+%#x are not the"
+                         " pair the load made the key from",
+                         (unsigned)(size_t)chunk,
+                         ((const unsigned *)((char *)chunk + FIELD_GLOBAL_COL))[0],
+                         ((const unsigned *)((char *)chunk + FIELD_GLOBAL_ROW))[0],
+                         key, key & SHADOW_DAT_COORD_MAX,
+                         key >> SHADOW_DAT_KEY_SHIFT,
+                         (unsigned)FIELD_GLOBAL_COL, (unsigned)FIELD_GLOBAL_ROW);
+                LogMsg(msg);
+            }
+        }
         else {
             /* is the chunk's tile in the set the clock picked? The record's
              * entries are sorted ascending inside it, so this is the same
@@ -2570,12 +2622,13 @@ static void RefillShadowTextures(void)
                     " re-filled at this clock: %u of them now draw a shadow of a"
                     " different record than the one they were built with, %u have no"
                     " tile in the record the clock picked and keep the shadow the load"
-                    " gave them, %u were left alone because the chunk stopped"
-                    " answering as the one this DLL installed, %u were already drawn"
-                    " from the record the clock picked and needed nothing, and %u of"
-                    " the chunks this run installed were past the cap of %u and were"
+                    " gave them, %u were left alone because their shadow is no longer"
+                    " an address in this arena, %u because their own column and row no"
+                    " longer make the key they were recorded under, %u were already"
+                    " drawn from the record the clock picked and needed nothing, and %u"
+                    " of the chunks this run installed were past the cap of %u and were"
                     " never offered this clock",
-             refilled, g_refillCount, moved, absent, stale, same, g_refill_dropped,
+             refilled, g_refillCount, moved, absent, dead, unown, same, g_refill_dropped,
              (unsigned)REFILL_MAX);
     LogMsg(msg);
     g_refill_done = 1;

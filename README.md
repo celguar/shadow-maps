@@ -475,7 +475,7 @@ the client's old `ebx` was. `verify_dll.py` reads `fixup_chunk`'s epilogue out o
 the linked image and requires the stub's `add` to match whichever `ret` form this
 build chose, so an off-by-eight is a build failure, not an in-game crash.
 
-## Re-filling chunks that are already resident (sv17)
+## Re-filling chunks that are already resident (sv17, sv18's fix)
 
 The selection machinery has one thing on top of sv16 that a first login makes
 visible. The client builds the chunks around the character before the server's
@@ -516,6 +516,19 @@ which set is current. `g_refill_dropped` counts installs past the cap, because a
 big city block can exceed 8192 chunks and the refill line names what was never
 offered rather than leave it unstated.
 
+sv18 is that test's repair, and it is why sv17's refill line said `0 of 2359`.
+`fixup_chunk` builds the key as `(row << 10) | column` from `+0x90` and `+0x8c`
+— the log's own fixup line printed `gy 811 gx 448 key 830912`, and
+`830912 = (811 << 10) | 448` — while sv17 decoded it the other way round, `key >>
+10` against `+0x8c` and `key & 0x3ff` against `+0x90`, i.e. row against column.
+Only a chunk whose column equals its row passed, so every recorded chunk was
+counted as stopped answering. sv18 takes the column out of the low 10 bits and
+the row off the top, splits the one counter into the two halves it was always
+testing — `dead` for a `+0x144` that is not in this arena, `unown` for a chunk
+whose own column and row no longer make the recorded key — and prints one line
+each naming the first chunk that failed and the addresses it compared, so a run
+that fills nothing says *which* test failed instead of *that* one did.
+
 A recorded chunk is only written to when it still answers as the chunk this run
 installed: its `+0x144` must still be inside `[g_arena, g_arena + arena bytes)`
 — only this DLL put an address there — and its own global column and row at
@@ -554,12 +567,14 @@ Honest about what a re-fill does and does not do:
 
 ## What this machine produces
 
-The sv17 build, i.e. what this branch's HEAD is: `out\ShadowMaps.dll`
-**168,960 bytes**, i686, exports `Load` at RVA `0x2cc0`, accepted by `verify_dll.py`
-with zero complaints, and its log banner reads `sv17`. The sv16 image was
-165,888 bytes with `Load` at RVA `0x2c90`; what the refill added is the four
-per-chunk arrays, the pass and the watchdog thread. The paragraphs below are the
-sv13 round's record of the game folder and keep their own numbers.
+The sv18 build, i.e. what this branch's HEAD is: `out\ShadowMaps.dll`
+**169,472 bytes**, i686, exports `Load` at RVA `0x2cc0`, accepted by `verify_dll.py`
+with zero complaints, and its log banner reads `sv18`. The sv17 image next to it
+was 168,960 bytes with `Load` at the same RVA `0x2cc0`, and sv16's was 165,888
+with `Load` at `0x2c90`: sv18 changes one comparison and two log lines, so an
+sv17 log line and an sv18 one about the same `.dat` differ only in what the
+refill's liveness test accepted. The paragraphs below are the sv13 round's record
+of the game folder and keep their own numbers.
 
 `out\ShadowMaps.dll` 146,944 bytes and `build\Release\ShadowMaps.dll` 147,968
 bytes, both i686, both exporting `Load` (at RVA `0x2530` and `0x2760`), both
@@ -602,13 +617,14 @@ Build the file with `--set` once per archive in the same order, so an off-by-one
 put noon's shadows in morning's window, and the script prints the `windows:` line it settled
 on so a wrong pairing is visible rather than silent.
 
-What that file tests on an sv17 image, once it is renamed to the fixed name next to the
+What that file tests on an sv18 image, once it is renamed to the fixed name next to the
 DLL and `f 5 v` is in the mode file: one install line naming 6 records and max sets 6, the
 `.dat windows` line with the six openings, one refill line at first login, and
-one switch line per window crossing as the day is sped up. The refill line is the sv17
-evidence — its "already drawn from the record the clock picked" count is what says the
-pass found the chunks rather than found none, and its "stopped answering" count is what
-says it left alone what it was told to leave alone.
+one switch line per window crossing as the day is sped up. The refill line is the sv18
+evidence — its "no longer an address in this arena" and "no longer make the key they were
+recorded under" counts are what say the pass found the chunks rather than found none, and
+its two first-chunk lines are what name the test that did fail, with the addresses it
+compared, when it does.
 
 There is **no `shadow-mod.mode` in the folder**, which is the whole point of the sv13 image
 sitting there: the state being tested is the state a user gets, and a launch from it writes

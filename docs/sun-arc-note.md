@@ -653,3 +653,60 @@ What sv17 does not do, and says so:
   absence rather than a silent one.
 * Chunks the client destroyed and rebuilt on its own, and chunks this run never
   installed, are left alone: their shadows are the client's to set.
+
+## sv18: sv17's refill ran and filled nothing, and what its test really compared
+
+The sv17 run in the game folder printed both halves of the pass and they disagree:
+
+```
+sv17 shadows: map 'Azeroth' picked set 6 of 6, the window opened at 21:30
+  (h0 2580 of 2880 half-minutes), with the client's own clock read as 00:00
+fixup: first chunk matched: gy 811 gx 448 key 830912, shadow drawn from arena+26066944
+sv17 refill: the clock reads 2391 of 2880 half-minutes ...
+sv17 refill: 0 of the 2359 chunks the map load left standing were re-filled at
+  this clock: ... 2359 were left alone because the chunk stopped answering as the
+  one this DLL installed
+```
+
+So the install, the pick, the record list and both triggers are fine — 2359 chunks
+were recorded and the watchdog reached the pass at 18453 ms with the clock read as
+19:55 — and the pass's liveness test is what rejected all of them. The test and the
+load do not agree about the key:
+
+* `fixup_chunk` reads `gx` at `chunk+0x8c` and `gy` at `chunk+0x90` and builds
+  `key = (gy << 10) | gx`. The log's own fixup line is the arithmetic:
+  `830912 = (811 << 10) | 448`, with `gy 811` the row and `gx 448` the column.
+* sv17's test decoded it the other way round: `key >> 10` compared against
+  `+0x8c` and `key & 0x3ff` compared against `+0x90`, i.e. row against column and
+  column against row. For that first chunk it asks whether `811 == 448`, so it
+  answers no, and it answers no for every chunk whose column differs from its row
+  — which is every chunk off the diagonal.
+
+sv18's change is that decode plus a way to tell the two halves apart:
+
+* The column comes out of the low 10 bits and the row off the top, the same pair
+  `fixup_chunk` read them.
+* The one "stopped answering" counter is split into `dead`, a `+0x144` that is
+  outside `[g_arena, g_arena + g_arena_bytes)`, and `unown`, a chunk whose own
+  `+0x8c`/`+0x90` no longer make the key it was recorded under, and the summary
+  line names both separately.
+* Each half also gets one line for the first chunk it rejected, printing the chunk,
+  the two field values, the recorded key and its decode, and for `dead` the value at
+  `+0x144` against the arena's bounds. A refill that fills nothing now says which
+  test failed and with what numbers, rather than only that one of them did.
+
+What sv18 still does not do, and the next test has to answer:
+
+* Whether `+0x144` really holds the arena address after a matched load — the fixup
+  line proves the load wrote `arena + 26066944` relative to `hdr` into `hdr+0x2c`,
+  and `CreateShadowTexture 0x6b0030` is read as storing what it was handed at
+  `+0x144`, but nothing has printed that field from a live chunk yet. If the
+  `dead` count is the whole 2359 and the `first dead chunk` line prints a `+0x144`
+  outside the arena, then that read is not where the chunk's shadow bytes are named
+  and the arena half of the test has to go.
+* The pass is one burst: every re-fill asks `GxTexUpdateRect` in the same call, so
+  2359 textures are marked dirty at once rather than spread over frames. A visible
+  hitch at that moment is the pass, not the arc.
+* One pass per session, still. The chunks standing at this run's login are moved to
+  the record the clock picked when the clock stopped reading midnight; a record that
+  becomes current later in the day reaches only the chunks that load after it.
