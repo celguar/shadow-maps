@@ -329,7 +329,7 @@
 #include <string.h>
 #include "../shadow_dat.h"
 
-#define STAMP "sv18" /* build stamp, printed in every log line: an old build of
+#define STAMP "sv19" /* build stamp, printed in every log line: an old build of
                      * this DLL sitting next to a new .dat is the most common
                      * confusion, so the line says which build made it, and the
                      * mode line below names which of the seven rungs ran. sv11
@@ -363,7 +363,19 @@
                      * round, so every recorded chunk was counted as left alone and
                      * the refill line printed 0 of 0. Nothing else moved, so an
                      * sv17 refill line and an sv18 one about the same .dat differ
-                     * only in what that test accepted. */
+                     * only in what that test accepted. sv19 is the same pass
+                      * with its one remaining bogus test gone: sv17 and sv18
+                      * read a dword out of the PAYLOAD at offset FIELD_MCSH_SIZE
+                      * and demanded it equal 0x30 -- that is where the MCNK
+                      * HEADER keeps sizeMCSH, not where a payload starts, and a
+                      * payload is the bare 512 shadow bytes the client reads at
+                      * hdr + ofsMCSH. Measured on the file the game was running,
+                      * 0 of a 60-payload sample of each of the six runs has 0x30
+                      * there, so that test answered no for essentially every
+                      * chunk and the pass re-filled 0 of the 2359. Nothing else
+                      * in the pass changed, so an sv18 refill line and an sv19
+                      * one about the same .dat differ only in what that test
+                      * accepted. */
 
 /* ---------------------------------------------------------------- pinned **/
 
@@ -2425,13 +2437,18 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
 static void RefillShadowTextures(void)
 {
     unsigned i, hmin, clock, refilled = 0u, moved = 0u, absent = 0u;
-    unsigned dead = 0u, unown = 0u, same = 0u;
-    int logged_dead = 0, logged_unown = 0; /* the half that rejects gets one
-                                            * line naming the chunk and the two
-                                            * addresses it compared, so a run
-                                            * that fills nothing says which of
-                                            * the two tests failed, not just
-                                            * that one of them did */
+    unsigned dead = 0u, unown = 0u, same = 0u, notex = 0u;
+    int logged_dead = 0, logged_unown = 0, logged_notex = 0;
+                                            /* the half that rejects gets one
+                                             * line naming the chunk and the two
+                                             * addresses it compared, so a run
+                                             * that fills nothing says which of
+                                             * the two tests failed, not just
+                                             * that one of them did; the chunks
+                                             * that took a payload but had no
+                                             * texture to mark get the same
+                                             * treatment */
+    unsigned tex, tex_ofs, other_ofs;
     GxTexUpdateRectT gx_update_rect =
         (GxTexUpdateRectT)(size_t)ADDR_GXTEX_UPDATE_RECT;
     char msg[1024]; /* the split summary line is the longest of the three */
@@ -2467,6 +2484,36 @@ static void RefillShadowTextures(void)
                     " chunk the map load left standing is picked again for the"
                     " record that owns this moment",
              hmin, SUN_HMIN_DAY, clock, g_mapCount);
+    LogMsg(msg);
+
+    /* which texture field the refill marks dirty, decided once for the pass.
+     * The client picks between the chunk's plain shadow texture at +0x140 and
+     * the one that packs it with the alphas of layers 1..3 at +0x13c, on bit
+     * 12 of either of its two shader switches, at its own 0x6af71f; the two
+     * draw the same +0x144 bytes underneath, so asking the one the chunk is
+     * drawing is what makes the change visible. The switches are static globals
+     * the client wrote at startup, so the pass decides once rather than once a
+     * chunk, and says what it decided and with what numbers: a pass that hands
+     * every chunk a new payload and changes nothing on the ground is this
+     * choice, not a crash, and this line is what names it. */
+    tex_ofs = FIELD_SHADOW_TEX;
+    if ((((const unsigned *)(size_t)FIELD_GX_SHADER0)[0] & 0x1000u) != 0u ||
+        (((const unsigned *)(size_t)FIELD_GX_SHADER1)[0] & 0x1000u) != 0u)
+        tex_ofs = FIELD_COMBINED;
+    other_ofs = (tex_ofs == (unsigned)FIELD_SHADOW_TEX)
+                    ? (unsigned)FIELD_COMBINED : (unsigned)FIELD_SHADOW_TEX;
+    snprintf(msg, sizeof msg,
+             STAMP " refill: the textures it marks dirty are read from chunk+%#x,"
+                    " the other candidate is chunk+%#x, because the shader switch"
+                    " at %#x reads %#x and the one at %#x reads %#x and bit 12 of"
+                    " %s",
+             (unsigned)tex_ofs, (unsigned)other_ofs,
+             (unsigned)FIELD_GX_SHADER0,
+             ((const unsigned *)(size_t)FIELD_GX_SHADER0)[0],
+             (unsigned)FIELD_GX_SHADER1,
+             ((const unsigned *)(size_t)FIELD_GX_SHADER1)[0],
+             (tex_ofs == (unsigned)FIELD_COMBINED ? "one of them is set"
+                                                 : "of neither is set"));
     LogMsg(msg);
 
     /* each recorded chunk is picked again the way its own load picked it:
@@ -2572,47 +2619,82 @@ static void RefillShadowTextures(void)
                              * one. The refill line names how many chunks are
                              * in this state. */
             else {
+                /* the payload the picked record has for this tile. There is
+                 * nothing to re-check here and sv19 checks nothing: an entry's
+                 * payload offset was validated when the .dat was read -- a
+                 * multiple of the payload size and with the whole payload
+                 * inside the payload area, both refused at install otherwise --
+                 * and a PAYLOAD is the bare 512 shadow bytes the client reads
+                 * at hdr + ofsMCSH, with no tag and no size of its own. sv17
+                 * and sv18 read a dword out of it at FIELD_MCSH_SIZE and
+                 * demanded 0x30 there, which is where the MCNK HEADER keeps
+                 * sizeMCSH, not where a payload starts: measured on the file
+                 * the game was running, 0 of a 60-payload sample of each of
+                 * the six records has 0x30 at payload offset 0x30 -- the bytes
+                 * there are shadow data, and 0 in the shared all-zero payload
+                 * -- so the test answered no for essentially every chunk and
+                 * the pass re-filled 0 of the 2359 and said nothing was wrong
+                 * with any of them. The load does no such test either, and a
+                 * load and a refill have to agree about what a chunk answers. */
                 hdr = g_arena + g_offs[a];
-                if (((const unsigned *)(hdr + FIELD_MCSH_SIZE))[0] !=
-                    (unsigned)FIELD_MCSH_SIZE)
-                    ++absent; /* the payload is not an MCSH: refuse, as the
-                                  * load does, rather than hand the client
-                                  * bytes it will read at its own size */
-                else {
-                    unsigned tex, tex_ofs;
 
-                    /* the chunk's shadow texture is at +0x140, except on a
-                     * client whose shaders are on: then the chunk has ONE
-                     * texture at +0x13c that packs this shadow with the
-                     * alphas of layers 1..3, and it is the same +0x144 bytes
-                     * underneath it, so the refill asks for that one. The
-                     * client picks between the two at its 0x6af71f, on bit 12
-                     * of either global switch, and the refill asks the same
-                     * way so it refills the texture the chunk is drawing. */
-                    tex_ofs = FIELD_SHADOW_TEX;
-                    if ((((const unsigned *)(size_t)FIELD_GX_SHADER0)[0] &
-                         0x1000u) != 0u ||
-                        (((const unsigned *)(size_t)FIELD_GX_SHADER1)[0] &
-                         0x1000u) != 0u)
-                        tex_ofs = FIELD_COMBINED;
-                    tex = ((const unsigned *)((char *)chunk + tex_ofs))[0];
-                    ((unsigned *)((char *)chunk + FIELD_SHADOW_OFS))[0] =
-                        (unsigned)(size_t)hdr;
-                    /* the refill the client's own refresh primitive wants:
-                     * the shadows are now this chunk's new bytes at +0x144,
-                     * and the texture was filled from the old ones, so ask
-                     * the device to fill it again. Four zero rectangles: the
-                     * whole texture, the minimap's idiom. Left alone when the
-                     * chunk has no texture there, which is what a chunk that
-                     * never reached CreateShadowTexture looks like: then the
-                     * new +0x144 is picked up the next time the chunk builds
-                     * its texture. */
-                    if (tex != 0u)
-                        gx_update_rect((void *)(size_t)tex, 0u, 0u, 0u, 0u);
-                    ++refilled;
-                    if (which != g_refill_set[i])
-                        ++moved;
+                /* the chunk's shadow texture is at +0x140, except on a
+                 * client whose shaders are on: then the chunk has ONE
+                 * texture at +0x13c that packs this shadow with the
+                 * alphas of layers 1..3, and it is the same +0x144 bytes
+                 * underneath it, so the refill asks for that one. The
+                 * client picks between the two at its 0x6af71f, on bit 12
+                 * of either global switch, and the refill asks the same
+                 * way so it refills the texture the chunk is drawing. The
+                 * choice is hoisted above the loop -- the two switches are
+                 * static globals the client wrote at its startup, so a
+                 * per-chunk read of them costs the pass nothing but says
+                 * nothing more -- and the line naming it is one-shot, so a
+                 * run can tell whether the refill asked for the texture the
+                 * chunk is drawing at all. */
+                tex = ((const unsigned *)((char *)chunk + tex_ofs))[0];
+                ((unsigned *)((char *)chunk + FIELD_SHADOW_OFS))[0] =
+                    (unsigned)(size_t)hdr;
+                /* the refill the client's own refresh primitive wants:
+                 * the shadows are now this chunk's new bytes at +0x144,
+                 * and the texture was filled from the old ones, so ask
+                 * the device to fill it again. Four zero rectangles: the
+                 * whole texture, the minimap's idiom. Left alone when the
+                 * chunk has no texture there, which is what a chunk that
+                 * never reached CreateShadowTexture looks like: then the
+                 * new +0x144 is picked up the next time the chunk builds
+                 * its texture. */
+                if (tex != 0u)
+                    gx_update_rect((void *)(size_t)tex, 0u, 0u, 0u, 0u);
+                else {
+                    ++notex; /* the payload was handed over and nothing was
+                               * marked dirty: the chunk has no texture at the
+                               * field the shader's state picked, so its new
+                               * +0x144 only shows up the next time the chunk
+                               * builds a texture. Named separately, and once
+                               * with the two fields it looked at, because a
+                               * pass that re-filled everything and changed
+                               * nothing on the ground is this case, not a
+                               * crash. */
+                    if (!logged_notex) {
+                        logged_notex = 1;
+                        snprintf(msg, sizeof msg,
+                                 STAMP " refill first chunk with no texture to"
+                                 " mark: this %#x took its payload at arena+%u"
+                                 " and its %#x reads 0, its other candidate %#x"
+                                 " reads %#x; its + %#x was still pointed at the"
+                                 " new payload, so the change shows the next time"
+                                 " the client builds this chunk's texture",
+                                 (unsigned)(size_t)chunk, g_offs[a],
+                                 (unsigned)tex_ofs, (unsigned)other_ofs,
+                                 ((const unsigned *)((char *)chunk + other_ofs))[0],
+                                 (unsigned)FIELD_SHADOW_OFS);
+                        LogMsg(msg);
+                    }
                 }
+                ++refilled;
+                if (which != g_refill_set[i])
+                    ++moved;
             }
         }
     }
@@ -2625,11 +2707,12 @@ static void RefillShadowTextures(void)
                     " gave them, %u were left alone because their shadow is no longer"
                     " an address in this arena, %u because their own column and row no"
                     " longer make the key they were recorded under, %u were already"
-                    " drawn from the record the clock picked and needed nothing, and %u"
-                    " of the chunks this run installed were past the cap of %u and were"
-                    " never offered this clock",
-             refilled, g_refillCount, moved, absent, dead, unown, same, g_refill_dropped,
-             (unsigned)REFILL_MAX);
+                    " drawn from the record the clock picked and needed nothing, %u took"
+                    " a payload but had no texture at the field the shader's state picked"
+                    " so nothing was marked dirty for them, and %u of the chunks this run"
+                    " installed were past the cap of %u and were never offered this clock",
+             refilled, g_refillCount, moved, absent, dead, unown, same, notex,
+             g_refill_dropped, (unsigned)REFILL_MAX);
     LogMsg(msg);
     g_refill_done = 1;
 }

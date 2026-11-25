@@ -529,6 +529,33 @@ whose own column and row no longer make the recorded key — and prints one line
 each naming the first chunk that failed and the addresses it compared, so a run
 that fills nothing says *which* test failed instead of *that* one did.
 
+sv19 is the pass's one remaining bogus test, and it is why sv18's refill line
+said `2359 have no tile in the record the clock picked` while naming nothing
+wrong. sv18's line already proves the two liveness tests passed — `dead` and
+`unown` are 0 of 2359 — so the chunks were found and re-picked; the `absent`
+counter has two sources, and the .dat the game was reading rules out the
+bisection one: measured against `shadowmaps.dat` itself, the key the log named,
+830912 (row 811 column 448), is present in the key runs of **all six** records,
+whose runs are 361040..998927 over rows 352..975 and columns 352..707. So the
+search found it, and the test behind it refused it: that test read the dword at
+`payload + FIELD_MCSH_SIZE` and demanded `0x30`, but 0x30 is where the *MCNK
+header* keeps `sizeMCSH`, and a payload is the bare 512 shadow bytes with no tag
+and no size of its own — measured, 0 of a 60-payload sample of each of the six
+runs has `0x30` at payload offset `0x30`, the bytes there being shadow data (and
+0 in the shared all-zero payload). The load does no such test, so sv19 drops it:
+an entry's payload offset was validated at install already, and a load and a
+refill have to agree about what a chunk answers. `absent` now means exactly one
+thing, the picked record having no entry for the tile.
+
+sv19 also names the two things the pass could otherwise get wrong silently: a
+`notex` counter, plus one line for the first chunk that hits it, for a chunk
+that was handed its new payload but had no texture at the field the shader's
+state picked — nothing was marked dirty for it, so its new shadow only shows
+when the client next builds that chunk's texture — and one line before the pass
+naming which texture field it marks dirty and what the two shader switches read
+at the moment it ran. A pass that re-fills everything and changes nothing on the
+ground is one of those two, not a crash, and this is what says which.
+
 A recorded chunk is only written to when it still answers as the chunk this run
 installed: its `+0x144` must still be inside `[g_arena, g_arena + arena bytes)`
 — only this DLL put an address there — and its own global column and row at
@@ -558,7 +585,9 @@ Honest about what a re-fill does and does not do:
   *after* the crossing is the one that would draw stock there.
 * a chunk this run never installed is not touched: its shadows are the
   client's, and the two liveness tests also catch a chunk that stopped being
-  the chunk this run installed.
+  the chunk this run installed — sv18's run is what proved both tests work:
+  they counted 0 and 0 out of 2359, so `chunk+0x144` really is an address in
+  this run's arena after a matched load.
 * a session whose server time really *is* midnight cannot be told from a login
   whose clock is still unknown, so those chunks keep the record the load
   picked, the record that owns the night — the watchdog's twenty-minute bound is

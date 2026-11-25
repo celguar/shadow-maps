@@ -710,3 +710,79 @@ What sv18 still does not do, and the next test has to answer:
 * One pass per session, still. The chunks standing at this run's login are moved to
   the record the clock picked when the clock stopped reading midnight; a record that
   becomes current later in the day reaches only the chunks that load after it.
+
+## sv19: sv18's refill found every chunk and then refused all of them for a reason that is not true
+
+sv18 in the game folder answers the question sv18 left open, in one line:
+
+```
+sv18 refill: 0 of the 2359 chunks the map load left standing were re-filled at
+  this clock: 0 of them now draw a shadow of a different record ..., 2359 have no
+  tile in the record the clock picked and keep the shadow the load gave them, 0
+  were left alone because their shadow is no longer an address in this arena, 0
+  because their own column and row no longer make the key they were recorded under,
+  0 were already drawn from the record the clock picked ..., 0 past the cap
+```
+
+* `dead` and `unown` are both **0**, so both liveness tests passed for all 2359
+  chunks. That settles sv18's open question: after a matched load, `chunk+0x144`
+  really does hold an address inside this run's arena — `CreateShadowTexture
+  0x6b0030` stores what it was handed, and the load's `hdr+0x2c` displacement is
+  the same arena address the fixup line printed (`arena + 26066944`).
+* `same` is 0 as expected: the load ran under set 6 (h0 2580, the night's
+  window) and the clock at 20:50 picked set 5 (h0 2100, 17:30), so every chunk
+  wanted a new record.
+* All 2359 went into the one remaining counter, and there are two places that
+  counter is bumped: the record's bisection missing the key, and the payload
+  sanity test behind it. The .dat the game was reading says the bisection cannot
+  have missed: measured against `shadowmaps.dat` itself (134,014,920 bytes,
+  `SHDW` v2, one map name `Azeroth`, 6 records of 114234/110857/109970/109865/
+  109865/114234 entries at h0 700/930/1230/1620/2100/2580, 669025 entries,
+  246067 payloads), the key the log named — 830912, row 811 column 448 — is
+  present in **all six** records' key runs, whose keys run 361040..998927 over
+  rows 352..975 and columns 352..707. A slice that contains the key, searched by
+  the bisection the load also uses, cannot answer "no tile".
+
+So the payload test is what refused all 2359, and it is a test of something that
+does not exist. It read the dword at `hdr + FIELD_MCSH_SIZE` and demanded it be
+`0x30`, with `hdr` taken as `g_arena + g_offs[a]` — a **payload**. But `FIELD_MCSH_SIZE`
+(0x30) is where the **MCNK header** keeps `sizeMCSH`, and the load puts 512 there
+(`hdr` in `fixup_chunk` is `record + 8`, the ADT's MCNK header, not a payload). A
+payload is the bare 512 shadow bytes the client reads at `hdr + ofsMCSH`: no tag,
+no size, nothing to check. Measured on that file, 0 of a 60-payload sample of
+each of the six records has `0x30` at payload offset `0x30` — the bytes there are
+shadow data, and in the shared all-zero payload they are 0. So the test answered
+no for essentially every chunk, and answered it while counting the chunk as
+"having no tile", which is why the line said nothing was wrong with any chunk.
+
+sv19's change is narrow and stays inside the pass:
+
+* The payload test is gone. Nothing replaces it: an entry's payload offset was
+  already validated when the `.dat` was read — a multiple of 512 and with the
+  whole payload inside the payload area, both refused at install otherwise — and
+  the load does no content test either. A load and a refill have to agree about
+  what a chunk answers, and this is the one place they did not.
+* A chunk whose picked record has no entry still goes to `absent`, and that
+  counter now means exactly one thing: the record the clock picked has no shadow
+  for this tile.
+* `notex` is a new counter, and one line for the first chunk that hits it: the
+  payload was handed to `chunk+0x144` but `chunk+0x140` (or `+0x13c`) read 0, so
+  nothing was marked dirty and the new shadow only shows when the client next
+  builds that chunk's texture. It is named apart because it is the one way the
+  pass can report "re-filled 2359" and the ground still not change — the same
+  reason the shader's field choice is printed once with the two switch values it
+  read, so a run says which texture the refill asked for rather than leaving that
+  to be inferred from the picture.
+
+What sv19 still leaves, in order of what the next run will tell:
+
+* Whether `GxTexUpdateRect 0x58ac70` on the whole texture really does make the
+  client re-fill from the new `+0x144`: if it does, the night's chunks visibly
+  move to the 17:30 set at that moment; if it does not, `refilled` is 2359 and
+  the ground does not move, and the answer is in the fill callback's read of
+  `+0x144` rather than in the pick.
+* One pass per session, still. The chunks standing at this run's login are moved
+  when the clock stops reading midnight; a record that becomes current later in
+  the day reaches only the chunks that load after it.
+* One burst: 2359 `GxTexUpdateRect` calls in one call, so a hitch at that
+  moment is the pass, not the arc.
