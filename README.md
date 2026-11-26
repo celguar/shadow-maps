@@ -556,6 +556,27 @@ naming which texture field it marks dirty and what the two shader switches read
 at the moment it ran. A pass that re-fills everything and changes nothing on the
 ground is one of those two, not a crash, and this is what says which.
 
+sv20 is that choice, repaired, and sv19's own line is what named the reason. The
+run printed `refilled 2288` and `notex 2288`: every payload moved into `chunk+0x144`
+and none of the 2288 got a dirty mark, because the pass asked for `chunk+0x140`
+and found 0 there — while the notex line itself printed the chunk's texture,
+`0x2f7e9008`, at `chunk+0x13c`. The test that chose `+0x140` was wrong: `0x6af71f`
+inside `CMapChunk::Load` takes the combined texture under **either shader flag**,
+and both flags are the client's `uint8_t` globals that **hold 1** when a terrain
+shader set is in use / when the terrain pixel shaders are in use — not a bit of
+the dword starting at them. Both read `0x1` in this client, so a chunk has ONE
+shadow-carrying texture, the combined one at `+0x13c` that packs the shadow with
+the alphas of layers 1..3 — and `0x6b02f0` fills it from `+0x144` together with
+the four alpha pointers, the same field this refill re-points.
+
+So sv20 reads the two bytes, and per chunk asks **both** fields and marks
+whichever one actually holds a texture: a chunk whose texture sits at the field
+the bytes did not pick goes to a `mismatch` counter and one line naming the field
+it marked, and `notex` counts only a chunk with 0 at *both* fields. The fallback
+is what makes asking for the right texture independent of the switches — exactly
+one of the two fields ever holds one — and it also covers a player who changed
+graphics between a chunk's load and this pass.
+
 A recorded chunk is only written to when it still answers as the chunk this run
 installed: its `+0x144` must still be inside `[g_arena, g_arena + arena bytes)`
 — only this DLL put an address there — and its own global column and row at

@@ -786,3 +786,76 @@ What sv19 still leaves, in order of what the next run will tell:
   the day reaches only the chunks that load after it.
 * One burst: 2359 `GxTexUpdateRect` calls in one call, so a hitch at that
   moment is the pass, not the arc.
+
+## sv20: sv19's pass re-filled 2288 chunks and marked none of them, and its own line said why
+
+The sv19 run answers sv19's open question two lines deep. The summary says the
+payload hand-over worked, and the line before it says what was handed to what
+field:
+
+```
+sv19 refill: the clock reads 2606 of 2880 half-minutes (the day at 9050 of 10000)
+  and the .dat carries 6 records in total: every chunk the map load left standing
+  is picked again for the record that owns this moment
+sv19 refill: the textures it marks dirty are read from chunk+0x140, the other
+  candidate is chunk+0x13c, because the shader switch at 0xc89f44 reads 0x1 and
+  the one at 0xc9a31c reads 0x1 and bit 12 of of neither is set
+sv19 refill first chunk with no texture to mark: this 0x33440008 took its payload
+  at arena+0 and its 0x140 reads 0, its other candidate 0x13c reads 0x2f7e9008 …
+sv19 refill: 2288 of the 2327 chunks the map load left standing were re-filled at
+  this clock: 2288 of them now draw a shadow of a different record …, 39 have no
+  tile in the record the clock picked …, 0 dead, 0 unown, 0 same, 2288 took a
+  payload but had no texture at the field the shader's state picked …
+```
+
+So the pick, the arena, the identity test and the bisection are all fine — 2288
+payloads were re-pointed into `chunk+0x144` and the log even printed the client's
+own texture pointer, `0x2f7e9008`, sitting at `chunk+0x13c`. What was missing is
+the dirty mark: the pass asked for `chunk+0x140`, found 0 there, and counted all
+2288 as `notex`.
+
+The test that picked `+0x140` was wrong, and the reference says so plainly:
+
+* `systems/terrain/chunk.md`, `CMapChunk::Load`: "the shadow map when flags bit
+  0 is set and world flag `0x40` is on, **the combined texture under either
+  shader flag**" — the gate at `0x6af71f`.
+* The two globals are bytes, not bit-flags of a dword: `0xc89f44` is `s_terrainShaderFlagA`,
+  "Holds 1 when a terrain shader set is in use, which selects the combined chunk
+  texture"; `0xc9a31c` is `s_terrainShaderFlag`, "Holds 1 when the terrain pixel
+  shaders are in use: combined chunk textures and `_s` textures". Reading the
+  dword at either address and asking for bit 12 was invented; the test is the
+  byte being 1, and the run printed both bytes as `0x1`.
+* `systems/terrain/chunk.md`, "Combined chunk texture": with either flag set a
+  chunk gets **one** texture at `+0x13c`, texel `s << 12 | a1 << 8 | a2 << 4 | a3`,
+  and `0x6b02f0` "gathers four alpha pointers … and passes them **with +0x144** to
+  `0x6b0350`". So the combined texture is filled from the same `+0x144` this refill
+  re-points — marking it is exactly what makes the new shadows show, and it is the
+  texture this client draws.
+
+sv20's change is inside the pass and has three parts:
+
+* The choice reads the two **bytes** and picks `+0x13c` when either holds 1 —
+  here both do, so the pass asks for the combined texture.
+* Per chunk, both fields are read and the refill marks **whichever one holds a
+  texture**; a chunk whose texture sits at the field the bytes did not pick bumps
+  a `mismatch` counter and gets one line, naming the field it actually marked and
+  what the bytes read. That fallback is what makes asking the right field not
+  depend on reading the switches at all — exactly one of the two fields ever
+  holds a chunk texture — and it also covers a player who changed graphics
+  between a chunk's load and this pass.
+* `notex` now counts only a chunk with **0 at both** fields, which is the one
+  remaining way a re-filled pass can leave the ground alone, and its one-shot
+  line says both fields' offsets instead of a candidate's value.
+
+What the next run has to show, in order:
+
+* The choice line should now print `chunk+0x13c` first and end with "one of them
+  holds 1". If it does, the byte test is confirmed against this client.
+* `notex` should be 0. If `mismatch` is 0, the bytes and the chunks agreed and the
+  choice alone was enough; if it is 2288, the fallback did the work and says so.
+* If `refilled` is 2288, `notex` is 0 and the ground still does not move at that
+  moment, the remaining suspect is `GxTexUpdateRect 0x58ac70` and the fill
+  callback's read of `+0x144` — sv19 has already ruled the pick out.
+* One file note, honest: the `.dat` this run read opens its night record at 21:50
+  (h0 2620), not the 21:30 (h0 2580) of the six-set plan, so its tiling came from
+  one of the user's own re-stamps rather than the plan's numbers.

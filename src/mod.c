@@ -329,7 +329,7 @@
 #include <string.h>
 #include "../shadow_dat.h"
 
-#define STAMP "sv19" /* build stamp, printed in every log line: an old build of
+#define STAMP "sv20" /* build stamp, printed in every log line: an old build of
                      * this DLL sitting next to a new .dat is the most common
                      * confusion, so the line says which build made it, and the
                      * mode line below names which of the seven rungs ran. sv11
@@ -375,7 +375,22 @@
                       * chunk and the pass re-filled 0 of the 2359. Nothing else
                       * in the pass changed, so an sv18 refill line and an sv19
                       * one about the same .dat differ only in what that test
-                      * accepted. */
+                      * accepted. sv20 is the pass's texture choice, and it is
+                      * what sv19's own refill line asked for: that line said
+                      * 2288 chunks were re-filled and 2288 had no texture to
+                      * mark, and its line above named the reason -- both
+                      * switches read 0x1, the marks went to chunk+0x140, and
+                      * the first chunk's texture, 0x2f7e9008, sits at chunk+0x13c
+                      * instead. The gate at 0x6af71f is either of two uint8_t
+                      * globals HOLDING 1 -- a terrain shader set in use, the
+                      * terrain pixel shaders in use -- not bit 12 of the dword
+                      * that starts at them, so sv17..sv19 asked for the fixed-
+                      * function field while this client runs the shader path and
+                      * keeps ONE combined texture per chunk at +0x13c. sv20 reads
+                      * the two bytes and, per chunk, marks whichever of the two
+                      * fields actually holds a texture, counting the chunks that
+                      * came from the field the switches did not pick, so only a
+                      * chunk with NOTHING at either field is left unmarked. */
 
 /* ---------------------------------------------------------------- pinned **/
 
@@ -431,7 +446,7 @@ static const unsigned char k_gate[] = {
 #define FIELD_COMBINED    0x13Cu /* CMapChunk: shadow packed with alpha   */
 #define FIELD_AREA_TABLE  0x278u /* CArea: its chunk grid, [row][column]  */
 #define FIELD_GX_SHADER0  0xC89F44u /* the client's own shader switches,   */
-#define FIELD_GX_SHADER1  0xC9A31Cu /* bit 12 of either picks FIELD_COMBINED */
+#define FIELD_GX_SHADER1  0xC9A31Cu /* either ONE picks FIELD_COMBINED     */
 
 /* The refill's one client call, reached by address: this DLL imports only OS
  * DLLs, so a client function is named by its address, not by a symbol the
@@ -2437,7 +2452,7 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
 static void RefillShadowTextures(void)
 {
     unsigned i, hmin, clock, refilled = 0u, moved = 0u, absent = 0u;
-    unsigned dead = 0u, unown = 0u, same = 0u, notex = 0u;
+    unsigned dead = 0u, unown = 0u, same = 0u, notex = 0u, mismatch = 0u;
     int logged_dead = 0, logged_unown = 0, logged_notex = 0;
                                             /* the half that rejects gets one
                                              * line naming the chunk and the two
@@ -2448,7 +2463,7 @@ static void RefillShadowTextures(void)
                                              * that took a payload but had no
                                              * texture to mark get the same
                                              * treatment */
-    unsigned tex, tex_ofs, other_ofs;
+    unsigned tex, tex_ofs, other_ofs, other_tex, shader_a, shader_b;
     GxTexUpdateRectT gx_update_rect =
         (GxTexUpdateRectT)(size_t)ADDR_GXTEX_UPDATE_RECT;
     char msg[1024]; /* the split summary line is the longest of the three */
@@ -2487,33 +2502,38 @@ static void RefillShadowTextures(void)
     LogMsg(msg);
 
     /* which texture field the refill marks dirty, decided once for the pass.
-     * The client picks between the chunk's plain shadow texture at +0x140 and
-     * the one that packs it with the alphas of layers 1..3 at +0x13c, on bit
-     * 12 of either of its two shader switches, at its own 0x6af71f; the two
-     * draw the same +0x144 bytes underneath, so asking the one the chunk is
-     * drawing is what makes the change visible. The switches are static globals
-     * the client wrote at startup, so the pass decides once rather than once a
-     * chunk, and says what it decided and with what numbers: a pass that hands
-     * every chunk a new payload and changes nothing on the ground is this
-     * choice, not a crash, and this line is what names it. */
+     * A chunk has ONE shadow-carrying texture: its plain shadow texture at
+     * +0x140 when the client is on the fixed-function path, and the combined
+     * one at +0x13c, which packs the shadow with the alphas of layers 1..3,
+     * when it is on its shader path -- CMapChunk::Load decides at its own
+     * 0x6af71f, and the combined texture is built from the same +0x144 this
+     * refill re-points (the packer 0x6b02f0 gathers four alpha pointers and
+     * passes them with +0x144 to 0x6b0350), so marking the one the chunk is
+     * drawing is what makes the change visible. The decision is either of the
+     * two switches holding 1 -- the client's uint8_t globals s_terrainShaderFlagA
+     * and s_terrainShaderFlag, one when a terrain shader set is in use and one
+     * when the terrain pixel shaders are -- and NOT a bit of the dword that
+     * starts at them. sv18 and sv19 tested bit 12 of that dword, which answered
+     * no here: this run's line printed both switches reading 0x1 and the marks
+     * going to chunk+0x140 while every chunk's texture, 0x2f7e9008 on the first
+     * of them, sits at chunk+0x13c -- which is why sv19's pass re-filled 2288
+     * chunks and marked none of them. */
+    shader_a = ((const unsigned char *)(size_t)FIELD_GX_SHADER0)[0];
+    shader_b = ((const unsigned char *)(size_t)FIELD_GX_SHADER1)[0];
     tex_ofs = FIELD_SHADOW_TEX;
-    if ((((const unsigned *)(size_t)FIELD_GX_SHADER0)[0] & 0x1000u) != 0u ||
-        (((const unsigned *)(size_t)FIELD_GX_SHADER1)[0] & 0x1000u) != 0u)
+    if (shader_a != 0u || shader_b != 0u)
         tex_ofs = FIELD_COMBINED;
     other_ofs = (tex_ofs == (unsigned)FIELD_SHADOW_TEX)
                     ? (unsigned)FIELD_COMBINED : (unsigned)FIELD_SHADOW_TEX;
     snprintf(msg, sizeof msg,
              STAMP " refill: the textures it marks dirty are read from chunk+%#x,"
                     " the other candidate is chunk+%#x, because the shader switch"
-                    " at %#x reads %#x and the one at %#x reads %#x and bit 12 of"
-                    " %s",
+                    " at %#x is %#x and the one at %#x is %#x and %s",
              (unsigned)tex_ofs, (unsigned)other_ofs,
-             (unsigned)FIELD_GX_SHADER0,
-             ((const unsigned *)(size_t)FIELD_GX_SHADER0)[0],
-             (unsigned)FIELD_GX_SHADER1,
-             ((const unsigned *)(size_t)FIELD_GX_SHADER1)[0],
-             (tex_ofs == (unsigned)FIELD_COMBINED ? "one of them is set"
-                                                 : "of neither is set"));
+             (unsigned)FIELD_GX_SHADER0, (unsigned)shader_a,
+             (unsigned)FIELD_GX_SHADER1, (unsigned)shader_b,
+             (tex_ofs == (unsigned)FIELD_COMBINED ? "one of them holds 1"
+                                                 : "neither holds 1"));
     LogMsg(msg);
 
     /* each recorded chunk is picked again the way its own load picked it:
@@ -2643,16 +2663,50 @@ static void RefillShadowTextures(void)
                  * texture at +0x13c that packs this shadow with the
                  * alphas of layers 1..3, and it is the same +0x144 bytes
                  * underneath it, so the refill asks for that one. The
-                 * client picks between the two at its 0x6af71f, on bit 12
-                 * of either global switch, and the refill asks the same
-                 * way so it refills the texture the chunk is drawing. The
-                 * choice is hoisted above the loop -- the two switches are
+                 * client picks between the two at its 0x6af71f, on either
+                 * of its two shader bytes being 1, and the refill asks the
+                 * same way so it refills the texture the chunk is drawing.
+                 * The choice is hoisted above the loop -- the two bytes are
                  * static globals the client wrote at its startup, so a
                  * per-chunk read of them costs the pass nothing but says
-                 * nothing more -- and the line naming it is one-shot, so a
-                 * run can tell whether the refill asked for the texture the
-                 * chunk is drawing at all. */
+                 * nothing more -- and the fallback under the read is what
+                 * makes asking the right field not depend on the switches
+                 * at all: exactly one of the two fields holds a texture, so
+                 * the refill marks the one that exists, and only a chunk
+                 * with 0 at BOTH is left with nothing to mark. */
                 tex = ((const unsigned *)((char *)chunk + tex_ofs))[0];
+                if (tex == 0u) {
+                    other_tex = ((const unsigned *)((char *)chunk + other_ofs))[0];
+                    if (other_tex != 0u) {
+                        ++mismatch; /* this chunk's shadow-carrying texture is at
+                                      * the other field than the two switches say,
+                                      * so its load ran with a different graphics
+                                      * state than the one this pass read. The
+                                      * texture that exists is the one to mark:
+                                      * CreateShadowTexture 0x6b0030 keeps what it
+                                      * was handed at +0x144, and the combined
+                                      * packer 0x6b02f0 passes +0x144 with the four
+                                      * alpha pointers to 0x6b0350, so both fields'
+                                      * textures are filled from the bytes this
+                                      * refill just pointed there. Counted, and
+                                      * named once below, because a run whose
+                                      * switches and chunks disagree is worth
+                                      * seeing rather than inferred. */
+                        tex = other_tex;
+                    }
+                }
+                if (mismatch == 1u) {
+                    snprintf(msg, sizeof msg,
+                             STAMP " refill first chunk built against the other"
+                             " shader state: this %#x has its texture at %#x, not"
+                             " at the %#x the switches picked, which read %#x and"
+                             " %#x; it was marked at %#x anyway, the field that"
+                             " holds a texture",
+                             (unsigned)(size_t)chunk, (unsigned)other_ofs,
+                             (unsigned)tex_ofs, (unsigned)shader_a,
+                             (unsigned)shader_b, (unsigned)other_ofs);
+                    LogMsg(msg);
+                }
                 ((unsigned *)((char *)chunk + FIELD_SHADOW_OFS))[0] =
                     (unsigned)(size_t)hdr;
                 /* the refill the client's own refresh primitive wants:
@@ -2660,34 +2714,34 @@ static void RefillShadowTextures(void)
                  * and the texture was filled from the old ones, so ask
                  * the device to fill it again. Four zero rectangles: the
                  * whole texture, the minimap's idiom. Left alone when the
-                 * chunk has no texture there, which is what a chunk that
-                 * never reached CreateShadowTexture looks like: then the
-                 * new +0x144 is picked up the next time the chunk builds
-                 * its texture. */
+                 * chunk has no texture at EITHER field, which is what a
+                 * chunk that never reached CreateShadowTexture looks like:
+                 * then the new +0x144 is picked up the next time the chunk
+                 * builds its texture. */
                 if (tex != 0u)
                     gx_update_rect((void *)(size_t)tex, 0u, 0u, 0u, 0u);
                 else {
                     ++notex; /* the payload was handed over and nothing was
-                               * marked dirty: the chunk has no texture at the
-                               * field the shader's state picked, so its new
-                               * +0x144 only shows up the next time the chunk
-                               * builds a texture. Named separately, and once
-                               * with the two fields it looked at, because a
-                               * pass that re-filled everything and changed
-                               * nothing on the ground is this case, not a
-                               * crash. */
+                               * marked dirty: the chunk has no texture at
+                               * either of the two fields, so its new +0x144
+                               * only shows up the next time the chunk builds
+                               * a texture. Named separately, and once with
+                               * both fields, because a pass that re-filled
+                               * everything and changed nothing on the ground
+                               * is this case, not a crash -- and with the
+                               * fallback above, this is now the ONLY way a
+                               * re-filled pass can leave the ground alone. */
                     if (!logged_notex) {
                         logged_notex = 1;
                         snprintf(msg, sizeof msg,
                                  STAMP " refill first chunk with no texture to"
                                  " mark: this %#x took its payload at arena+%u"
-                                 " and its %#x reads 0, its other candidate %#x"
-                                 " reads %#x; its + %#x was still pointed at the"
-                                 " new payload, so the change shows the next time"
-                                 " the client builds this chunk's texture",
+                                 " and BOTH its %#x and its %#x read 0; its + %#x"
+                                 " was still pointed at the new payload, so the"
+                                 " change shows the next time the client builds"
+                                 " this chunk's texture",
                                  (unsigned)(size_t)chunk, g_offs[a],
                                  (unsigned)tex_ofs, (unsigned)other_ofs,
-                                 ((const unsigned *)((char *)chunk + other_ofs))[0],
                                  (unsigned)FIELD_SHADOW_OFS);
                         LogMsg(msg);
                     }
@@ -2707,11 +2761,12 @@ static void RefillShadowTextures(void)
                     " gave them, %u were left alone because their shadow is no longer"
                     " an address in this arena, %u because their own column and row no"
                     " longer make the key they were recorded under, %u were already"
-                    " drawn from the record the clock picked and needed nothing, %u took"
-                    " a payload but had no texture at the field the shader's state picked"
-                    " so nothing was marked dirty for them, and %u of the chunks this run"
+                    " drawn from the record the clock picked and needed nothing, %u were"
+                    " marked at the other texture field than the shader switches picked, %u took"
+                    " a payload but had no texture at either field so nothing was marked dirty"
+                    " for them, and %u of the chunks this run"
                     " installed were past the cap of %u and were never offered this clock",
-             refilled, g_refillCount, moved, absent, dead, unown, same, notex,
+             refilled, g_refillCount, moved, absent, dead, unown, same, mismatch, notex,
              g_refill_dropped, (unsigned)REFILL_MAX);
     LogMsg(msg);
     g_refill_done = 1;
