@@ -705,12 +705,13 @@ chunk to be called on.
 ## What this machine produces
 
 The sv22 build, i.e. what this branch's HEAD is: `out\ShadowMaps.dll`
-**172,032 bytes**, i686, exports `Load` at RVA `0x2cc0`, accepted by `verify_dll.py`
-with zero complaints, and its log banner reads `sv22`. It is installed in the game
-folder at `G:\Games\twmoa_1181\ShadowMaps.dll`, byte-identical, sha256
-`0fc13c5e40dc51603f0474e662a3832e3689ded703ab6258519eb92fbef30194`, which contains
-`sv22` 82 times and no `sv21`, `sv20` or `sv19`. The sv21 build was 171,520 bytes
-with `Load` at the same RVA `0x2cc0`, and sv18's was 169,472 bytes there, and sv16's
+**172,032 bytes**, i686, exports `Load` at RVA `0x2cd0`, accepted by `verify_dll.py`
+with zero complaints, and its log banner reads `sv22` (82 times, with no `sv21`,
+`sv20` or `sv19` in the image). It is installed in the game folder at
+`G:\Games\twmoa_1181\ShadowMaps.dll`, byte-identical, sha256
+`0fc13c5e40dc51603f0474e662a3832e3689ded703ab6258519eb92fbef30194`. The sv21 build
+was 171,520 bytes with `Load` at `0x2cc0` — sv22's refill code moves the export by
+16 bytes — and sv18's was 169,472 bytes there, and sv16's was 165,888 with `Load` at
 was 165,888 with `Load` at `0x2c90`: sv22 changes the refill's writes, its trigger
 and the load's record of a chunk it left stock, so an sv21 log line and an sv22 one
 about the same `.dat` differ in what the refill found, not in what it accepted. The
