@@ -859,3 +859,141 @@ What the next run has to show, in order:
 * One file note, honest: the `.dat` this run read opens its night record at 21:50
   (h0 2620), not the 21:30 (h0 2580) of the six-set plan, so its tiling came from
   one of the user's own re-stamps rather than the plan's numbers.
+
+## sv21: the mark reached the client and the client faulted in its own code
+
+The sv20 run got all the way through the pass and died inside the client. The
+game's report:
+
+```
+ERROR #132 (0x85100084) Fatal Exception
+Program: G:\Games\twmoa_1181\WoW.exe
+0023:00594B9E, referenced memory 0x00000140, could not be written
+0xC0000005 (ACCESS_VIOLATION)
+```
+
+`0x594b9e` is client code, not the DLL's (the DLL sits at `0x14000000`), and
+reading the image says exactly what it is. `0x594b9e` is the third byte of
+`c6 06 01` at `0x594b90 + 0xe` — `mov byte ptr [esi], 1` — with `esi = [ebp+8]`
+of `0x594b90`. That `0x594b90` was entered by `0x58acd0`, which pushed its own
+`ecx`, which `GxTexUpdateRect (0x58ac70)`'s tail handed unchanged from its own
+`ecx`, which is the `ecx` at the C call site. The cdecl call the refill used
+never set `ecx`, and the value left there was the refill's own address
+arithmetic: `FIELD_SHADOW_TEX = 0x140`, which is the "referenced memory" the
+report names. So the calling convention and any stack imbalance were never the
+problem — the missing texture register was, and the store went to a page that
+does not exist.
+
+The client's own call sites, all three of them, say what the shape is. Their
+push-1 bytes are at `0x6b007c` in `CreateShadowTexture`, `0x6b00ce` in
+`CombinedChunkTexture` and `0x6b0011` in `CMapChunk::UpdateShadow` (0x6aff80,
+whose call is at `0x6b001e`), and all three run the same six words:
+
+```
+push 1 / push <size> / push <size> / push 0 / xor edx,edx / mov ecx,<texture>
+```
+
+Reading the callee back is what makes those words mean the same thing. `0x58ac70`
+keeps `[ebp+8]` at rect+0, `edx` at rect+4, `[ebp+0x10]` at rect+8 and
+`[ebp+0xc]` at rect+0xc of a local rect at `[ebp-0x10]`, pushes arg 4, and hands
+that rect in `edx` plus the unchanged `ecx` to `0x58acd0`, which pushes the flag,
+the rect and the texture, loads the device at `0xc0ed38` into `ecx` as `this` and
+calls `0x594b90` — whose `ret 0xc` and `0x58acd0`'s `ret 4` keep the stack
+balanced, with `GxTexUpdateRect`'s own `ret 0x10` removing the four args at the
+top. So `[ebp+8]` there *is* the texture, which is why the first thing it does is
+write a byte into it (`0x594b9e: mov byte ptr [esi], 1` — that byte is the
+dirty flag), `[ebp+0xc]` is the rect, and `[ebp+0x10]` is arg 4, whose test at
+`0x594c23` decides whether the device is told at all: `0x594c27` reads the
+device's vtable and does `push <texture> / call dword ptr [edx]`, its slot-0
+method, and `je 0x594c2f` skips that whole block. Inside that method the rect is
+read at `0x594ba1` (`cmp ebx,ecx / jge 0x594c08` on rect+0 and rect+8) and the
+clamped words are stored at `+4`, `+8`, `+0xc`, `+0x10` of the texture through
+the `0x5977f0` helper at `0x594be9`.
+
+That last line also retires an idea sv17..sv20 leaned on. The four-zeros form
+is real in the client — the minimap at `0x4ecee8` calls `0x58ac70` as
+`push 0 ×4 / xor edx,edx / call`, with the texture in `ecx` and gated by a
+one-shot `byte [0xbc8308]` — but it answers *no* to the flag test, so the
+device is never told, and its `{0,0,0,0}` rect takes the branch that only
+resets the texture's own rectangle words. Four zeros can never be the refill's
+call. `0x4ecee8` is the only four-zeros call site in the client's shadow path.
+
+The `size` in those three sites is not a constant either: `CombinedChunkTexture`
+compares the client's `shadowLevel` option, `0xc63284`, as its very first
+instruction, and the texture's side and the two sizes they push are `0x20` when
+that dword is exactly 1 and `0x40` otherwise (the setter accepts `atoi` ≤ 1).
+So the refill reads the same dword and compares the same way; a client on the
+game's default answers 0 and gets 0x40, and a 64-wide rectangle handed to a
+client that built 32×32 textures names texels that do not exist.
+
+Why the shape is machine code and not C: MSVC rejects `__thiscall` and
+`__fastcall` on a function-pointer typedef, so no declaration can name "texture
+in `ecx`, the rect's second word in `edx`". The thunk is 24 bytes emitted onto
+the detour's own `PAGE_EXECUTE_READWRITE` page at `STUB_PAGE_THUNK = 0x80`,
+past the longest detour table this source has emitted (`stub_sv20` and `stub_sv16`
+are 0x40 bytes; `BuildStub` checks the pair against the rung it really emitted,
+so a longer detour in a future source is refused rather than overlapped), and
+C calls it as a plain cdecl pair `mark_rect(tex, tile)`:
+
+```
+8b 4c 24 04   mov  ecx, [esp+4]   = the texture C passed
+8b 44 24 08   mov  eax, [esp+8]   = the tile size C passed
+6a 01         push 1              = arg4, the flag: 0x594c23 tests it
+50            push eax            = arg3, stored at rect+8
+50            push eax            = arg2, stored at rect+0xc
+6a 00         push 0              = arg1, stored at rect+0
+33 d2         xor  edx, edx       = the rect's word at +4
+b8 <imm32>    mov  eax, <0x58ac70>   slot GX_RECT_THUNK_SLOT_TARGET = 17
+ff d0         call eax
+c3            ret                 = back to C, which cleans its 2 args
+```
+
+The stack discipline is small and checkable: at the thunk's entry `[esp]` is the
+return to C and `[esp+4]/[esp+8]` are C's two args; the four pushes are exactly
+what `GxTexUpdateRect`'s own `ret 0x10` removes; the thunk's `ret` returns to C,
+whose `add esp, 8` cleans its own pair. Nothing else is promised — cdecl already
+says `eax`, `ecx`, `edx` may change, and the callee keeps `ebx`, `esi`, `edi`,
+`ebp`. Confirmed in the linked image: the call site is `push [tile] / push esi
+/ call dword ptr [esp+0x60] / add esp, 8`.
+
+Two gates had to be added, and each one caught a real defect instead of
+confirming a guess.
+
+* **The encoding.** `[esp+4]` cannot be written in three bytes. `rm=100` with a
+  displacing `mod` is `[ebp+disp8]` — the *frame* pointer — and the only way to
+  make `esp` the base is the SIB byte `0x24` (no index, base `esp`) and then the
+  `disp8`. sv21's first draft wrote `8b 4c 04`, which capstone decodes as
+  `mov ecx, [esp+eax-0x75]`: a different instruction, a garbage texture, and —
+  because the callee's first test is `test ecx,ecx` and its early-out is a quiet
+  `ret 0x10` — a thunk that *returned quietly*, which is a wrong answer that
+  looks like a pass. So `verify_dll.py` disassembles the table out of the linked
+  image and requires `mov ecx,[esp+4]`, `mov eax,[esp+8]`, four pushes whose
+  values include `1` and `0`, one `call eax`, a terminating `ret`, and a zeroed
+  `mov` imm32 with `0xB8` in front at slot 17.
+* **The table was not in the image at all.** `GX_RECT_THUNK_BYTES` is 24
+  constant and `gx_rect_thunk` is `const`, so `/O2` turns
+  `memcpy(page + 0x80, gx_rect_thunk, 24)` into immediate stores and never takes
+  the array's address: the array has no home in `.rdata`, and the byte-for-byte
+  gate printed "the 24-byte thunk table is NOT in any section of this image". The
+  copy length is a `volatile` local for exactly that reason, which makes the copy
+  a real `memcpy` out of the table — the shipped bytes *are* mod.c's table — and
+  `PatchHook` re-reads the page after the install: the table's prefix bytes, the
+  client address in its imm32, the `ff d0` and the trailing `c3`, all must be
+  where `BuildStub` says. A thunk that is not on the page means the refill would
+  call whatever else is there.
+
+What the next run has to show, in order:
+
+* The refill's new line should print the tile it marked with and what
+  `0xc63284` read: a client on defaults answers `0` and `64 by 64`.
+* No `0x594b9e` report. If the marks are now accepted, `refilled` keeps its
+  sv20 number (2288 of 2327 for that `.dat`) and the ground changes at the
+  record boundary the clock crossed.
+* If the pass still reports marks and the ground does not move, the next thing to
+  read is the fill callback (`0x6b1150`/`0x6b1180`/`0x6b11b0` through `0x6aed20`
+  with `push 2 / push 2`) and whether it re-reads `+0x144` on the *refill* path
+  or only on a fresh build — that is the one edge sv19's and sv20's evidence did
+  not settle.
+* One file note still owed: the user's real six-set `.dat` opens its night
+  record at 21:50, not the plan's 21:30, so the tiling of that file came from one
+  of the user's own re-stamps.

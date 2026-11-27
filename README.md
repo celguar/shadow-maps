@@ -615,11 +615,64 @@ Honest about what a re-fill does and does not do:
   what makes that visible rather than silent, and raising it watches a night
   session cross into the day.
 
+sv21 is what sv20's crash said about the mark itself. The run got further and
+died inside the client: `ERROR #132 (0x85100084)`, `0023:00594B9E`, referenced
+memory `0x00000140`, `0xC0000005`. `0x594b9e` is client code — the DLL is not in
+that address's neighbourhood at all — and its bytes are `c6 06 01`,
+`mov byte ptr [esi], 1` inside `0x594b90`, where `esi = [ebp+8]` is the value
+`0x58acd0` pushed, which is the `ecx` that `GxTexUpdateRect`'s own tail passed
+down, which is the `ecx` at the C call site — the one a cdecl call never sets.
+`0x140` is `FIELD_SHADOW_TEX`, the constant the refill's own address arithmetic
+left in that register: the store went into an address that is not mapped.
+So the calling convention was never the problem — the texture register was.
+
+sv21 says the client's own shape, in machine code on the detour's execute page,
+because this compiler cannot say it in C: MSVC rejects `__thiscall` and
+`__fastcall` on a function-pointer typedef, so no declaration of
+`GxTexUpdateRect (0x58ac70)` can name "texture in `ecx`, rect word at +4 in
+`edx`". All three of the client's own call sites — `CreateShadowTexture`'s push-1
+at `0x6b007c`, `CombinedChunkTexture`'s at `0x6b00ce`, `CMapChunk::UpdateShadow`'s
+(0x6aff80) at `0x6b0011`, call at `0x6b001e` — run
+`push 1 / push <size> / push <size> / push 0 / xor edx,edx / mov ecx,<texture>`,
+and the `size` there is `0x20` only when the client's `shadowLevel` option
+(`0xc63284`) reads exactly 1, else `0x40` — the same comparison that decided the
+texture's side, so the refill reads that dword and compares the same way instead
+of assuming 64. The last word is the flag whose test at `0x594c23` (`test eax,eax
+/ je 0x594c2f`) decides whether the device is told at all: the four zeros sv17..sv20
+pushed answer *no* to it, and their `{0,0,0,0}` rect takes the `cmp ebx,ecx / jge
+0x594c08` branch that only resets the texture's own rectangle words — so that form
+could never have changed the ground, on top of faulting.
+
+Two build gates were needed to make the thunk's bytes true, and both found real
+defects rather than confirming a guess. First the encoding: `[esp+4]` cannot be
+written in three bytes — `rm=100` with a displacing `mod` is `[ebp+disp8]`, the
+frame pointer, and the only way to say `esp` as the base is the SIB byte `0x24`
+then the `disp8`. sv21's first draft omitted it, and capstone decoded `8b 4c 04`
+as `mov ecx,[esp+eax-0x75]`: a different instruction, which pushed a garbage
+texture and *returned quietly* — a wrong answer that looks like a pass. So
+`verify_dll.py` now disassembles the table from the linked image and requires
+`mov ecx,[esp+4]`, `mov eax,[esp+8]`, four pushes of `1`, size, size, `0`,
+`xor edx,edx`, one `call eax`, a terminating `ret`, and the zeroed `mov`
+imm32 at slot 17 with `0xB8` before it. Second, the table was not in the image
+at all: `/O2` turns a `memcpy` of 24 constant bytes out of a `const` array into
+immediate stores and never takes the array's address, so there was nothing to
+copy and the byte-for-byte gate said "the 24-byte thunk table is NOT in any
+section". The copy length is a `volatile` local for exactly that reason, which
+makes the copy a real `memcpy` out of the table in `.rdata` — the shipped bytes
+*are* mod.c's table. `BuildStub` re-reads the page (the detour's read-back
+already says the same about its own jmp) and refuses the whole install if the
+page does not hold the table with `0x58ac70` in its imm32.
+
 ## What this machine produces
 
-The sv18 build, i.e. what this branch's HEAD is: `out\ShadowMaps.dll`
-**169,472 bytes**, i686, exports `Load` at RVA `0x2cc0`, accepted by `verify_dll.py`
-with zero complaints, and its log banner reads `sv18`. The sv17 image next to it
+The sv21 build, i.e. what this branch's HEAD is: `out\ShadowMaps.dll`
+**171,520 bytes**, i686, exports `Load` at RVA `0x2cc0`, accepted by `verify_dll.py`
+with zero complaints, and its log banner reads `sv21`. The sv18 image next to it
+was 169,472 bytes with `Load` at the same RVA `0x2cc0`, and sv16's was 165,888
+with `Load` at `0x2c90`: sv18 changes one comparison and two log lines, so an
+sv17 log line and an sv18 one about the same `.dat` differ only in what the
+refill's liveness test accepted. The paragraphs below are the sv13 round's record
+of the game folder and keep their own numbers. The sv17 image next to it
 was 168,960 bytes with `Load` at the same RVA `0x2cc0`, and sv16's was 165,888
 with `Load` at `0x2c90`: sv18 changes one comparison and two log lines, so an
 sv17 log line and an sv18 one about the same `.dat` differ only in what the

@@ -329,7 +329,7 @@
 #include <string.h>
 #include "../shadow_dat.h"
 
-#define STAMP "sv20" /* build stamp, printed in every log line: an old build of
+#define STAMP "sv21" /* build stamp, printed in every log line: an old build of
                      * this DLL sitting next to a new .dat is the most common
                      * confusion, so the line says which build made it, and the
                      * mode line below names which of the seven rungs ran. sv11
@@ -390,7 +390,25 @@
                       * the two bytes and, per chunk, marks whichever of the two
                       * fields actually holds a texture, counting the chunks that
                       * came from the field the switches did not pick, so only a
-                      * chunk with NOTHING at either field is left unmarked. */
+                      * chunk with NOTHING at either field is left unmarked. The
+                      * mark itself, however, never ran: sv20's own crash report
+                      * named it. 0x594b9e is mov byte ptr [esi], 1 with esi =
+                      * [ebp+8] of 0x594b90, which is the ecx 0x58acd0 was
+                      * entered with, which is the ecx GxTexUpdateRect 0x58ac70
+                      * expects AT THE CALL SITE -- the texture is not a stack
+                      * argument. The cdecl pointer sv17..sv20 called through
+                      * never sets ecx, so that store went to 0x140, the constant
+                      * the surrounding C had left in the register, and the
+                      * report said "write of 0x140". sv21 calls it the way the
+                      * client does instead: a thunk on the DLL's executable page
+                      * pushes the client's own six words (1, size, size, 0, edx
+                      * cleared, ecx = the texture), with size read from shadowLevel
+                      * exactly as the chunk's texture was made, and that 1 is
+                      * what makes 0x594b90 run the device upload at all -- its
+                      * test eax,eax / je 0x594c2f skips the push <texture> / call
+                      * [device slot 0] when the last word is 0, which is also
+                      * why the four zeros sv17..sv20 pushed could not have
+                      * changed anything on the ground. */
 
 /* ---------------------------------------------------------------- pinned **/
 
@@ -438,9 +456,15 @@ static const unsigned char k_gate[] = {
  * with the alpha maps of layers 1..3 (0x6b00a0, 0x6b02f0, 0x6b0350), and it
  * is read from the same +0x144, so a shader client is refilled the same way
  * at the other address. GxTexUpdateRect (0x58ac70) "asks the device to refill
- * that part of a texture"; the minimap's 0x4ecef8 calls it with four zeros,
- * which means the whole texture, and the chunk layer's own 0x6b001e passes
- * the size twice instead. */
+ * that part of a texture", and reading it back is what fixes the calling
+ * shape: the texture is ecx at the call site, the rectangle's second word is
+ * edx, and the four stack words are the rect it packs -- the minimap's 0x4ecef8
+ * form (four zeros, edx cleared) only records a rectangle, because the last
+ * word is the flag 0x594b90 tests at its 0x594c23 before the device upload.
+ * For a chunk's shadow or combined texture the client's own three sites --
+ * UpdateShadow's 0x6b0011, CreateShadowTexture's 0x6b007c and CombinedChunkTexture's
+ * 0x6b00de -- all push 1, the size twice and 0 with edx cleared, the size being
+ * 0x40 texels unless the shadowLevel option reads exactly 1. */
 #define FIELD_SHADOW_OFS  0x144u /* CMapChunk: address of its shadow map  */
 #define FIELD_SHADOW_TEX  0x140u /* CMapChunk: its shadow texture         */
 #define FIELD_COMBINED    0x13Cu /* CMapChunk: shadow packed with alpha   */
@@ -450,16 +474,34 @@ static const unsigned char k_gate[] = {
 
 /* The refill's one client call, reached by address: this DLL imports only OS
  * DLLs, so a client function is named by its address, not by a symbol the
- * link could resolve, and an explicit cast from that address to a function
- * pointer is what C asks for. Five arguments, __cdecl: the texture, then the
- * rectangle. All four rectangle words are zero, the minimap's idiom (0x4ecef8
- * calls GxTexUpdateRect with four zeros and means the whole texture), not the
- * chunk layer's, which passes the tile size twice at 0x6b001e: whole is the
- * safe form here, because a chunk's shadow texture is one whole tile map and
- * a rectangle inside it would have to be the tile's own sub-record bounds the
- * refill no longer reads. */
+ * link could resolve. What it is called THROUGH, though, is not a pointer to
+ * that address: GxTexUpdateRect 0x58ac70 takes its texture in ecx and the
+ * rectangle's second word in edx, neither of them on the stack, and C cannot
+ * say that about an address -- __thiscall and __fastcall are both refused on
+ * a function-pointer typedef in this compiler -- so the cdecl pointer this
+ * file used before only ever pushed the four rectangle words and left ecx
+ * alone. That is what crashed sv20: the report's 0x594b9e is mov byte ptr
+ * [esi], 1 with esi = [ebp+8] of 0x594b90 = the ecx 0x58acd0 was entered with
+ * = the ecx this call never set, and the "write of 0x140" it names is FIELD_SHADOW_TEX
+ * read back as an address. The address below is therefore reached through a
+ * thunk this DLL emits on its executable page, the gx_rect_thunk table below:
+ * C hands it the texture and the size, the thunk puts them in ecx and edx and
+ * pushes the client's own rectangle. */
 #define ADDR_GXTEX_UPDATE_RECT 0x58ac70u
-typedef void (*GxTexUpdateRectT)(void *, unsigned, unsigned, unsigned, unsigned);
+/* what the thunk is called as, from C: two dwords, cdecl, the caller cleans
+ * them, and the thunk's own ret comes back to the call site. */
+typedef void (*GxUpdateRectThunkT)(unsigned, unsigned);
+/* the client's shadowLevel option: the side of a chunk's shadow texture, and
+ * the whole-rectangle size the client pushes for it, is 0x40 texels unless the
+ * dword reads exactly 1. Its own three chunk-texture sites make the same
+ * comparison -- UpdateShadow's 0x6aff80 at its 0x6affe2, CreateShadowTexture's
+ * 0x6b0030 at its 0x6b0051 and CombinedChunkTexture's 0x6b00a0, whose cmp is
+ * the first thing the function does, before its own prologue -- and benilla-re's
+ * systems/terrain/chunk.md says the option's setter accepts at most 1, so the
+ * only two answers are 32 and 64. */
+#define ADDR_SHADOW_LEVEL   0xC63284u
+#define TILE_TEXELS_FULL    0x40u
+#define TILE_TEXELS_HALF    0x20u
 
 /* The chunk grid a CArea keeps, and the chunk's own copy of its place in it:
  * an area's chunk object lives at area + 0x278 + index*4 (the chunk layer
@@ -632,6 +674,7 @@ static int g_refill_done;                    /* the refill pass happened      */
 static volatile LONG g_refill_taken;         /* the refill pass owns the pass */
 static unsigned char *g_arena;        /* payloadUnique x 512 live shadow maps */
 static unsigned char *g_stub;         /* the executable page holding the detour */
+static unsigned char *g_update_thunk; /* the thiscall thunk on that same page  */
 static unsigned char g_dat_map[24];   /* header's map name, NUL-terminated  */
 static DWORD g_resume;                /* runtime resume address for the asm */
 static volatile DWORD g_hits;         /* chunks that found a payload        */
@@ -2446,9 +2489,15 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
  * CreateShadowTexture (0x6b0030) keeps the MCSH address it was handed at
  * +0x144 and DecodeShadow (0x6b02b0), the fill callback's worker, reads
  * +0x144 again, so a new address there is the new shadows; and GxTexUpdateRect
- * (0x58ac70) over the whole texture is what CMapChunk::UpdateShadow
- * (0x6b001e) itself calls at 0x6b0263 with the tile rectangle, and what the
- * minimap calls at 0x4ecef8 with four zeros to mean the whole texture. */
+ * (0x58ac70) is what tells the device to fill a texture again. The chunk
+ * layer's own UpdateShadow (0x6aff80) asks for the whole tile at its 0x6b001e,
+ * with the client's own six words -- push 1, the tile size twice and 0, edx
+ * cleared, the texture in ecx -- and the refill copies that shape, through the
+ * thunk this DLL emits on its executable page. The minimap's 0x4ecef8 form
+ * with four zeros is NOT the whole-texture idiom: its last word is the flag
+ * that decides whether the device is told at all, so four zeros only record a
+ * rectangle. Reading the callee back is what settled that, see the comment at
+ * ADDR_GXTEX_UPDATE_RECT. */
 static void RefillShadowTextures(void)
 {
     unsigned i, hmin, clock, refilled = 0u, moved = 0u, absent = 0u;
@@ -2463,9 +2512,8 @@ static void RefillShadowTextures(void)
                                              * that took a payload but had no
                                              * texture to mark get the same
                                              * treatment */
-    unsigned tex, tex_ofs, other_ofs, other_tex, shader_a, shader_b;
-    GxTexUpdateRectT gx_update_rect =
-        (GxTexUpdateRectT)(size_t)ADDR_GXTEX_UPDATE_RECT;
+    unsigned tex, tex_ofs, other_ofs, other_tex, shader_a, shader_b, tile, level;
+    GxUpdateRectThunkT mark_rect;
     char msg[1024]; /* the split summary line is the longest of the three */
 
     /* one pass per session, whichever trigger got there first: the chunk hook
@@ -2475,6 +2523,18 @@ static void RefillShadowTextures(void)
     if (InterlockedCompareExchange(&g_refill_taken, 1, 0) != 0)
         return;
     g_refill_done = 1; /* the pass is owned: neither trigger asks again */
+
+    /* the client call the marks go through. BuildStub emits it on the detour's
+     * execute page next to the hook, and the two are refused together, so a
+     * pass that finds no thunk here is an install that refused and this line
+     * should be unreachable: it is kept because it says which of the two
+     * "nothing changed on the ground" cases the log is in, rather than
+     * reaching through a null pointer and looking like the client's crash. */
+    if (!g_update_thunk) {
+        LogMsg(STAMP " refill: no gx_rect_thunk was emitted on the detour page, so no texture can be marked dirty: the pass is left alone");
+        return;
+    }
+    mark_rect = (GxUpdateRectThunkT)(size_t)g_update_thunk;
 
     if (g_refillCount == 0u) {
         LogMsg(STAMP " refill: no chunk was installed by the loader, so there"
@@ -2534,6 +2594,22 @@ static void RefillShadowTextures(void)
              (unsigned)FIELD_GX_SHADER1, (unsigned)shader_b,
              (tex_ofs == (unsigned)FIELD_COMBINED ? "one of them holds 1"
                                                  : "neither holds 1"));
+    LogMsg(msg);
+
+    /* the size of the rectangle the device is told about: the client's own
+     * chunk-texture sites compare the shadowLevel option to exactly 1 and make
+     * the texture's side and the two sizes they push from that answer, so the
+     * refill reads the same dword and compares the same way rather than
+     * assuming 64. A client on the game's default answers 0 and gets 0x40;
+     * one that set the option to 1 built 32x32 textures and a 64-wide
+     * rectangle would name texels that do not exist. */
+    level = ((const unsigned *)(size_t)ADDR_SHADOW_LEVEL)[0];
+    tile = (level == 1u) ? TILE_TEXELS_HALF : TILE_TEXELS_FULL;
+    snprintf(msg, sizeof msg,
+             STAMP " refill: a whole texture is marked as a %u by %u texel rectangle,"
+                    " because the client's shadowLevel option at %#x reads %u and the"
+                    " side is 32 only when that dword is exactly 1, else 64",
+             tile, tile, (unsigned)ADDR_SHADOW_LEVEL, level);
     LogMsg(msg);
 
     /* each recorded chunk is picked again the way its own load picked it:
@@ -2712,14 +2788,22 @@ static void RefillShadowTextures(void)
                 /* the refill the client's own refresh primitive wants:
                  * the shadows are now this chunk's new bytes at +0x144,
                  * and the texture was filled from the old ones, so ask
-                 * the device to fill it again. Four zero rectangles: the
-                 * whole texture, the minimap's idiom. Left alone when the
-                 * chunk has no texture at EITHER field, which is what a
-                 * chunk that never reached CreateShadowTexture looks like:
-                 * then the new +0x144 is picked up the next time the chunk
-                 * builds its texture. */
+                 * the device to fill it again -- in the client's own shape,
+                 * which is the whole tile as a {0, 0, size, size} rectangle
+                 * with the flag word answering 1, the texture in ecx and
+                 * edx cleared: UpdateShadow's 0x6b001e, CreateShadowTexture's
+                 * 0x6b007c and CombinedChunkTexture's 0x6b00de all do
+                 * exactly this to exactly the two textures marked here. Four
+                 * zeros, sv17..sv20's form, cannot work: the last word is the
+                 * flag whose test at 0x594c23 skips the device upload, and
+                 * the rect {0,0,0,0} takes the cmp ebx,ecx / jge branch that
+                 * only resets the texture's own rectangle words. Left alone
+                 * when the chunk has no texture at EITHER field, which is what
+                 * a chunk that never reached CreateShadowTexture looks like:
+                 * the new +0x144 is then picked up the next time the client
+                 * builds that chunk's texture. */
                 if (tex != 0u)
-                    gx_update_rect((void *)(size_t)tex, 0u, 0u, 0u, 0u);
+                    mark_rect(tex, tile);
                 else {
                     ++notex; /* the payload was handed over and nothing was
                                * marked dirty: the chunk has no texture at
@@ -2978,6 +3062,84 @@ static const unsigned char stub_code_d[] = {
 #define STUB_D_SLOT_FIXUP    7u
 #define STUB_D_SLOT_RESUME  24u
 
+/* The refill's client call, in the client's own shape, and the reason a table
+ * of bytes is the only honest way to write it: GxTexUpdateRect (0x58ac70) takes
+ * its texture in ecx and the rectangle's second word in edx. C has no way to
+ * say that about an address -- this compiler refuses both __thiscall and
+ * __fastcall on a function-pointer typedef -- and the cdecl form sv17..sv20
+ * used pushed the rectangle words and left ecx at whatever the surrounding C
+ * had put there last. sv20's crash report is exactly that: 0x594b9e is mov
+ * byte ptr [esi], 1, esi = [ebp+8] of 0x594b90, which is the ecx its caller
+ * 0x58acd0 pushed and that caller was entered with by GxTexUpdateRect's own
+ * tail -- so ecx at the C call site -- and the report's "write of 0x140" is
+ * FIELD_SHADOW_TEX, the constant the refill's own address arithmetic left in
+ * that register, faulting because no page is mapped there.
+ *
+ * The six words the thunk leaves the callee with are the client's own, copied
+ * from three places that all do the same thing to the same two textures this
+ * refill marks, and the three sites all push the same six words: CreateShadowTexture's
+ * push-1 at 0x6b007c, CombinedChunkTexture's at 0x6b00ce and CMapChunk::UpdateShadow's
+ * (0x6aff80) at 0x6b0011, whose call is at 0x6b001e, all run
+ *      push 1 / push <size> / push <size> / push 0 / xor edx,edx / mov ecx,<texture>
+ * with <size> = 0x20 when shadowLevel reads exactly 1 and 0x40 otherwise, the
+ * same comparison that decided the texture's side. Reading the callee back is
+ * what says those words are the rect and the flag: 0x58ac70 stores [ebp+8] at
+ * rect+0, edx at rect+4, [ebp+0x10] at rect+8 and [ebp+0xc] at rect+0xc of a
+ * local rect at [ebp-0x10], pushes the last argument and hands the rect in
+ * edx plus the unchanged ecx to 0x58acd0, which pushes the flag, the rect and
+ * the texture, loads the device at 0xc0ed38 into ecx as this and calls 0x594b90
+ * -- so [ebp+8] there is the texture, which is why the first thing it does at
+ * 0x594b9e is write a byte into it (that byte is the dirty flag), [ebp+0xc] is
+ * the rect and [ebp+0x10] is the flag whose test at 0x594c23 answers whether
+ * the device is told at all: 0x594c27 movs ecx back to the device, reads its
+ * vtable and does push <texture> / call dword ptr [edx], the slot-0 method, and
+ * je 0x594c2f skips that whole block. Four zeros, the minimap's 0x4ecef8 form,
+ * answers no to that test, so nothing is ever uploaded, and its {0,0,0,0} rect
+ * also takes the cmp ebx,ecx / jge 0x594c08 branch -- rect+0 and rect+8 are
+ * both 0 there -- whose block rewrites the texture's own rect words from its
+ * [esi+0x24] and [esi+0x28] rather than uploading new pixels. That is why the
+ * sv17..sv20 form could not have changed anything on the ground, on top of
+ * faulting.
+ *
+ * The shape around the table is the cdecl one this file's own call site emits:
+ * C pushes the size then the texture and cleans 8 bytes after the call, so at
+ * the thunk's entry [esp+4] is the texture and [esp+8] the size, and the four
+ * pushes it makes are exactly what GxTexUpdateRect's ret 0x10 removes, so the
+ * ret that follows it returns to C with esp where C expects it. Nothing else
+ * is promised or needed: cdecl already says eax, ecx and edx may change, and
+ * the callee keeps ebx, esi, edi and ebp. The one imm32 is a client address,
+ * so it needs no relocation dance -- same rule as the detour's resume slot --
+ * and is patched at install for the same reason.
+ *
+ * Encoding note, and the reason the two stack reads are four bytes long: the
+ * addressing mode [esp+4] cannot be written with three. rm=100 with a mod that
+ * carries a displacement is [ebp+disp8], the frame pointer, not the stack
+ * pointer, and the only way to say esp as the base is the SIB byte 0x24 --
+ * no index, base esp -- followed by the disp8. sv21's first draft omitted it
+ * and capstone decoded 8b 4c 04 as mov ecx,[esp+eax-0x75], a different
+ * instruction entirely; verify_dll.py disassembles the table from the linked
+ * image, so that misalignment cannot ship. */
+static const unsigned char gx_rect_thunk[] = {
+    0x8B, 0x4C, 0x24, 0x04,       /* mov  ecx, [esp+4]   = texture  */
+    0x8B, 0x44, 0x24, 0x08,       /* mov  eax, [esp+8]   = size     */
+    0x6A, 0x01,                   /* push 1              (a4: device) */
+    0x50,                         /* push eax            (a3 = size) */
+    0x50,                         /* push eax            (a2 = size) */
+    0x6A, 0x00,                   /* push 0              (a1)        */
+    0x33, 0xD2,                   /* xor  edx, edx       (rect +4)   */
+    0xB8, 0x00, 0x00, 0x00, 0x00, /* mov  eax, <GxTexUpdateRect>     */
+    0xFF, 0xD0,                   /* call eax                        */
+    0xC3                          /* ret                             */
+};
+#define GX_RECT_THUNK_BYTES         24u
+#define GX_RECT_THUNK_SLOT_TARGET   17u
+/* where the thunk sits on the detour's page. Not at 0: the detour is written
+ * at the page's start, and 0x80 clears the longest table this source has ever
+ * emitted (stub_sv20 and stub_sv16 are 0x40 bytes) by twice. BuildStub checks
+ * the pair against the rung it really emitted, so a longer detour in a future
+ * source is refused instead of overlapping the thunk. */
+#define STUB_PAGE_THUNK             0x80u
+
 /* Which detour shape a rung rides. This is the one place the ladder says which
  * frame is in play, and it changed after real runs: sv8's mode b (the 0x6AF5F0
  * store, pushad/pushfd and [esp+48] record lookup) crashed entering the world at
@@ -3010,7 +3172,7 @@ static int BuildStub(char rung)
     unsigned char *page;
     const unsigned char *code;
     unsigned code_bytes, slot_fixup, slot_resume;
-    unsigned fixup_target, resume_at;
+    unsigned fixup_target, resume_at, target;
     char msg[256];
     char shape;
     unsigned resume_prefix;
@@ -3056,6 +3218,19 @@ static int BuildStub(char rung)
         LogMsg(STAMP " build defect: the detour byte table and its slot offsets disagree, refusing to patch");
         return 0;
     }
+    /* the refill's client call is checked by the same rule, before any page
+     * exists: its one imm32 is the operand of a mov, and zeroed in the table */
+    if (GX_RECT_THUNK_BYTES != (unsigned)sizeof gx_rect_thunk
+        || gx_rect_thunk[GX_RECT_THUNK_SLOT_TARGET - 1u] != 0xB8u
+        || gx_rect_thunk[GX_RECT_THUNK_SLOT_TARGET] != 0u
+        || gx_rect_thunk[GX_RECT_THUNK_SLOT_TARGET + 1u] != 0u
+        || gx_rect_thunk[GX_RECT_THUNK_SLOT_TARGET + 2u] != 0u
+        || gx_rect_thunk[GX_RECT_THUNK_SLOT_TARGET + 3u] != 0u
+        || STUB_PAGE_THUNK + GX_RECT_THUNK_BYTES > 0x1000u
+        || STUB_PAGE_THUNK < (unsigned)code_bytes) {
+        LogMsg(STAMP " build defect: the gx_rect_thunk table and its slot or page offsets disagree, refusing to patch or to offer a refill that could not call the device");
+        return 0;
+    }
     page = (unsigned char *)VirtualAlloc(NULL, 0x1000u, 0x00003000u,
                                          0x00000040u /* PAGE_EXECUTE_READWRITE from
                                          <winnt.h>, the same value MinHook asks for
@@ -3081,6 +3256,23 @@ static int BuildStub(char rung)
     if (slot_fixup != 0u)
         memcpy(page + slot_fixup, &fixup_target, 4);
     memcpy(page + slot_resume, &resume_at, 4);
+    /* the refill's thunk shares this page: it is machine code the client's own
+     * function is called through, so it needs the execute bit the page was
+     * asked for, and it sits past the longest detour table so the client's jmp
+     * and the replayed prologue never touch it. The length is a volatile local
+     * on purpose: asked to memcpy GX_RECT_THUNK_BYTES == 24 constant bytes out
+     * of a const array, /O2 stores the twenty-four literals directly and never
+     * takes the array's address, and then gx_rect_thunk is not in the image at
+     * all -- the byte-for-byte gate below would be looking at nothing, and the
+     * rule this project keeps ("mod.c's table is the source of truth for the
+     * shipped bytes") would have no shipped copy to check. With a length the
+     * compiler cannot fold, the copy is a real memcpy out of the table in .rdata
+     * and the image does carry it. */
+    volatile unsigned int thunk_bytes = GX_RECT_THUNK_BYTES;
+    memcpy(page + STUB_PAGE_THUNK, gx_rect_thunk, (size_t) thunk_bytes);
+    target = ADDR_GXTEX_UPDATE_RECT;
+    memcpy(page + STUB_PAGE_THUNK + GX_RECT_THUNK_SLOT_TARGET, &target, 4);
+    g_update_thunk = page + STUB_PAGE_THUNK;
     g_stub = page;
     return 1;
 }
@@ -3149,6 +3341,34 @@ static int PatchHook(char rung)
 
     if (memcmp(site, patched, 5) != 0) {
         LogMsg(STAMP " the 5-byte detour store did not land (write-protected code page): refusing to run half-patched");
+        return 0;
+    }
+    /* the page's other half, read back: the refill's thunk. The detour's read-
+     * back says the jmp landed; this one says the client-call shape actually
+     * left the compiler into the image, which is the thing sv21 keeps getting
+     * wrong twice. Ask /O2 to memcpy a constant 24 bytes out of a const array
+     * and it stores the literals and takes no address, so the array has no
+     * home in .rdata and there is nothing to copy; build gates that check the
+     * bytes of mod.c against the image fail exactly then (sv21 saw "the 24-
+     * byte thunk table is NOT in any section"). And the shape itself: the two
+     * stack reads are four bytes long because [esp+d] needs the SIB byte 0x24,
+     * three-byte 8b 4c 04 is mov ecx,[esp+eax-0x75], a different instruction,
+     * and a thunk built from that draft pushed a garbage texture into a client
+     * function whose first test is test ecx,ecx -- it returned quietly instead
+     * of refilling, which is a wrong answer that looks like a pass. So the
+     * prefix bytes are checked, the imm32 is checked against the address
+     * install means to call, and the call and ret are checked to be there: the
+     * bytes that run are the bytes in mod.c's table. */
+    if (g_update_thunk != g_stub + STUB_PAGE_THUNK
+        || memcmp(g_stub + STUB_PAGE_THUNK, gx_rect_thunk,
+                  GX_RECT_THUNK_SLOT_TARGET) != 0
+        || *(const unsigned *) (size_t) (g_stub + STUB_PAGE_THUNK
+                                         + GX_RECT_THUNK_SLOT_TARGET)
+           != ADDR_GXTEX_UPDATE_RECT
+        || g_stub[STUB_PAGE_THUNK + GX_RECT_THUNK_SLOT_TARGET + 4u] != 0xFFu
+        || g_stub[STUB_PAGE_THUNK + GX_RECT_THUNK_SLOT_TARGET + 5u] != 0xD0u
+        || g_stub[STUB_PAGE_THUNK + GX_RECT_THUNK_BYTES - 1u] != 0xC3u) {
+        LogMsg(STAMP " the execute page does not hold gx_rect_thunk with the client's GxTexUpdateRect address in its imm32: the refill would call whatever else is on the page, refusing to run");
         return 0;
     }
     if (perms)

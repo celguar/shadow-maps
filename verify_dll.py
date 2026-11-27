@@ -67,10 +67,37 @@ own frame pointer, so no esp displacement is involved in finding them:
     68 <imm32>         push <resume>              slot STUB_D_SLOT_RESUME = 24
     c3                 ret                        -> 0x6AF5F8
 
-The needle is PARSED out of mod.c rather than hardcoded for all three tables, so
-the fingerprint cannot drift from the source: if someone edits a table, this
-script follows. It also cross-checks every table's own _BYTES and slot defines
-against the array, which is the same equality BuildStub asserts at runtime.
+A fourth table is not a rung's detour but the refill's client call, and it is
+machine code for the same reason -- GxTexUpdateRect (0x58ac70) keeps its texture
+in ecx and the rectangle's second word in edx, and this compiler refuses both
+__thiscall and __fastcall on a function-pointer typedef, so C cannot say the
+calling shape at all. sv20 found that out by crashing: the report's 0x594b9e is
+`mov byte ptr [esi], 1` with esi = [ebp+8] of 0x594b90 = the ecx 0x58acd0 was
+entered with = the ecx the cdecl call never set, and the "write of 0x140" is
+FIELD_SHADOW_TEX read back as an address. gx_rect_thunk, 24 bytes, is copied onto
+the SAME execute page as the detour, at STUB_PAGE_THUNK, and its one imm32 slot
+carries 0x58ac70 at install:
+
+    gx_rect_thunk  24 bytes, target slot 17, page offset 0x40
+
+     8b 4c 24 04      mov  ecx, [esp+4]   = the texture C passed
+     8b 44 24 08      mov  eax, [esp+8]   = the tile size C passed
+     6a 01            push 1              = arg4, the flag: 0x594c23 tests it
+     50               push eax            = arg3, stored at rect+8
+     50               push eax            = arg2, stored at rect+0xc
+     6a 00            push 0              = arg1, stored at rect+0
+     33 d2            xor  edx, edx       = the rect's word at +4, from a
+                                            register not the stack
+     b8 <imm32>       mov  eax, <0x58ac70>  slot GX_RECT_THUNK_SLOT_TARGET = 15
+     ff d0            call eax
+     c3               ret                 = back to C, which cleans its 2 args
+
+The callee's own `ret 0x10` removes the four pushed words, so esp comes back
+where C expects it. The four zeros sv17..sv20 pushed instead cannot work at all:
+the last word is the flag whose test at 0x594c23 skips the device upload, and a
+{0,0,0,0} rect takes the `cmp ebx,ecx / jge 0x594c08` branch that only resets the
+texture's rectangle words. The page offset must also clear the longest detour
+table, which is checked against every rung here and against code_bytes in BuildStub.
 
 One check cannot come from the source at all: the stubs' `add esp,N` after the
 call. MSVC gives a static C function a PLAIN ret (opcode c3) and makes the caller
@@ -165,6 +192,29 @@ def parse_stubs(source_text):
     return tables or None
 
 
+def parse_thunk(source_text):
+    """The refill's client-call thunk in mod.c, with its slot and page defines."""
+    body = re.search(r"\bgx_rect_thunk\[\]\s*=\s*\{(.*?)\}\s*;", source_text, re.S)
+    if body is None:
+        return None
+    raw = re.sub(r"/\*.*?\*/", "", body.group(1), flags=re.S)
+    data = bytes(int(t, 16) for t in re.findall(r"0[xX][0-9a-fA-F]+", raw))
+    want = len(data)
+    hit = re.search(r"#define\s+GX_RECT_THUNK_BYTES\s+(\d+)u?", source_text)
+    if hit:
+        want = int(hit.group(1))
+    slot = None
+    hit = re.search(r"#define\s+GX_RECT_THUNK_SLOT_TARGET\s+(\d+)u?", source_text)
+    if hit:
+        slot = int(hit.group(1))
+    page = None
+    hit = re.search(r"#define\s+STUB_PAGE_THUNK\s+(0[xX][0-9a-fA-F]+|\d+)u?",
+                    source_text)
+    if hit:
+        page = int(hit.group(1), 0)
+    return {"bytes": data, "want": want, "slot": slot, "page": page}
+
+
 def callee_cleanup(path, blob, pe, base, md):
     """Bytes the callee itself removes for the fixup call, read from the image.
 
@@ -212,9 +262,12 @@ def main(argv):
     bad = 0
     md = Cs(CS_ARCH_X86, CS_MODE_32)
 
+    thunk = None
     try:
         with open(MOD_CPP, "rb") as fh:
-            tables = parse_stubs(fh.read().decode("utf-8", "replace"))
+            source_text = fh.read().decode("utf-8", "replace")
+        tables = parse_stubs(source_text)
+        thunk = parse_thunk(source_text)
         if tables is None:
             print("mod.c has no stub_code tables: falling back to the hardcoded"
                   " needles")
@@ -259,8 +312,50 @@ def main(argv):
                     bad += 1
                     print("   %s%s=%d is past the end of the table"
                           % (STUB_SHAPE[t["rung"]][1], label, where))
+        if thunk is None:
+            bad += 1
+            print("   mod.c has no gx_rect_thunk table: the refill cannot call"
+                  " GxTexUpdateRect with its texture in ecx, which is exactly"
+                  " what faulted in sv20 at 0x594b9e")
+        else:
+            print("thunk gx_rect_thunk from mod.c: %d bytes (want %d), target slot %s,"
+                  " page offset %#x"
+                  % (len(thunk["bytes"]), thunk["want"],
+                     ("%d" % thunk["slot"]) if thunk["slot"] is not None else "none",
+                     thunk["page"] if thunk["page"] is not None else 0))
+            if thunk["want"] != len(thunk["bytes"]):
+                bad += 1
+                print("   GX_RECT_THUNK_BYTES says %d, the array has %d: BuildStub"
+                      " refuses to patch and the refill is left alone"
+                      % (thunk["want"], len(thunk["bytes"])))
+            where = thunk["slot"]
+            if (where is None or where + 4 > len(thunk["bytes"])
+                    or thunk["bytes"][where - 1] != 0xB8
+                    or thunk["bytes"][where:where + 4] != b"\x00\x00\x00\x00"):
+                bad += 1
+                print("   GX_RECT_THUNK_SLOT_TARGET does not point at a zeroed"
+                      " mov imm32: install would write the client address into"
+                      " the middle of an instruction")
+            if thunk["page"] is None:
+                bad += 1
+                print("   STUB_PAGE_THUNK is not defined: where the thunk lands"
+                      " on the execute page is unchecked")
+            else:
+                for t in tables:
+                    if thunk["page"] < len(t["bytes"]):
+                        bad += 1
+                        print("   STUB_PAGE_THUNK=%#x is inside the %s detour table"
+                              " of %d bytes: the client's jmp and the thunk"
+                              " would run over each other"
+                              % (thunk["page"], t["name"], len(t["bytes"])))
+                if thunk["page"] + len(thunk["bytes"]) > 0x1000:
+                    bad += 1
+                    print("   the thunk at %#x runs past the 0x1000 page"
+                          % thunk["page"])
     except OSError as exc:
-        print("cannot read mod.c (%s): falling back to the hardcoded needles" % exc)
+        print("cannot read mod.c (%s): falling back to the hardcoded needles"
+              " and leaving the thunk unchecked" % exc)
+        thunk = None
         tables = []
         for rung in ("b", "c", "d"):
             hexs, want, fx, rs = FALLBACK_STUBS[rung]
@@ -387,6 +482,85 @@ def main(argv):
                 print("   the stub %s table appears in %d sections: two copies"
                       " means BuildStub and the shipped bytes could disagree"
                       % (t["rung"], found))
+
+        # ---- the refill's client-call thunk -------------------------------
+        if thunk is None:
+            print("   no thunk table parsed from mod.c: its bytes are unchecked"
+                  " here, and a refill that reaches GxTexUpdateRect through a"
+                  " plain C pointer faults inside the client, as sv20 did")
+        else:
+            found = 0
+            for sec in pe.sections:
+                label = sec.Name.rstrip(b"\0").decode("ascii", "errors")
+                size = sec.SizeOfRawData
+                raw = blob[sec.PointerToRawData:sec.PointerToRawData + size]
+                at = raw.find(thunk["bytes"])
+                if at < 0:
+                    continue
+                found += 1
+                va = base + sec.VirtualAddress + at
+                print("   thunk gx_rect_thunk (%d bytes) found in %s at %#x"
+                      % (len(thunk["bytes"]), label, va))
+                ins_list = list(md.disasm(raw[at:at + len(thunk["bytes"])], va))
+                for ins in ins_list:
+                    print("     %#010x: %-22s %s %s"
+                          % (ins.address, ins.bytes.hex(), ins.mnemonic, ins.op_str))
+                if not ins_list:
+                    bad += 1
+                    print("     the thunk disassembles to nothing: it is not code")
+                    continue
+                if ins_list[-1].mnemonic != "ret":
+                    bad += 1
+                    print("     the thunk does not end in ret: control would fall"
+                          " through into whatever follows it on the execute page")
+                pushes = [i.op_str for i in ins_list if i.mnemonic == "push"]
+                calls = [i for i in ins_list if i.mnemonic == "call"]
+                def takes(mn, reg, word):
+                    return [i for i in ins_list
+                            if i.mnemonic == mn
+                            and i.op_str.replace(" ", "").startswith(reg + ",")
+                            and word in i.op_str.replace(" ", "")]
+
+                ecx = takes("mov", "ecx", "esp+4")
+                size = takes("mov", "eax", "esp+8")
+                if len(pushes) != 4 or "1" not in pushes or "0" not in pushes:
+                    bad += 1
+                    print("     the thunk pushes %s instead of 1, the size twice"
+                          " and 0: the callee's rect and its device flag"
+                          " would not be the client's own"
+                          % ("[" + ",".join("'%s'" % p for p in pushes) + "]"))
+                if len(calls) != 1 or calls[0].op_str != "eax":
+                    bad += 1
+                    print("     the thunk does not call eax once: what reaches"
+                          " 0x58ac70 is not what install patched")
+                if not ecx:
+                    bad += 1
+                    print("     nothing puts the texture in ecx: that is the"
+                          " register whose absence wrote 0x140 in sv20")
+                if not size:
+                    bad += 1
+                    print("     nothing reads the size C passed off the stack:"
+                          " the rectangle would be a constant, not the tile"
+                          " shadowLevel decided")
+                where = thunk["slot"]
+                if where is not None and (raw[at + where - 1] != 0xB8
+                                          or raw[at + where:at + where + 4]
+                                          != b"\x00\x00\x00\x00"):
+                    bad += 1
+                    print("     the thunk's patch slot in this image is not a"
+                          " zeroed mov imm32: install would overwrite an"
+                          " instruction operand")
+            if found == 0:
+                bad += 1
+                print("   the %d-byte thunk table is NOT in any section of this"
+                      " image: BuildStub's memcpy has no source to copy, so no"
+                      " refill can ask the device to refill a texture"
+                      % len(thunk["bytes"]))
+            elif found > 1:
+                bad += 1
+                print("   the thunk table appears in %d sections: two copies"
+                      " means BuildStub and the shipped bytes could disagree"
+                      % found)
 
     print("dlls %d" % len(dlls))
     return 1 if bad else 0
