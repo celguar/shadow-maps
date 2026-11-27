@@ -997,3 +997,88 @@ What the next run has to show, in order:
 * One file note still owed: the user's real six-set `.dat` opens its night
   record at 21:50, not the plan's 21:30, so the tiling of that file came from one
   of the user's own re-stamps.
+
+## sv22: the refill reached the ground, and two things about it were still wrong
+
+The sv21 run's own words: *"texture really works now!"* — the `0x594b9e` report is
+gone and the ground redraws at login. Two things about that refill were still wrong
+in game, and both were settled by reading **which field of the chunk the client
+reads**, not by guessing at the mod's own state.
+
+### Issue 2: the shadow *effect* stayed where the old set was
+
+The client keeps the shadow map's address in two places, and different code reads
+each one. Reading them is what split the symptom:
+
+| Field | Written by | Read by |
+| --- | --- | --- |
+| `chunk+0x144` (`FIELD_SHADOW_OFS`) | `CreateShadowTexture (0x6b0030)` stores the address it was handed; the combined packer `0x6b02f0` passes it with four alpha pointers to `0x6b0350` | the shadow texture's fill (`DecodeShadow (0x6b02b0)`, the fill callback's worker) |
+| `chunk+0xf1c` (`FIELD_PTR_MCSH`) | `CMapChunk::Load` through the resolver `0x6AF970`, as `hdr + ofsMCSH` | `IsInChunkShadow (0x69b350)`, dereferenced at `0x69b466` — the doodad, entity and light code; the grass detail's own test at `0x6c013b` |
+
+sv21 re-pointed only `+0x144`. So the redrawn shadows were, in the user's words,
+"just textures": an NPC or a player walking where the **old** set's shadow was
+still got the shadow effect, and one standing where the **new** one is got nothing
+— the effect and the picture were reading two different records. The two fields
+hold the same address for a live chunk (`+0xf1c` is `hdr + ofsMCSH`, `+0x144` is
+what `CreateShadowTexture` was handed, which is that same address), so writing
+both is what makes them agree, and neither write destroys the chunk or its
+texture.
+
+### Issue 1: a sparse preset was never drawn
+
+The user's own words for it: the 21:30 preset ships **only the changed chunks**
+(`patch-S.mpq`), so most chunks have no entry there and must fall back to stock —
+and full-map bakes are accepted, but "if you find a fix, that can save me some MBs".
+Two separate defects made that preset never appear:
+
+* `fixup_chunk` **returned** before recording a chunk with no entry, so the refill
+  only ever knew the chunks that had matched. A fuller record that becomes current
+  later could never reach the rest of the map. sv22 records those chunks with
+  `REFILL_NONE`.
+* A tile the picked record has no entry for used to keep "the shadow the load
+  gave it", and for a resident chunk that is the **previous** record's shadow. A
+  refill could hand a chunk a new shadow but not take one back. sv22 hands back the
+  client's own stock `MCSH`: `hdr + ofsMCSH`, the address `fixup_chunk` read for
+  every chunk this `.dat` names, which is the same address the client itself
+  dereferences through `chunk+0xf1c` while the chunk is alive — so the way back to
+  stock needs no copy of the night's shadows and no bigger file.
+
+The gate for having a stock shadow at all is the client's own: MCNK flag bit 0
+(the shadow path's gate inside `Load`, read at `0x6af6ea`) plus a real MCSH body
+behind the header. A chunk failing that has `0` recorded, is counted apart
+(`nostock`), and is left exactly as the client left it.
+
+### The refill follows the day, not the login
+
+sv17 stopped at **one pass per session**, which is why the log said set 4 of 6 was
+picked while the ground stayed on the record the midnight load chose. `g_set_applied[group]`
+is what a map group's chunks are drawing now; the chunk hook asks
+`RefillKeep(group, which)` with the pick the load already took, so the per-chunk cost is
+one array read and one integer compare, and a pass runs only when the record the clock
+picks stops being the one the world is drawing — the day's own crossings, at most one a
+day per record. `AnyGroupDue` asks the same question from the watchdog thread for the
+session that stands where it booted, and `g_refill_busy` — replacing sv17's one-shot
+`g_refill_taken` — keeps the two triggers from running a pass in each other's middle.
+The first chunk of a group only states what its load picked, so the chunks of a first
+login's own load are never marked while their textures are being built.
+
+What the next run has to show, in order:
+
+* One `refill pass:` line per crossing, naming the clock in half-minutes and the
+  day's 0..10000 number beside it, so the ground can be read against the sky's
+  crossing rather than a screenshot. With `f 5 v` the six windows cross in a few
+  minutes and six such lines should print.
+* `handed their stock shadow back` (`absent`) is the issue-1 evidence: on the
+  six-set file whose 21:30 record is `patch-S`-only, most of Azeroth is expected
+  there, with `nostock` near 0.
+* The entity and grass answer is in game, not in the log: an NPC standing where
+  the new set's shadow is must get the effect, and one where only the old one was
+  must lose it. If the log says re-pointed and the ground moved but the entities
+  do not, the next thing to read is whether `UpdateMapEntityEnvironment (0x69e280)`
+  caches its answer per entity rather than asking again each frame — `DrainPendingDoodads
+  (0x698c50)` is where the ask comes from.
+* `left alone because their shadow address is no longer one of ours` (`dead`) near
+  0 is the field-contract evidence: the recorded stock address really is what the
+  resolver wrote at `+0xf1c`. A big count there means the record buffer moved
+  between this DLL's read and the resolver, and the line prints both addresses and
+  the arena's range so the distance is measurable.

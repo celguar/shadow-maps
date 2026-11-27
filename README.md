@@ -663,11 +663,59 @@ makes the copy a real `memcpy` out of the table in `.rdata` — the shipped byte
 already says the same about its own jmp) and refuses the whole install if the
 page does not hold the table with `0x58ac70` in its imm32.
 
+sv22 is the two things sv21's confirmed refill then reported wrong in game, and
+both were found by reading which field of the chunk the client reads.
+
+**Issue 2 — the entity and grass shadows followed the old set while the ground's
+texture followed the new one.** The client keeps the shadow map's address in TWO
+places, and they are read by different code. `chunk+0x144`
+(`FIELD_SHADOW_OFS`) is what `CreateShadowTexture (0x6b0030)` stores and what the
+shadow texture is filled from — sv21 re-pointed that one, which is why the ground
+redrew. `chunk+0xf1c` (`FIELD_PTR_MCSH`) is what `CMapChunk::Load` writes through
+the resolver as `hdr + ofsMCSH`, and it is what the shadow *tests* dereference:
+`IsInChunkShadow (0x69b350)`, dereferenced at `0x69b466`, which the doodad,
+entity and light code asks, and the grass detail's own test at `0x6c013b`. So an
+NPC standing where the old set's shadow was kept getting the shadow effect and
+one standing in the new one got nothing: the picture and the effect were reading
+two different records. sv22 writes both fields, always the same address, which is
+what makes the effect and the picture about the same bytes.
+
+**Issue 1 — a sparse preset (the 21:30 one, baked only for `patch-S.mpq`'s
+places) was never drawn where it should be.** Two reasons, both fixed. A chunk
+with no entry used to `return` from `fixup_chunk` before being recorded, so a
+later, fuller record could never reach it — sv22 records the chunk with
+`REFILL_NONE` and the stock address it read. And a tile the picked record has no
+entry for used to keep "the shadow the load gave it", which for a resident chunk
+is the *previous* record's shadow; sv22 hands back the client's own stock `MCSH`,
+the address `hdr + ofsMCSH` that `fixup_chunk` read for every chunk this `.dat`
+names, so a sparse preset costs nothing extra in the file and no copy of the
+night's shadows is kept — the client already dereferences that same address
+through `chunk+0xf1c` while the chunk is alive.
+
+**The refill now follows the day instead of happening once.** sv17 stopped at one
+pass per session, so the day's own crossings were never drawn: the log said set
+4 of 6 was picked while the ground stayed on the record the midnight load chose.
+`g_set_applied[group]` is the record a map group's chunks were last given, and the
+chunk hook asks `RefillKeep(group, which)` — one array read and one integer
+compare per chunk — so a pass runs at the day's crossing and only at a crossing,
+at most once a day per record. `AnyGroupDue` is the same question from the
+watchdog thread, for the session that stands where it booted and has no further
+chunk to be called on.
+
 ## What this machine produces
 
-The sv21 build, i.e. what this branch's HEAD is: `out\ShadowMaps.dll`
-**171,520 bytes**, i686, exports `Load` at RVA `0x2cc0`, accepted by `verify_dll.py`
-with zero complaints, and its log banner reads `sv21`. The sv18 image next to it
+The sv22 build, i.e. what this branch's HEAD is: `out\ShadowMaps.dll`
+**172,032 bytes**, i686, exports `Load` at RVA `0x2cc0`, accepted by `verify_dll.py`
+with zero complaints, and its log banner reads `sv22`. It is installed in the game
+folder at `G:\Games\twmoa_1181\ShadowMaps.dll`, byte-identical, sha256
+`0fc13c5e40dc51603f0474e662a3832e3689ded703ab6258519eb92fbef30194`, which contains
+`sv22` 82 times and no `sv21`, `sv20` or `sv19`. The sv21 build was 171,520 bytes
+with `Load` at the same RVA `0x2cc0`, and sv18's was 169,472 bytes there, and sv16's
+was 165,888 with `Load` at `0x2c90`: sv22 changes the refill's writes, its trigger
+and the load's record of a chunk it left stock, so an sv21 log line and an sv22 one
+about the same `.dat` differ in what the refill found, not in what it accepted. The
+paragraphs below are the sv13 round's record of the game folder and keep their own
+numbers. The sv18 image next to it
 was 169,472 bytes with `Load` at the same RVA `0x2cc0`, and sv16's was 165,888
 with `Load` at `0x2c90`: sv18 changes one comparison and two log lines, so an
 sv17 log line and an sv18 one about the same `.dat` differ only in what the

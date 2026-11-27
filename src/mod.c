@@ -329,7 +329,7 @@
 #include <string.h>
 #include "../shadow_dat.h"
 
-#define STAMP "sv21" /* build stamp, printed in every log line: an old build of
+#define STAMP "sv22" /* build stamp, printed in every log line: an old build of
                      * this DLL sitting next to a new .dat is the most common
                      * confusion, so the line says which build made it, and the
                      * mode line below names which of the seven rungs ran. sv11
@@ -465,7 +465,11 @@ static const unsigned char k_gate[] = {
  * UpdateShadow's 0x6b0011, CreateShadowTexture's 0x6b007c and CombinedChunkTexture's
  * 0x6b00de -- all push 1, the size twice and 0 with edx cleared, the size being
  * 0x40 texels unless the shadowLevel option reads exactly 1. */
-#define FIELD_SHADOW_OFS  0x144u /* CMapChunk: address of its shadow map  */
+#define FIELD_SHADOW_OFS  0x144u /* CMapChunk: address of its shadow map,   */
+                                  /* and its twin FIELD_PTR_MCSH at +0xf1c:  */
+                                  /* the same address from the header. Which  */
+                                  /* of the two reads what is explained where  */
+                                  /* the refill writes them, sv22 */
 #define FIELD_SHADOW_TEX  0x140u /* CMapChunk: its shadow texture         */
 #define FIELD_COMBINED    0x13Cu /* CMapChunk: shadow packed with alpha   */
 #define FIELD_AREA_TABLE  0x278u /* CArea: its chunk grid, [row][column]  */
@@ -525,6 +529,19 @@ typedef void (*GxUpdateRectThunkT)(unsigned, unsigned);
  * about at once -- a chunk past the cap is left as it was installed, and the
  * refill line says how many were kept. */
 #define REFILL_MAX  8192u
+/* sv22: what the record the world is currently drawing is, and what a chunk
+ * that the load left alone has. Both are record indices, so the value below is
+ * out of range for one: g_set_applied starts there, meaning "no record has been
+ * applied to this map's group yet, the loads are drawing the one they picked",
+ * and g_refill_set carries it for a chunk whose tile is not in the set the
+ * clock picked at its load -- that chunk is drawing the stock MCSH from the
+ * .adt buffer, and sv22 needs to be able to say so because a sparse set (the
+ * 21:30 one baked only for patch-S places) leaves most of a map's tiles in it.
+ * The load cannot tell those chunks apart later -- one is stock because the
+ * night has no shadow for it and the other because the set is sparse -- and
+ * the refill has to treat them apart: the first goes back to stock when a
+ * full set becomes current, and that is only right if it was stock before. */
+#define REFILL_NONE  0xFFFFFFFFu
 
 /* Called once per chunk CMapChunk::Load builds, from the detour at 0x6AF5F3.
  * The chunk object and the file record are handed over in ecx and [esp+4]
@@ -653,25 +670,46 @@ static char g_dat_maps_txt[512];  /* every DISTINCT gate name, for the log: a
 static char g_dat_set_txt[640];   /* each map's window opens, one log line   */
 static int g_set_last = -1;       /* record the per-chunk gate picked last   */
 static unsigned g_set_logs;       /* switch-of-set lines logged this session */
-/* sv17: the chunks this run gave a baked shadow to, kept so the day's set
- * change can offer them a new one. A chunk the map load built carries a
- * shadow texture that is already made from the set that was current when it
- * was built -- at a first login that is the set the unknown clock wraps to --
- * and nothing re-runs CMapChunk::Load for a chunk that is already resident,
- * so its texture is never rebuilt on its own. One record per installed chunk,
- * in load order: the chunk object, the entry key its payload came from, the
- * record group its pick searched, and that pick. g_refill_dropped counts the
- * installs past REFILL_MAX, so the refill line can name what was never
- * offered this clock rather than leave it unstated. */
+/* sv17 and sv22: one record per chunk the map load touched on a map this .dat
+ * names -- whether it found a payload or not, which is sv22's point: a sparse
+ * set (the 21:30 one baked only for the patch-S places) leaves most of a map's
+ * tiles without an entry, and those chunks are exactly the ones a later, fuller
+ * set has to be given, so a refill that only knew the matched chunks could never
+ * draw a preset over them. A chunk the map load built carries a shadow texture
+ * that is already made from the set that was current when it was built -- at a
+ * first login that is the set the unknown clock wraps to, and for a sparse set
+ * that texture is the stock MCSH from the .adt buffer -- and nothing re-runs
+ * CMapChunk::Load for a chunk that is already resident, so its texture is never
+ * rebuilt on its own. In load order: the chunk object, the entry key, the
+ * record group its pick searched, and that pick, or REFILL_NONE when the load
+ * left the chunk stock; plus the stock shadow's address, which is what sv22
+ * hands back when a fuller record turns out not to cover this tile either. The
+ * stock address is the value the load read at hdr + ofsMCSH, the place the
+ * client itself dereferences for a live chunk through its +0xf1c copy, so
+ * keeping it is no bolder than what the client already does with it.
+ * g_refill_dropped counts the chunks past REFILL_MAX, so the refill line can
+ * name what was never offered this clock rather than leave it unstated. */
 static unsigned g_refill_chunk[REFILL_MAX];
 static unsigned g_refill_key[REFILL_MAX];
 static unsigned g_refill_first[REFILL_MAX];  /* group start the pick searched */
 static unsigned g_refill_set[REFILL_MAX];    /* record that pick chose        */
+static unsigned g_refill_stock[REFILL_MAX];  /* stock MCSH address, 0: none   */
 static unsigned g_refillCount;               /* records kept, capped          */
-static unsigned g_refill_dropped;            /* installs past the cap         */
+static unsigned g_refill_dropped;            /* chunks past the cap           */
+static unsigned g_refill_stock_ofs[REFILL_MAX]; /* the ofsMCSH the load read   */
 static unsigned g_arena_bytes;               /* arena size: the liveness test */
-static int g_refill_done;                    /* the refill pass happened      */
-static volatile LONG g_refill_taken;         /* the refill pass owns the pass */
+/* sv22: the record each map group is drawing now, and the group starts the
+ * load has seen. This is what makes the re-fill follow the day rather than
+ * happen once: sv17 stopped at one pass per session, so a set that became
+ * current later in the day was never drawn -- the log said set 4 of 6 was
+ * picked and the ground stayed on the set the midnight load chose. A group
+ * whose applied record differs from the one the clock picks is a set change,
+ * and that is the only moment the pass is worth running. g_refill_busy keeps
+ * the chunk hook's trigger and the watchdog thread from running a pass in
+ * each other's middle; unlike sv17's one-shot it says nothing about how many
+ * passes a session takes. */
+static unsigned g_set_applied[SHADOW_DAT_MAP_MAX]; /* per group start */
+static volatile LONG g_refill_busy;         /* a refill pass is in flight */
 static unsigned char *g_arena;        /* payloadUnique x 512 live shadow maps */
 static unsigned char *g_stub;         /* the executable page holding the detour */
 static unsigned char *g_update_thunk; /* the thiscall thunk on that same page  */
@@ -740,7 +778,7 @@ static int Install(void);
 static int BuildStub(char rung);
 /* sv17: the chunk hook's refill trigger (fixup_chunk calls it on every chunk),
  * defined below next to the refill it guards */
-static void RefillKeep(void);
+static void RefillKeep(unsigned group, int which);
 static int PatchHook(char rung);
 static void InstallHandler(void);
 static DWORD WINAPI DyingChunkHandler(PEXCEPTION_POINTERS info);
@@ -2159,6 +2197,13 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
     unsigned before[PROBE_COUNT];
     int lo, hi, mid, hit, which, group;
     unsigned char *hdr;
+    unsigned stock_ofs, stock_size, stock_addr;
+                                            /* sv22: what the load read in the
+                                             * shadow slot before it touched it,
+                                             * so a chunk it left alone can
+                                             * still be offered a payload later,
+                                             * and a chunk it patched can be
+                                             * handed its stock shadow back */
     char msg[768];
 
     /* the instrument's capture, before every gate: whichever rung calls this,
@@ -2218,14 +2263,13 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
      * got the arc never get the speed-up either. */
     TimeSpeedKeep();
 
-    /* sv17's refill, on the same reach as the arc: it only matters once the
-     * client's clock left midnight, and only for the chunks this run already
-     * gave a shadow to, so the guard above makes this a single volatile read
-     * for every chunk after the pass. It runs before this chunk is recorded
-     * below, which is the reason it must: a chunk that is still inside Load
-     * has a shadow texture the client is in the middle of building, and the
-     * refill marks textures dirty. */
-    RefillKeep();
+    /* sv17's refill trigger lives below now, next to the map's pick: sv22's
+     * version asks whether the record the clock picks for THIS chunk's group is
+     * the one the world is already drawing, and that needs the pick the map
+     * check below takes. It keeps sv17's place in the visit, before this chunk
+     * is recorded, which is the reason it has to be before the record: the pass
+     * marks textures dirty, and a chunk still inside Load has its texture being
+     * built. */
 
     /* the very first chunk to reach Load is audited whole, before the map
      * check and before anything could be written: the crash reports say the
@@ -2363,117 +2407,161 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
         else
             hi = mid - 1;
     }
+    /* sv22: hdr and the chunk's stock shadow are read on the way through, not
+     * only on the branch that patches. The matched half still writes the
+     * header the way sv17 did; the unmatched half has nothing to write but is
+     * remembered all the same, and what it has to hand the refill is where the
+     * client's own stock shadow is: hdr + ofsMCSH, the address the resolver
+     * (0x6AF970, still ahead of this call inside Load) is about to put at
+     * chunk+0xf1c for this chunk, read here before anything moved it. Both
+     * facts are therefore exactly the ones the client itself holds, which is
+     * what makes the refill's way back to stock need no extra copy of the
+     * night's shadows: a live chunk's .adt buffer is alive, since its
+     * geometry is read off the same header. */
+    hdr = (unsigned char *)record_ + 8;
+    stock_ofs = ((const unsigned *)(hdr + FIELD_MCSH_OFS))[0];
+    stock_size = ((const unsigned *)(hdr + FIELD_MCSH_SIZE))[0];
+    stock_addr = 0u;
+    /* the client's own gate for the shadow path, at 0x6af6ea inside Load: MCNK
+     * flag bit 0, the world's terrain-shadow bit in 0xc7b2a4 and a real MCSH
+     * body behind the header. Only the flag and the body are checked here, the
+     * world bit being a run-wide switch the gate reads every chunk anyway: a
+     * chunk that fails the flag or has no body has no stock shadow to fall back
+     * to and no texture built from one, so 0 is kept and the refill counts that
+     * case apart from the chunks that had a shadow of their own. */
+    if ((((const unsigned *)hdr)[0] & 1u) != 0u && stock_ofs != 0u &&
+        stock_size >= SHADOW_DAT_PAYLOAD_BYTES)
+        stock_addr = (unsigned)(size_t)(hdr + stock_ofs);
+
     if (hit < 0) {
         if (g_verbose && !g_log_nomatch) {
             g_log_nomatch = 1;
             snprintf(msg, sizeof msg,
-                     "fixup: first chunk with no payload: gy %u gx %u key %u (the bake left it without a shadow map, or its tile is not in this set)",
+                     "fixup: first chunk with no payload: gy %u gx %u key %u (the bake left it without a shadow map, or its tile is not in this set): the load leaves its stock shadow alone, and sv22 remembers the chunk so a fuller set that becomes current later can still be drawn on it",
                      gy, gx, key);
             LogVerb(msg);
         }
-        return;
-    }
+    } else {
+        /* hdr is what the client itself calls record + 8: the MCNK magic is
+         * record's start, the header fields start after it (0x6AF970: lea
+         * edx,[eax+8]). ofsMCSH is relative to hdr, and the game resolves every
+         * sub-record as hdr + ofs, so hdr + ofs lands in the arena. */
+        if (g_verbose && !g_log_first)
+            AuditHeader(record_, "first matched");
+        for (i = 0; i < PROBE_COUNT; ++i)
+            before[i] = ((const unsigned *)(hdr + k_probe_ofs[i]))[0];
+        hdr[0] |= 1; /* MCNK flag bit 0: the shadow path's own gate */
+        ((unsigned *)(hdr + FIELD_MCSH_OFS))[0] =
+            (unsigned)((size_t)(g_arena + g_offs[hit]) - (size_t)hdr);
+        ((unsigned *)(hdr + FIELD_MCSH_SIZE))[0] = SHADOW_DAT_PAYLOAD_BYTES;
 
-    /* hdr is what the client itself calls record + 8: the MCNK magic is
-     * record's start, the header fields start after it (0x6AF970: lea
-     * edx,[eax+8]). ofsMCSH is relative to hdr, and the game resolves every
-     * sub-record as hdr + ofs, so hdr + ofs lands in the arena. */
-    if (g_verbose && !g_log_first)
-        AuditHeader(record_, "first matched");
-    hdr = (unsigned char *)record_ + 8;
-    for (i = 0; i < PROBE_COUNT; ++i)
-        before[i] = ((const unsigned *)(hdr + k_probe_ofs[i]))[0];
-    hdr[0] |= 1; /* MCNK flag bit 0: the shadow path's own gate */
-    ((unsigned *)(hdr + FIELD_MCSH_OFS))[0] =
-        (unsigned)((size_t)(g_arena + g_offs[hit]) - (size_t)hdr);
-    ((unsigned *)(hdr + FIELD_MCSH_SIZE))[0] = SHADOW_DAT_PAYLOAD_BYTES;
-
-    /* proof that the write stayed in the shadow slot: none of the other
-     * sub-record ofss may move. One that did says hdr is not the header the
-     * resolver has, so the ofss are put back -- BuildVertices would otherwise
-     * read 145 floats off an MCVT cursor that is really an arena displacement,
-     * i.e. the 0x6B0FB7 crash -- and mutation is switched off for the rest of
-     * the run so the session finishes and the log can be read whole. */
-    moved = 0;
-    for (i = 0; i < PROBE_COUNT; ++i) {
-        unsigned now = ((unsigned *)(hdr + k_probe_ofs[i]))[0];
-        if (now == before[i])
-            continue;
-        if (!g_log_field) {
-            g_log_field = 1;
-            snprintf(msg, sizeof msg,
-                     "fixup: the shadow write moved a sub-record ofs: hdr %#x,"
-                     " ofs at hdr+%#x was %#x and is %#x now, ofs written %#x"
-                     " (= arena %#x - hdr), FIELD_MCSH_OFS 0x%x is wrong for"
-                     " this client; the ofss are restored and no more chunks"
-                     " are patched so the run finishes",
-                     (unsigned)(size_t)hdr, k_probe_ofs[i], before[i], now,
-                     (unsigned)((size_t)(g_arena + g_offs[hit]) - (size_t)hdr),
-                     (unsigned)(size_t)g_arena, FIELD_MCSH_OFS);
-            LogMsg(msg);
+        /* proof that the write stayed in the shadow slot: none of the other
+         * sub-record ofss may move. One that did says hdr is not the header the
+         * resolver has, so the ofss are put back -- BuildVertices would
+         * otherwise read 145 floats off an MCVT cursor that is really an arena
+         * displacement, i.e. the 0x6B0FB7 crash -- and mutation is switched
+         * off for the rest of the run so the session finishes and the log can
+         * be read whole. */
+        moved = 0;
+        for (i = 0; i < PROBE_COUNT; ++i) {
+            unsigned now = ((const unsigned *)(hdr + k_probe_ofs[i]))[0];
+            if (now == before[i])
+                continue;
+            if (!g_log_field) {
+                g_log_field = 1;
+                snprintf(msg, sizeof msg,
+                         "fixup: the shadow write moved a sub-record ofs: hdr %#x,"
+                         " ofs at hdr+%#x was %#x and is %#x now, ofs written %#x"
+                         " (= arena %#x - hdr), FIELD_MCSH_OFS 0x%x is wrong for"
+                         " this client; the ofss are restored and no more chunks"
+                         " are patched so the run finishes",
+                         (unsigned)(size_t)hdr, k_probe_ofs[i], before[i], now,
+                         (unsigned)((size_t)(g_arena + g_offs[hit]) - (size_t)hdr),
+                         (unsigned)(size_t)g_arena, FIELD_MCSH_OFS);
+                LogMsg(msg);
+            }
+            ((unsigned *)(hdr + k_probe_ofs[i]))[0] = before[i];
+            moved = 1;
         }
-        ((unsigned *)(hdr + k_probe_ofs[i]))[0] = before[i];
-        moved = 1;
-    }
-    if (moved) {
-        g_ready = 0;
-        if (g_log_field)
-            LogMsg(STAMP " fixup: the field contract does not hold on this"
-                         " client, shadows left stock for the rest of the run");
-        return;
-    }
+        if (moved) {
+            g_ready = 0;
+            if (g_log_field)
+                LogMsg(STAMP " fixup: the field contract does not hold on this"
+                       " client, shadows left stock for the rest of the run");
+            return;
+        }
 
-    ++g_hits;
+        ++g_hits;
 
-    /* one progress line every 10000 matched chunks, capped at 60 lines: cheap
-     * enough for a path that runs once per loaded chunk, and it is the in-game
-     * evidence that the arena is what is being drawn (g_entryCount is the
-     * ceiling, so the last line under it names the tiles the set does not
-     * cover). sv13: diagnostic level, so the shipping run writes none of them
-     * and never takes the modulo either */
-    if (g_verbose && (g_hits % 10000u) == 0u && g_log_hits < 60) {
-        ++g_log_hits;
-        snprintf(msg, sizeof msg, "fixup: %u chunks matched so far, of %u entries",
-                 (unsigned)g_hits, g_entryCount);
-        LogVerb(msg);
-    }
+        /* one progress line every 10000 matched chunks, capped at 60 lines:
+         * cheap enough for a path that runs once per loaded chunk, and it is
+         * the in-game evidence that the arena is what is being drawn (g_entryCount
+         * is the ceiling, so the last line under it names the tiles the
+         * set does not cover). sv13: diagnostic level, so the shipping run
+         * writes none of them and never takes the modulo either */
+        if (g_verbose && (g_hits % 10000u) == 0u && g_log_hits < 60) {
+            ++g_log_hits;
+            snprintf(msg, sizeof msg, "fixup: %u chunks matched so far, of %u entries",
+                     (unsigned)g_hits, g_entryCount);
+            LogVerb(msg);
+        }
 
-    /* the one line that says the write landed and where in the arena the
-     * payload came from -- sv13: diagnostic level, so the shipping run's
-     * evidence that shadows were drawn is what the ground shows, and this
-     * line is what a debug session reads with a v in the mode file */
-    if (g_verbose && !g_log_first) {
-        g_log_first = 1;
-        snprintf(msg, sizeof msg,
-                 "fixup: first chunk matched: gy %u gx %u key %u, shadow drawn"
-                 " from arena+%u, this %#x record %#x hdr %#x arena %#x,"
-                 " hdr flags %#x size %#x ofs %#x, mcvtof %#x mcnrof %#x"
-                 " mclyof %#x mcrof %#x mcalof %#x mcseof %#x mclof %#x",
-                 gy, gx, key, g_offs[hit],
-                 (unsigned)(size_t)self_, (unsigned)(size_t)record_,
-                 (unsigned)(size_t)hdr, (unsigned)(size_t)g_arena,
-                 ((const unsigned *)(hdr + 0x00u))[0],
-                 ((const unsigned *)(hdr + FIELD_MCSH_SIZE))[0],
-                 ((const unsigned *)(hdr + FIELD_MCSH_OFS))[0],
-                 ((const unsigned *)(hdr + 0x14u))[0],
-                 ((const unsigned *)(hdr + 0x18u))[0],
-                 ((const unsigned *)(hdr + 0x1cu))[0],
-                 ((const unsigned *)(hdr + 0x20u))[0],
-                 ((const unsigned *)(hdr + 0x24u))[0],
-                 ((const unsigned *)(hdr + 0x58u))[0],
-                 ((const unsigned *)(hdr + 0x60u))[0]);
-        LogVerb(msg);
+        /* the one line that says the write landed and where in the arena the
+         * payload came from -- sv13: diagnostic level, so the shipping run's
+         * evidence that shadows were drawn is what the ground shows, and this
+         * line is what a debug session reads with a q in the mode file */
+        if (g_verbose && !g_log_first) {
+            g_log_first = 1;
+            snprintf(msg, sizeof msg,
+                     "fixup: first chunk matched: gy %u gx %u key %u, shadow drawn"
+                     " from arena+%u, this %#x record %#x hdr %#x arena %#x,"
+                     " hdr flags %#x size %#x ofs %#x, mcvtof %#x mcnrof %#x"
+                     " mclyof %#x mcrof %#x mcalof %#x mcseof %#x mclof %#x",
+                     gy, gx, key, g_offs[hit],
+                     (unsigned)(size_t)self_, (unsigned)(size_t)record_,
+                     (unsigned)(size_t)hdr, (unsigned)(size_t)g_arena,
+                     ((const unsigned *)(hdr + 0x00u))[0],
+                     ((const unsigned *)(hdr + FIELD_MCSH_SIZE))[0],
+                     ((const unsigned *)(hdr + FIELD_MCSH_OFS))[0],
+                     ((const unsigned *)(hdr + 0x14u))[0],
+                     ((const unsigned *)(hdr + 0x18u))[0],
+                     ((const unsigned *)(hdr + 0x1cu))[0],
+                     ((const unsigned *)(hdr + 0x20u))[0],
+                     ((const unsigned *)(hdr + 0x24u))[0],
+                     ((const unsigned *)(hdr + 0x58u))[0],
+                     ((const unsigned *)(hdr + 0x60u))[0]);
+            LogVerb(msg);
+        }
     }
 
-    /* sv17: remember what this chunk was given, so the day's set change can
-     * re-fill it. Kept with the chunk rather than looked up later: the entry
-     * would have to be searched again under a clock that has moved, and what
-     * is worth knowing is which payload the client is drawing now. */
+    /* sv22's trigger, and it is the whole point of sv17's refill made honest:
+     * a set that becomes current later in the day has to be drawn, not only
+     * the one the load's clock chose. The cheap half runs here, once per
+     * chunk, and compares this chunk's group's applied record with what the
+     * clock now picks -- the pick was already taken above for the load, so the
+     * comparison is one read and one integer compare until a crossing happens.
+     * It runs before this chunk is recorded below, sv17's reason kept: the
+     * pass marks textures dirty, and this chunk is still inside Load with its
+     * texture being built. */
+    RefillKeep((unsigned)group, which);
+
+    /* sv17 and sv22: remember what this chunk was given, so the day's set
+     * change can re-fill it. Kept with the chunk rather than looked up later:
+     * the entry would have to be searched again under a clock that has moved,
+     * and what is worth knowing is which payload the client is drawing now.
+     * sv22 adds the two halves the sparse set needs: REFILL_NONE for a chunk
+     * the load left on its stock shadow -- a 21:30 set baked only for the
+     * patch-S places leaves the rest of the map in that state -- and the
+     * stock shadow's address and slot offset, so the way back is stated rather
+     * than assumed. */
     if (g_refillCount < REFILL_MAX) {
         g_refill_chunk[g_refillCount] = (unsigned)(size_t)self_;
         g_refill_key[g_refillCount] = key;
         g_refill_first[g_refillCount] = (unsigned)group;
-        g_refill_set[g_refillCount] = (unsigned)which;
+        g_refill_set[g_refillCount] =
+            (hit < 0) ? REFILL_NONE : (unsigned)which;
+        g_refill_stock[g_refillCount] = stock_addr;
+        g_refill_stock_ofs[g_refillCount] = stock_ofs;
         ++g_refillCount;
     } else
         ++g_refill_dropped;
@@ -2481,48 +2569,85 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
 
 /* ------------------------------------------------------- the refill ***/
 
-/* Called once when the client's clock stops being unknown: the chunks the
- * first login built are still standing, their textures were made from the
- * set that was current then, and nothing re-runs CMapChunk::Load for them.
- * Re-pointing a chunk at its new payload and marking its texture dirty is
- * what makes the client re-fill it, and both halves are the client's own:
- * CreateShadowTexture (0x6b0030) keeps the MCSH address it was handed at
- * +0x144 and DecodeShadow (0x6b02b0), the fill callback's worker, reads
- * +0x144 again, so a new address there is the new shadows; and GxTexUpdateRect
- * (0x58ac70) is what tells the device to fill a texture again. The chunk
- * layer's own UpdateShadow (0x6aff80) asks for the whole tile at its 0x6b001e,
- * with the client's own six words -- push 1, the tile size twice and 0, edx
- * cleared, the texture in ecx -- and the refill copies that shape, through the
- * thunk this DLL emits on its executable page. The minimap's 0x4ecef8 form
- * with four zeros is NOT the whole-texture idiom: its last word is the flag
- * that decides whether the device is told at all, so four zeros only record a
- * rectangle. Reading the callee back is what settled that, see the comment at
- * ADDR_GXTEX_UPDATE_RECT. */
+/* The pass that re-points already-resident chunks. Two things need it, and
+ * both are "a chunk that is standing still is never built again":
+ *
+ *  - a first login builds its chunks while the client's day clock still reads
+ *    midnight, so they were made from the record the unknown clock wraps to,
+ *    and the real clock lands on a different one seconds later;
+ *  - the day itself moves on: the sun crosses a record's opening while the
+ *    player stands where it booted or walks inside one chunk, and nothing
+ *    re-runs CMapChunk::Load for a chunk that is already resident, so the
+ *    ground would go on drawing the record that owned the moment the chunk
+ *    was built. sv17 stopped at one pass per session for exactly this reason,
+ *    which is why the log said set 4 of 6 was picked while the ground stayed
+ *    on what the midnight load chose. sv22 makes the pass a function of what
+ *    the world is drawing: the record each map group's chunks were last given
+ *    (g_set_applied) against what the clock now picks, and a difference is the
+ *    only moment a pass is worth running -- six crossings a day, on the
+ *    client's own crossings, rather than one guess per login.
+ *
+ * What the pass writes is both halves of the same address, because the client
+ * reads the shadow map from two places and they have to agree:
+ *  - chunk + FIELD_SHADOW_OFS (0x144), which CreateShadowTexture (0x6b0030)
+ *    keeps and the shadow texture is filled from -- this is what makes the
+ *    ground's texture change;
+ *  - chunk + FIELD_PTR_MCSH (0xf1c), which CMapChunk::Load writes as hdr +
+ *    ofsMCSH through the resolver (0x6AF970) and which the entity and grass
+ *    shadow TESTS read: IsInChunkShadow (0x69b350, dereferenced at 0x69b466)
+ *    and the grass detail's own test at 0x6c013b. sv21 re-pointed only +0x144,
+ *    which is why the redrawn shadows were "just textures": an NPC or a player
+ *    standing where the OLD set's shadow was still got the shadow effect, and
+ *    one standing where the NEW one is did not. Writing both is what makes the
+ *    effect and the picture be about the same bytes; neither write destroys
+ *    the chunk or its texture, and both fields are ours to write, because the
+ *    only thing the client writes there is the address of the shadow it is
+ *    drawing -- which is exactly what this pass is changing.
+ *
+ * A tile the picked record has no entry for goes back to STOCK, and that is
+ * what makes a sparse set affordable: baking only the chunks whose shadows
+ * actually change (patch-S's places) means most of a map's tiles have no entry
+ * in that record, and the honest thing for them is the client's own MCSH from
+ * the .adt buffer, not the neighbouring set's shadow. For that the pass needs
+ * the stock address, and it has one it is allowed to keep: fixup_chunk read
+ * hdr + ofsMCSH on the way through for every chunk this .dat names, which is
+ * the same address the client itself dereferences through chunk+0xf1c while
+ * the chunk is alive. Restoring it is no bolder than what the client already
+ * holds, and it costs the run no copy of the night's shadows.
+ *
+ * The refill the client's own refresh primitive wants is the client's own
+ * shape, read back from three call sites that are identical (UpdateShadow's
+ * 0x6b001e, CreateShadowTexture's 0x6b007c and CombinedChunkTexture's 0x6b00de):
+ * push 1, the tile size twice and 0, edx cleared, the texture in ecx, and
+ * GxTexUpdateRect (0x58ac70) called through the thunk this DLL emits on its
+ * executable page. Four zeros -- sv17..sv20's form -- cannot work: the last
+ * word is the flag whose test at 0x594c23 skips the device upload, and the
+ * rect {0,0,0,0} takes the cmp ebx,ecx / jge branch that only resets the
+ * texture's own rectangle words. See the note at ADDR_GXTEX_UPDATE_RECT. */
 static void RefillShadowTextures(void)
 {
-    unsigned i, hmin, clock, refilled = 0u, moved = 0u, absent = 0u;
+    unsigned i, hmin, clock, ours, refilled = 0u, moved = 0u, absent = 0u, nostock = 0u;
     unsigned dead = 0u, unown = 0u, same = 0u, notex = 0u, mismatch = 0u;
-    int logged_dead = 0, logged_unown = 0, logged_notex = 0;
+    int logged_dead = 0, logged_unown = 0, logged_notex = 0, logged_nostock = 0;
                                             /* the half that rejects gets one
-                                             * line naming the chunk and the two
+                                             * line naming the chunk and the
                                              * addresses it compared, so a run
-                                             * that fills nothing says which of
-                                             * the two tests failed, not just
-                                             * that one of them did; the chunks
-                                             * that took a payload but had no
-                                             * texture to mark get the same
-                                             * treatment */
+                                             * that fills nothing says which
+                                             * test failed rather than only
+                                             * that one of them did */
     unsigned tex, tex_ofs, other_ofs, other_tex, shader_a, shader_b, tile, level;
+    unsigned chunk, key, want, cur, ptr;
     GxUpdateRectThunkT mark_rect;
     char msg[1024]; /* the split summary line is the longest of the three */
 
-    /* one pass per session, whichever trigger got there first: the chunk hook
-     * and the watchdog below both ask for this, and the watchdog is on another
-     * thread, so the take is an exchange rather than a read-and-write that two
-     * of them could both win. */
-    if (InterlockedCompareExchange(&g_refill_taken, 1, 0) != 0)
+    /* a pass is in flight: the chunk hook's trigger and the watchdog thread
+     * both ask, on different threads, and unlike sv17's one-shot this is asked
+     * again at every crossing of the day, so the guard says "not at the same
+     * time" rather than "only once". A pass that finds it in flight simply
+     * declines: the pass that is running is already re-picking every recorded
+     * chunk under this clock, so the crossing it is about is covered. */
+    if (InterlockedCompareExchange(&g_refill_busy, 1, 0) != 0)
         return;
-    g_refill_done = 1; /* the pass is owned: neither trigger asks again */
 
     /* the client call the marks go through. BuildStub emits it on the detour's
      * execute page next to the hook, and the two are refused together, so a
@@ -2532,33 +2657,35 @@ static void RefillShadowTextures(void)
      * reaching through a null pointer and looking like the client's crash. */
     if (!g_update_thunk) {
         LogMsg(STAMP " refill: no gx_rect_thunk was emitted on the detour page, so no texture can be marked dirty: the pass is left alone");
+        g_refill_busy = 0;
         return;
     }
     mark_rect = (GxUpdateRectThunkT)(size_t)g_update_thunk;
 
     if (g_refillCount == 0u) {
         LogMsg(STAMP " refill: no chunk was installed by the loader, so there"
-                     " is nothing to re-fill");
+                      " is nothing to re-fill");
+        g_refill_busy = 0;
         return;
     }
 
-    hmin = SunHalfMinute(&clock);
-    if (g_mapCount < 2u) {
-        snprintf(msg, sizeof msg,
-                 STAMP " refill: the clock reads %u of %u half-minutes and this"
-                        " .dat carries one record, so the set a chunk was"
-                        " given at its load is the only set there is: nothing to"
-                        " re-fill",
-                 hmin, SUN_HMIN_DAY);
-        LogMsg(msg);
-        return;
-    }
+    /* the clock and the records, then the pick per chunk below. The line is
+     * printed for every pass, not only the first, because the day's crossings
+     * are sv22's whole point: the ground should be readable against the sky at
+     * each one, and a session that shows a pass and no change on the ground is
+     * the interesting case rather than a crash. */
+    hmin = SunHalfMinute(&clock); /* the day's own reading, in the same half-minutes
+                    * PickRunIdx compared when it picked these chunks: SunHalfMinute
+                    * returns the half-minutes and, asked for it, the raw 0..10000
+                    * day value the sky was drawn from, and printing both is what
+                    * lets the ground be read against the sky's crossing rather
+                    * than guessed from a screenshot. */
     snprintf(msg, sizeof msg,
-             STAMP " refill: the clock reads %u of %u half-minutes (the day at"
-                    " %u of 10000) and the .dat carries %u records in total: every"
-                    " chunk the map load left standing is picked again for the"
-                    " record that owns this moment",
-             hmin, SUN_HMIN_DAY, clock, g_mapCount);
+             STAMP " refill pass: the clock reads %u of %u half-minutes (the day"
+                    " at %u of 10000), every chunk the map load left standing is"
+                    " pointed again at the record that owns this moment, and %u"
+                    " chunks were recorded",
+             hmin, SUN_HMIN_DAY, clock, g_refillCount);
     LogMsg(msg);
 
     /* which texture field the refill marks dirty, decided once for the pass.
@@ -2593,7 +2720,7 @@ static void RefillShadowTextures(void)
              (unsigned)FIELD_GX_SHADER0, (unsigned)shader_a,
              (unsigned)FIELD_GX_SHADER1, (unsigned)shader_b,
              (tex_ofs == (unsigned)FIELD_COMBINED ? "one of them holds 1"
-                                                 : "neither holds 1"));
+                                                  : "neither holds 1"));
     LogMsg(msg);
 
     /* the size of the rectangle the device is told about: the client's own
@@ -2614,65 +2741,32 @@ static void RefillShadowTextures(void)
 
     /* each recorded chunk is picked again the way its own load picked it:
      * same group start, same PickRunIdx, so the re-fill and the load cannot
-     * disagree about which set is current */
+     * disagree about which set is current. sv22 then does the same bookkeeping
+     * the load's trigger does: the record this pass hands a group's chunks IS
+     * what the world is drawing for that group, so the next chunk's compare is
+     * against this pass, not against the load's. */
     for (i = 0u; i < g_refillCount; ++i) {
-        unsigned chunk = g_refill_chunk[i];
-        unsigned key = g_refill_key[i];
-        unsigned cur;
-        unsigned a, b, mid;
-        int which;
-        const unsigned char *hdr;
+        unsigned which, a, b, mid;
 
-        which = PickRunIdx(g_refill_first[i]);
-        if (which < 0)
-            continue;
-        if ((unsigned)which == g_refill_set[i]) {
-            ++same; /* the clock picked the record this chunk was built under:
-                     * its payload is already the one that record gives this
-                     * tile, so there is nothing to hand over and nothing to
-                     * mark dirty. This is also the whole cost for a .dat with
-                     * one record per map -- several maps, one set each: every
-                     * chunk lands here and the pass costs one pick each. */
-            continue;
-        }
+        chunk = g_refill_chunk[i];
+        key = g_refill_key[i];
+        which = (unsigned)PickRunIdx(g_refill_first[i]);
+        if ((int)which < 0)
+            continue; /* the group's pick refused (clock unreadable): leave the
+                        * chunk as it is and let the next crossing try again */
+        g_set_applied[g_refill_first[i]] = which;
 
-        /* is this recorded chunk still the one we gave it shadows to? Both
-         * halves of the test are about the object itself, so a chunk the
-         * client destroyed and freed -- the map pass destroys areas, 0x694920
-         * through 0x694810 -- is caught rather than written to. Its +0x144
-         * must still be an address in this run's arena, which is where only
-         * this DLL put it; and its own global column and row at +0x8c and
-         * +0x90, the same pair the load made the key from, must still make
-         * the key it was recorded under. A chunk that answers no to either
-         * was rebuilt by the client or reused, and its shadows are the
-         * client's to set, so it is left alone. */
-        cur = ((const unsigned *)((char *)chunk + FIELD_SHADOW_OFS))[0];
-        if (!((unsigned)(size_t)g_arena <= (unsigned)(size_t)cur &&
-              (unsigned)(size_t)cur < (unsigned)(size_t)g_arena + g_arena_bytes)) {
-            ++dead; /* its shadow is not one of this arena's payloads */
-            if (!logged_dead) {
-                logged_dead = 1;
-                snprintf(msg, sizeof msg,
-                         STAMP " refill first dead chunk: this %#x, its + %#x reads"
-                         " %#x, this arena is %#x..%#x, it was recorded under key"
-                         " %u -- its shadow is not one of this arena's payloads,"
-                         " which means the load left its own shadow there or the"
-                         " client overwrote it after CreateShadowTexture",
-                         (unsigned)(size_t)chunk, (unsigned)FIELD_SHADOW_OFS, cur,
-                         (unsigned)(size_t)g_arena,
-                         (unsigned)(size_t)g_arena + g_arena_bytes, key);
-                LogMsg(msg);
-            }
-        }
-        else if (((key & SHADOW_DAT_COORD_MAX) !=
-                  ((const unsigned *)((char *)chunk + FIELD_GLOBAL_COL))[0]) ||
-                 ((key >> SHADOW_DAT_KEY_SHIFT) !=
-                  ((const unsigned *)((char *)chunk + FIELD_GLOBAL_ROW))[0])) {
-            ++unown; /* its own column and row no longer make the key it was
-                      * recorded under: the load built the key as
-                      * (row << 10) | column, so the decode takes the row off
-                      * the top and the column out of the low 10 bits -- the
-                      * same pair, read the same way fixup_chunk read them. */
+        /* is this recorded chunk still the one we gave it shadows to? Its own
+         * global column and row at +0x8c and +0x90, the same pair the load made
+         * the key from, must still make the key it was recorded under. A chunk
+         * the client destroyed and freed -- the map pass destroys areas, 0x694920
+         * through 0x694810 -- and the allocator reused answers no here, and its
+         * shadows are the client's to set, so it is left alone. */
+        if (((key & SHADOW_DAT_COORD_MAX) !=
+              ((const unsigned *)((char *)chunk + FIELD_GLOBAL_COL))[0]) ||
+             ((key >> SHADOW_DAT_KEY_SHIFT) !=
+              ((const unsigned *)((char *)chunk + FIELD_GLOBAL_ROW))[0])) {
+            ++unown;
             if (!logged_unown) {
                 logged_unown = 1;
                 snprintf(msg, sizeof msg,
@@ -2689,200 +2783,273 @@ static void RefillShadowTextures(void)
                          (unsigned)FIELD_GLOBAL_COL, (unsigned)FIELD_GLOBAL_ROW);
                 LogMsg(msg);
             }
+            continue;
         }
-        else {
-            /* is the chunk's tile in the set the clock picked? The record's
-             * entries are sorted ascending inside it, so this is the same
-             * bisection the load's lookup runs, against the record's bounds */
-            a = g_map_start[which];
-            b = g_map_start[which] + g_map_len[which];
-            while (a < b) {
-                mid = a + ((b - a) >> 1);
-                if (g_keys[mid] < key)
-                    a = mid + 1u;
-                else
-                    b = mid;
-            }
-            if (a >= g_entryCount || a >= g_map_start[which] + g_map_len[which] ||
-                g_keys[a] != key)
-                ++absent; /* the record the clock picked has no shadow for
-                             * this tile. A fresh load of this chunk would
-                             * then have left its header alone and the client
-                             * would draw its own MCSH, but this chunk is not
-                             * fresh: it already has a texture built from the
-                             * record it was built under, and a refill cannot
-                             * take a shadow back, so it goes on drawing that
-                             * one. The refill line names how many chunks are
-                             * in this state. */
-            else {
-                /* the payload the picked record has for this tile. There is
-                 * nothing to re-check here and sv19 checks nothing: an entry's
-                 * payload offset was validated when the .dat was read -- a
-                 * multiple of the payload size and with the whole payload
-                 * inside the payload area, both refused at install otherwise --
-                 * and a PAYLOAD is the bare 512 shadow bytes the client reads
-                 * at hdr + ofsMCSH, with no tag and no size of its own. sv17
-                 * and sv18 read a dword out of it at FIELD_MCSH_SIZE and
-                 * demanded 0x30 there, which is where the MCNK HEADER keeps
-                 * sizeMCSH, not where a payload starts: measured on the file
-                 * the game was running, 0 of a 60-payload sample of each of
-                 * the six records has 0x30 at payload offset 0x30 -- the bytes
-                 * there are shadow data, and 0 in the shared all-zero payload
-                 * -- so the test answered no for essentially every chunk and
-                 * the pass re-filled 0 of the 2359 and said nothing was wrong
-                 * with any of them. The load does no such test either, and a
-                 * load and a refill have to agree about what a chunk answers. */
-                hdr = g_arena + g_offs[a];
 
-                /* the chunk's shadow texture is at +0x140, except on a
-                 * client whose shaders are on: then the chunk has ONE
-                 * texture at +0x13c that packs this shadow with the
-                 * alphas of layers 1..3, and it is the same +0x144 bytes
-                 * underneath it, so the refill asks for that one. The
-                 * client picks between the two at its 0x6af71f, on either
-                 * of its two shader bytes being 1, and the refill asks the
-                 * same way so it refills the texture the chunk is drawing.
-                 * The choice is hoisted above the loop -- the two bytes are
-                 * static globals the client wrote at its startup, so a
-                 * per-chunk read of them costs the pass nothing but says
-                 * nothing more -- and the fallback under the read is what
-                 * makes asking the right field not depend on the switches
-                 * at all: exactly one of the two fields holds a texture, so
-                 * the refill marks the one that exists, and only a chunk
-                 * with 0 at BOTH is left with nothing to mark. */
-                tex = ((const unsigned *)((char *)chunk + tex_ofs))[0];
-                if (tex == 0u) {
-                    other_tex = ((const unsigned *)((char *)chunk + other_ofs))[0];
-                    if (other_tex != 0u) {
-                        ++mismatch; /* this chunk's shadow-carrying texture is at
-                                      * the other field than the two switches say,
-                                      * so its load ran with a different graphics
-                                      * state than the one this pass read. The
-                                      * texture that exists is the one to mark:
-                                      * CreateShadowTexture 0x6b0030 keeps what it
-                                      * was handed at +0x144, and the combined
-                                      * packer 0x6b02f0 passes +0x144 with the four
-                                      * alpha pointers to 0x6b0350, so both fields'
-                                      * textures are filled from the bytes this
-                                      * refill just pointed there. Counted, and
-                                      * named once below, because a run whose
-                                      * switches and chunks disagree is worth
-                                      * seeing rather than inferred. */
-                        tex = other_tex;
-                    }
-                }
-                if (mismatch == 1u) {
+        /* what the picked record has for this tile. The record's entries are
+         * sorted ascending inside it, so this is the same bisection the load's
+         * lookup runs, against the record's bounds. */
+        a = g_map_start[which];
+        b = g_map_start[which] + g_map_len[which];
+        while (a < b) {
+            mid = a + ((b - a) >> 1);
+            if (g_keys[mid] < key)
+                a = mid + 1u;
+            else
+                b = mid;
+        }
+        if (a >= g_entryCount || a >= g_map_start[which] + g_map_len[which] ||
+            g_keys[a] != key) {
+            /* the record the clock picked has no shadow for this tile, so the
+             * honest answer is the stock one the load read, which is what makes
+             * a sparse preset work without baking a whole map per preset. */
+            ++absent;
+            want = g_refill_stock[i];
+            if (want == 0u) {
+                ++nostock; /* the load read no MCSH body behind this chunk's
+                             * header at all: the client has no stock shadow for
+                             * it either, so there is nothing to hand back and
+                             * the chunk keeps whatever it is drawing. Named once
+                             * with the header's own words, because a run where
+                             * this is most of the map is a field-contract
+                             * question, not a passing one. */
+                if (!logged_nostock) {
+                    logged_nostock = 1;
                     snprintf(msg, sizeof msg,
-                             STAMP " refill first chunk built against the other"
-                             " shader state: this %#x has its texture at %#x, not"
-                             " at the %#x the switches picked, which read %#x and"
-                             " %#x; it was marked at %#x anyway, the field that"
-                             " holds a texture",
-                             (unsigned)(size_t)chunk, (unsigned)other_ofs,
-                             (unsigned)tex_ofs, (unsigned)shader_a,
-                             (unsigned)shader_b, (unsigned)other_ofs);
+                             STAMP " refill first chunk with no stock shadow to"
+                             " hand back: this %#x key %u, the load read ofsMCSH"
+                             " %#x at hdr+%#x and either the MCNK flag bit 0 or a"
+                             " body of the shadow's own size behind it was missing,"
+                             " so no MCSH body was behind its header and its + %#x"
+                             " and + %#x are left exactly as they are",
+                             (unsigned)(size_t)chunk, key,
+                             g_refill_stock_ofs[i], (unsigned)FIELD_MCSH_OFS,
+                             (unsigned)FIELD_SHADOW_OFS, (unsigned)FIELD_PTR_MCSH);
                     LogMsg(msg);
                 }
-                ((unsigned *)((char *)chunk + FIELD_SHADOW_OFS))[0] =
-                    (unsigned)(size_t)hdr;
-                /* the refill the client's own refresh primitive wants:
-                 * the shadows are now this chunk's new bytes at +0x144,
-                 * and the texture was filled from the old ones, so ask
-                 * the device to fill it again -- in the client's own shape,
-                 * which is the whole tile as a {0, 0, size, size} rectangle
-                 * with the flag word answering 1, the texture in ecx and
-                 * edx cleared: UpdateShadow's 0x6b001e, CreateShadowTexture's
-                 * 0x6b007c and CombinedChunkTexture's 0x6b00de all do
-                 * exactly this to exactly the two textures marked here. Four
-                 * zeros, sv17..sv20's form, cannot work: the last word is the
-                 * flag whose test at 0x594c23 skips the device upload, and
-                 * the rect {0,0,0,0} takes the cmp ebx,ecx / jge branch that
-                 * only resets the texture's own rectangle words. Left alone
-                 * when the chunk has no texture at EITHER field, which is what
-                 * a chunk that never reached CreateShadowTexture looks like:
-                 * the new +0x144 is then picked up the next time the client
-                 * builds that chunk's texture. */
-                if (tex != 0u)
-                    mark_rect(tex, tile);
-                else {
-                    ++notex; /* the payload was handed over and nothing was
-                               * marked dirty: the chunk has no texture at
-                               * either of the two fields, so its new +0x144
-                               * only shows up the next time the chunk builds
-                               * a texture. Named separately, and once with
-                               * both fields, because a pass that re-filled
-                               * everything and changed nothing on the ground
-                               * is this case, not a crash -- and with the
-                               * fallback above, this is now the ONLY way a
-                               * re-filled pass can leave the ground alone. */
-                    if (!logged_notex) {
-                        logged_notex = 1;
-                        snprintf(msg, sizeof msg,
-                                 STAMP " refill first chunk with no texture to"
-                                 " mark: this %#x took its payload at arena+%u"
-                                 " and BOTH its %#x and its %#x read 0; its + %#x"
-                                 " was still pointed at the new payload, so the"
-                                 " change shows the next time the client builds"
-                                 " this chunk's texture",
-                                 (unsigned)(size_t)chunk, g_offs[a],
-                                 (unsigned)tex_ofs, (unsigned)other_ofs,
-                                 (unsigned)FIELD_SHADOW_OFS);
-                        LogMsg(msg);
-                    }
-                }
-                ++refilled;
-                if (which != g_refill_set[i])
-                    ++moved;
+                continue;
             }
         }
+        else {
+            /* the payload the picked record has for this tile. There is
+             * nothing to re-check about the payload itself: an entry's payload
+             * offset was validated when the .dat was read -- a multiple of the
+             * payload size and with the whole payload inside the payload area,
+             * both refused at install otherwise -- and a PAYLOAD is the bare
+             * 512 shadow bytes the client reads at hdr + ofsMCSH, with no tag
+             * and no size of its own. sv17 and sv18 read a dword out of it at
+             * FIELD_MCSH_SIZE and demanded 0x30 there, which is where the MCNK
+             * HEADER keeps sizeMCSH, not where a payload starts: measured on the
+             * file the game was running, 0 of a 60-payload sample of each of the
+             * six records has 0x30 at payload offset 0x30 -- the bytes there are
+             * shadow data, and 0 in the shared all-zero payload -- so the test
+             * answered no for essentially every chunk and the pass re-filled 0
+             * of the 2359 and said nothing was wrong with any of them. The load
+             * does no such test either, and a load and a refill have to agree
+             * about what a chunk answers. */
+            want = (unsigned)(size_t)(g_arena + g_offs[a]);
+        }
+
+        /* what the chunk is holding now, in both of the client's two places.
+         * Both must be addresses this run wrote before this pass writes them
+         * again: either a payload of this arena, which only this DLL hands out,
+         * or the stock address the load read for this chunk, or 0 for a chunk
+         * the load never gave a shadow of its own. Anything else means the
+         * client set a shadow here behind our back or the chunk was destroyed
+         * and its memory reused, and its shadows are then the client's to set.
+         * The two fields are checked separately rather than for agreeing with
+         * each other, which is what makes a chunk the client touched on only
+         * one of them visible instead of being written over. */
+        cur = ((const unsigned *)((char *)chunk + FIELD_SHADOW_OFS))[0];
+        ptr = ((const unsigned *)((char *)chunk + FIELD_PTR_MCSH))[0];
+        ours = (((unsigned)(size_t)g_arena <= (unsigned)(size_t)cur &&
+                (unsigned)(size_t)cur < (unsigned)(size_t)g_arena + g_arena_bytes) ||
+               cur == g_refill_stock[i] || cur == 0u);
+        if (ours)
+            ours = (((unsigned)(size_t)g_arena <= (unsigned)(size_t)ptr &&
+                    (unsigned)(size_t)ptr < (unsigned)(size_t)g_arena + g_arena_bytes) ||
+                   ptr == g_refill_stock[i] || ptr == 0u);
+        if (!ours) {
+            ++dead;
+            if (!logged_dead) {
+                logged_dead = 1;
+                snprintf(msg, sizeof msg,
+                         STAMP " refill first rejected chunk: this %#x, its + %#x reads"
+                         " %#x and its + %#x reads %#x, this arena is %#x..%#x and"
+                         " its stock shadow was %#x -- neither field is one of ours,"
+                         " which means the client set a shadow here after we did or"
+                         " the chunk was rebuilt",
+                         (unsigned)(size_t)chunk, (unsigned)FIELD_SHADOW_OFS, cur,
+                         (unsigned)FIELD_PTR_MCSH, ptr,
+                         (unsigned)(size_t)g_arena,
+                         (unsigned)(size_t)g_arena + g_arena_bytes,
+                         g_refill_stock[i]);
+                LogMsg(msg);
+            }
+            continue;
+        }
+
+        if (cur == want && ptr == want) {
+            ++same; /* the clock picked the record this chunk is already drawing
+                      * and its tile is in it, or it picked a record without the
+                      * tile and the stock shadow is already there: either way the
+                      * bytes the client reads are the bytes it wants, so there is
+                      * nothing to hand over and nothing to mark dirty. This is
+                      * also the whole cost of a .dat with one record per map,
+                      * several maps, one set each. */
+            g_refill_set[i] = which;
+            continue;
+        }
+
+        /* the hand-over, in both places. +0x144 is what the shadow texture is
+         * filled from and what DecodeShadow (0x6b02b0), the fill callback's
+         * worker, reads again; +0xf1c is what IsInChunkShadow (0x69b350,
+         * dereferenced at 0x69b466) tests and what the grass detail's test at
+         * 0x6c013b reads, so the entity and grass shadows and the ground's
+         * texture are now about the same bytes. A chunk whose +0x144 is 0 never
+         * reached CreateShadowTexture and gets the payload in both fields
+         * anyway: it has no shadow texture to redraw, but the entity and grass
+         * tests read +0xf1c every time they are asked, so writing it changes
+         * what they answer, which is what a chunk with no shadow of its own
+         * needs. */
+        ((unsigned *)((char *)chunk + FIELD_SHADOW_OFS))[0] = want;
+        ((unsigned *)((char *)chunk + FIELD_PTR_MCSH))[0] = want;
+        g_refill_set[i] = which;
+
+        /* the chunk's shadow texture is at +0x140, except on a client whose
+         * shaders are on: then the chunk has ONE texture at +0x13c that packs
+         * this shadow with the alphas of layers 1..3, and it is the same +0x144
+         * bytes underneath it, so the refill asks for that one. The client picks
+         * between the two at its 0x6af71f, on either of its two shader bytes
+         * being 1, and the refill asks the same way so it refills the texture the
+         * chunk is drawing. The choice is hoisted above the loop -- the two bytes
+         * are static globals the client wrote at its startup, so a per-chunk read
+         * of them costs the pass nothing but says nothing more -- and the fallback
+         * under the read is what makes asking the right field not depend on the
+         * switches at all: exactly one of the two fields holds a texture, so the
+         * refill marks the one that exists, and only a chunk with 0 at BOTH is
+         * left with nothing to mark. */
+        tex = ((const unsigned *)((char *)chunk + tex_ofs))[0];
+        if (tex == 0u) {
+            other_tex = ((const unsigned *)((char *)chunk + other_ofs))[0];
+            if (other_tex != 0u) {
+                ++mismatch; /* this chunk's shadow-carrying texture is at the
+                              * other field than the two switches say, so its load
+                              * ran with a different graphics state than the one
+                              * this pass read. The texture that exists is the one
+                              * to mark: CreateShadowTexture 0x6b0030 keeps what it
+                              * was handed at +0x144, and the combined packer
+                              * 0x6b02f0 passes +0x144 with the four alpha pointers
+                              * to 0x6b0350, so both fields' textures are filled
+                              * from the bytes this refill just pointed there. */
+                tex = other_tex;
+            }
+        }
+        if (mismatch == 1u) {
+            snprintf(msg, sizeof msg,
+                     STAMP " refill first chunk built against the other"
+                     " shader state: this %#x has its texture at %#x, not"
+                     " at the %#x the switches picked, which read %#x and"
+                     " %#x; it was marked at %#x anyway, the field that"
+                     " holds a texture",
+                     (unsigned)(size_t)chunk, (unsigned)other_ofs,
+                     (unsigned)tex_ofs, (unsigned)shader_a,
+                     (unsigned)shader_b, (unsigned)other_ofs);
+            LogMsg(msg);
+        }
+        /* the refill the client's own refresh primitive wants: the shadows are
+         * now these new bytes at +0x144, and the texture was filled from the old
+         * ones, so ask the device to fill it again -- in the client's own shape,
+         * which is the whole tile as a {0, 0, size, size} rectangle with the flag
+         * word answering 1, the texture in ecx and edx cleared: UpdateShadow's
+         * 0x6b001e, CreateShadowTexture's 0x6b007c and CombinedChunkTexture's
+         * 0x6b00de all do exactly this to exactly the two textures marked here.
+         * Four zeros, sv17..sv20's form, cannot work: the last word is the flag
+         * whose test at 0x594c23 skips the device upload, and the rect {0,0,0,0}
+         * takes the cmp ebx,ecx / jge branch that only resets the texture's own
+         * rectangle words. Left alone when the chunk has no texture at EITHER
+         * field, which is what a chunk that never reached CreateShadowTexture
+         * looks like: the new +0x144 and +0xf1c are then only read the next time
+         * the client builds that chunk's texture, and the entity and grass tests
+         * answer the new bytes straight away. */
+        if (tex != 0u)
+            mark_rect(tex, tile);
+        else {
+            ++notex; /* the payload was handed over and nothing was marked dirty:
+                       * the chunk has no texture at either of the two fields, so
+                       * its new +0x144 only shows up the next time the client
+                       * builds that chunk's texture -- while its entity and grass
+                       * answers change straight away, because those read +0xf1c.
+                       * Named separately, and once with both fields, because a
+                       * pass that re-filled everything and changed nothing on the
+                       * ground is this case, not a crash. */
+            if (!logged_notex) {
+                logged_notex = 1;
+                snprintf(msg, sizeof msg,
+                         STAMP " refill first chunk with no texture to mark: this"
+                         " %#x took its address %#x and BOTH its %#x and"
+                         " its %#x read 0; its + %#x and + %#x were still pointed"
+                         " at it, so the entity and grass tests answer the new"
+                         " bytes now and the ground shows it the next time the"
+                         " client builds this chunk's texture",
+                         (unsigned)(size_t)chunk, want,
+                         (unsigned)tex_ofs, (unsigned)other_ofs,
+                         (unsigned)FIELD_SHADOW_OFS, (unsigned)FIELD_PTR_MCSH);
+                LogMsg(msg);
+            }
+        }
+        ++refilled;
+        if (want != cur)
+            ++moved;
     }
 
     snprintf(msg, sizeof msg,
-             STAMP " refill: %u of the %u chunks the map load left standing were"
-                    " re-filled at this clock: %u of them now draw a shadow of a"
-                    " different record than the one they were built with, %u have no"
-                    " tile in the record the clock picked and keep the shadow the load"
-                    " gave them, %u were left alone because their shadow is no longer"
-                    " an address in this arena, %u because their own column and row no"
-                    " longer make the key they were recorded under, %u were already"
-                    " drawn from the record the clock picked and needed nothing, %u were"
-                    " marked at the other texture field than the shader switches picked, %u took"
-                    " a payload but had no texture at either field so nothing was marked dirty"
-                    " for them, and %u of the chunks this run"
-                    " installed were past the cap of %u and were never offered this clock",
-             refilled, g_refillCount, moved, absent, dead, unown, same, mismatch, notex,
-             g_refill_dropped, (unsigned)REFILL_MAX);
+             STAMP " refill pass: %u of the %u chunks the map load left standing"
+                    " were re-pointed at this clock: %u now draw a shadow of a"
+                    " different record than the one they were built with, %u have"
+                    " no tile in the record the clock picked and were handed their"
+                    " stock shadow back, %u of those had no stock shadow to hand"
+                    " back so they keep what they are drawing, %u were already"
+                    " drawn from what the clock picked and needed nothing, %u were"
+                    " left alone because their shadow address is no longer one of"
+                    " ours, %u because their own column and row no longer make the"
+                    " key they were recorded under, %u were marked at the other"
+                    " texture field than the shader switches picked, %u took a"
+                    " new address but had no texture at either field so nothing"
+                    " was marked dirty for them, and %u of the chunks this run"
+                    " installed were past the cap of %u and were never offered"
+                    " this clock",
+             refilled, g_refillCount, moved, absent, nostock, same, dead, unown,
+             mismatch, notex, g_refill_dropped, (unsigned)REFILL_MAX);
     LogMsg(msg);
-    g_refill_done = 1;
+    g_refill_busy = 0;
 }
 
 /* The cheap per-chunk half of the trigger, next to the arc and the clock
- * keeper: the chunks a first login built were made while the client's day
- * clock still read midnight, and a chunk that is already resident is never
- * built again, so a set that has since become current would otherwise go on
- * drawing the shadows of the record that owns midnight. This is the half that
- * runs when chunks keep loading: one volatile read, so a session that already
- * took its refill pays that, and the half that costs anything is the first
- * chunk to arrive after the login time packet. */
-static void RefillKeep(void)
+ * keeper: it asks one question, whether the record the clock picks for THIS
+ * chunk's group is the one the world is already drawing, and the answer needs
+ * the pick the map check above just took -- so this half costs one array read
+ * and one integer compare per chunk, and the pass that costs anything runs
+ * only at the day's crossings, on the client's own clock, rather than once per
+ * login as sv17 had it. The first chunk of a group only says what the load
+ * picked is what the world is drawing, because the chunks of the pass's own
+ * load are still being built and marking them dirty would be marking a texture
+ * the client is in the middle of writing. */
+static void RefillKeep(unsigned group, int which)
 {
-    unsigned hmin, clock;
-
-    if (g_refill_done)
-        return;
     if (g_refillCount == 0u)
         return; /* no install yet: nothing to re-fill, and the guard is the
                   * whole cost on a session that installed nothing (modes n,
                   * h, a: no payload, no records) */
-    hmin = SunHalfMinute(&clock);
-    if (hmin == 0u)
-        return; /* the clock still reads midnight: before the login time
-                  * packet that is the unknown clock, and a session whose
-                  * server time really is midnight cannot tell the two apart,
-                  * so those chunks keep the record the load picked -- the
-                  * record that owns the night */
+    if (g_set_applied[group] == REFILL_NONE) {
+        g_set_applied[group] = (unsigned)which;
+        return;
+    }
+    if (g_set_applied[group] == (unsigned)which)
+        return; /* the world is already drawing what the clock picks */
     RefillShadowTextures();
 }
+
 
 /* The detour, as bytes: three hand-written x86-32 stubs, one per rung, emitted
  * once at install into a private executable page with the absolute addresses
@@ -3765,6 +3932,10 @@ static int Install(void)
             g_map_start[i] = start;
             g_map_len[i] = ((const unsigned *)(r + 24))[0];
             g_map_h0[i] = SHADOW_DAT_H0_ALL;
+            /* sv22: nothing is applied yet, so the first chunk of a group that
+             * reaches the load sets what that load picked rather than asking
+             * for a pass over chunks that are still being built */
+            g_set_applied[i] = REFILL_NONE;
             if (recStride >= SHADOW_DAT_MAP_RECORD_V2) {
                 g_map_h0[i] = ((const unsigned *)(r + 28))[0];
                 if (g_map_h0[i] != SHADOW_DAT_H0_ALL && g_map_h0[i] >= SUN_HMIN_DAY) {
@@ -3846,6 +4017,7 @@ static int Install(void)
         g_map_start[0] = 0;
         g_map_len[0] = head.entryCount;
         g_map_h0[0] = SHADOW_DAT_H0_ALL;
+        g_set_applied[0] = REFILL_NONE;
         memcpy(g_map_name[0], head.map, 24);
         g_map_name[0][23] = 0;
         grp_start[0] = 0;
@@ -4216,21 +4388,54 @@ static DWORD EnsureInitialized(void)
     return (DWORD)g_result;
 }
 
-/* sv17's other half of the trigger. The chunk hook above covers a session
- * whose player keeps loading chunks after the login time packet; a session
- * that stands still where it booted has no further chunk to be called on, so
- * the resident chunks would keep the record the unknown clock wrapped to.
- * This waits on the day clock and asks once. It runs on a thread of this DLL
+/* Is any map group drawing the wrong record for this clock? sv22's question,
+ * asked here from a thread instead of from a chunk visit, because the session
+ * that stands where it booted has no further chunk to be called on and its
+ * resident chunks would otherwise keep whatever the load picked. A group is a
+ * run of records under one name, so a group start is any record whose name
+ * differs from the record before it; a group whose chunks never loaded is not
+ * due, since there is nothing of ours to re-point. PickRunIdx is the same
+ * function the load's trigger uses, so the two cannot disagree about which
+ * record owns this moment, and its pick-change line is what prints the
+ * crossing's own clock. The cost is one pass over the map records every 200 ms,
+ * against at most 256 of them. */
+static int AnyGroupDue(void)
+{
+    unsigned i;
+    int which;
+
+    for (i = 0u; i < g_mapCount; ++i) {
+        if (i != 0u && CiEqName((const char *)g_map_name[i - 1u],
+                               (const char *)g_map_name[i]))
+            continue; /* not a group start */
+        if (g_set_applied[i] == REFILL_NONE)
+            continue; /* no chunk of this map has reached the load yet: nothing
+                        * of ours is standing on this map to be re-pointed */
+        which = PickRunIdx(i);
+        if (which >= 0 && g_set_applied[i] != (unsigned)which)
+            return 1;
+    }
+    return 0;
+}
+
+/* sv17 and sv22's other half of the trigger: not "ask once when the clock
+ * leaves midnight" but "ask again at every crossing of the day", because a
+ * set that becomes current later in the day has to be drawn and sv17 stopped
+ * at the first pass, which is why the log said set 4 of 6 was picked while the
+ * ground stayed on the midnight load's set. It runs on a thread of this DLL
  * rather than on the client's, which is why the honest note about a re-fill
- * says it can land between the client's own frames: the writes are one
- * pointer per chunk plus the client's dirty-rect call, and the exchange in
- * RefillShadowTextures keeps the whole thing to one pass per session. The
- * wait is bounded: a night session keeps the record the load picked, and the
- * chunk hook's own check still runs whenever a chunk loads. */
+ * says it can land between the client's own frames: the writes are two
+ * pointers per chunk plus the client's dirty-rect call, and g_refill_busy
+ * keeps this thread and the chunk hook's trigger from running a pass in each
+ * other's middle. The wait for the clock to leave midnight is bounded, the
+ * loop after it is not: a session that keeps playing keeps being watched, and
+ * a pass happens only at the day's own crossings, at most once a day per
+ * record, so the loop costs a Sleep and a table scan. */
 static DWORD WINAPI RefillWatchdog(LPVOID p)
 {
     unsigned hmin, clock;
     DWORD start;
+    int logged_wait = 0;
 
     (void)p;
     /* the install comes first, and whichever of us gets there first does it:
@@ -4245,20 +4450,23 @@ static DWORD WINAPI RefillWatchdog(LPVOID p)
     start = GetTickCount();
     for (;;) {
         Sleep(200u);
-        if (g_refill_done)
-            return 0; /* the chunk hook got there with a loaded chunk */
-        if ((LONG)(GetTickCount() - start) > (LONG)(20u * 60u * 1000u)) {
-            LogMsg(STAMP " refill: the day clock still read midnight twenty"
-                         " real minutes after the install and no chunk loaded"
-                         " in that time, so the resident chunks keep the record"
-                         " the load picked: no re-fill was attempted");
-            return 0;
-        }
         hmin = SunHalfMinute(&clock);
-        if (hmin != 0u) {
-            RefillShadowTextures();
-            return 0;
+        if (hmin == 0u) {
+            if ((LONG)(GetTickCount() - start) > (LONG)(20u * 60u * 1000u)) {
+                if (!logged_wait) {
+                    logged_wait = 1;
+                    LogMsg(STAMP " watchdog: the day clock still read midnight"
+                            " twenty real minutes after the install, so the"
+                            " resident chunks keep the record the load picked"
+                            " and nothing was re-pointed; the chunk hook still"
+                            " asks whenever a chunk loads");
+                }
+                return 0;
+            }
+            continue;
         }
+        if (AnyGroupDue())
+            RefillShadowTextures();
     }
 }
 
