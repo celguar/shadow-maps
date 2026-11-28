@@ -1312,3 +1312,42 @@ Sizes: sv25 is 176,640 bytes, `Load` still at `0x2e80`.
 * Still owed, and not answerable from the log: the entity, grass and NPC walking shadows
   follow the clock (issue 2), and the one whole-continent 21:30 bake against the
   six-set day tiling.
+
+### What the session run against sv25 showed
+
+No crash: the user teleported several times, and the newest file in
+`G:\Games\twmoa_1181\Errors` is still `2026-11-28 05.09.14 Crash.txt`, the report from
+before this build was installed. The run's own log (line 1172 of a 2,021-line file, 850
+lines, last line at 2,043,422 ms — over half an hour of standing still and teleporting)
+carries 84 crossings, each as a three-line pass.
+
+Its counters balance against each other exactly, which is what makes them readable at
+all:
+
+| what the run counted | value |
+| --- | --- |
+| live slots walked by the 84 passes | 227,483 |
+| taken back because their `ofsMCSH` read 0, body under 512, header inside this DLL's arena, no header at all | 1913 + 3 + 0 + 0 = 1,916 |
+| taken back because the chunk is another tile's now | 773 |
+| taken back because the chunk could not be read at all — sv23's fault class, caught | **7,287** |
+| taken back because the hand-over write faulted | 0 |
+| session total taken back | **9,976** |
+
+1,916 + 773 + 7,287 + 0 = 9,976, so no slot went free for a reason the pass does not
+name. 11 of the 84 passes printed the "refill first slot whose chunk is not there at
+all" notice — the class the two crash reports named is met about one pass in eight and
+is now being answered by freeing the slot and counting it; 0 printed the write notice,
+so the guarded hand-over has not had to fire yet. The pass is doing real work the whole
+way through: 156,286 chunks re-pointed over the run, all of them to a record they were
+not built with; 28,849 had no tile in the picked record and were handed the stock
+shadow; 61,221 already matched; 0 claims missed a slot and 0 needed displacing a
+neighbour at 2,861 live slots of 16,384. The watchdog's own live probe never had to
+fire (0 crossings, 0 stale), so every crossing this session came with a chunk load.
+
+The read-back found one print defect of our own, not a fault: the session line's first
+breakdown pair had its arguments swapped, so it printed `3848 had no header at chunk+0`
+— 3848 is `0xf08`, the field offset, and the real count was 0, printed as the field. The
+per-pass line printed the same pair in the right order. The fix is one swap in the
+argument list, and the rebuilt DLL keeps the sv25 stamp, the same 176,640 bytes, `Load`
+still at `0x2e80` and identical stub and thunk records; installed sha256 is now
+`4d95c008e930cfb7004edf6467ea54aeccdd6378d44f624545430b3673737ada`.

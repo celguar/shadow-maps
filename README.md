@@ -792,7 +792,17 @@ reads `sv25` (84 times; the older stamps in the image are literals inside log
 strings — `sv13` in the TrimLog banner, `sv14` in the sun-arc window line and `sv23`
 in the line about a chunk the bake left without a shadow map — and no `sv24` remains). It is installed in the game folder at
 `G:\Games\twmoa_1181\ShadowMaps.dll`, byte-identical, sha256
-`05f0a4df83ffde4b10c3d3c5355c6056c0a70a35e72f491abc407b77fefb2ee6`.
+`4d95c008e930cfb7004edf6467ea54aeccdd6378d44f624545430b3673737ada`. The one installed
+before it, sv25's first build at the same 176,640 bytes and the same `Load`, printed the
+session line's first breakdown pair swapped — the field offset in the count's place —
+and that argument order is what the fixed build changed.
+
+The session run against sv25 crossed 84 records over half an hour of standing still and
+teleporting with no crash: the run's counters balance exactly (1,916 header-value +
+773 unowned + 7,287 unreadable + 0 write = 9,976 slots taken back out of 227,483 walked),
+and the 7,287 slots taken back "because the chunk could not be read at all" are the class
+the crash reports named before sv24's guard, met in about one pass in eight and answered
+by freeing the slot and counting it instead of dying in the client's reporter.
 
 The build before it, sv24, was 175,104 bytes with the same `Load` at RVA `0x2e80` and
 sha256 `c74bec3d39f98fe12d792e0f52d87e77d299f247267dad19a4d346cb3e14c110`, installed at

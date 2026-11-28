@@ -3436,7 +3436,7 @@ static void RefillShadowTextures(void)
                    " tile's at %u",
              g_refillCount, (unsigned)REFILL_SLOTS, g_refill_dropped,
              g_refill_evicted, g_refill_probed, g_refill_probe_failed,
-             (unsigned)FIELD_HDR_OFS, g_refill_count_null, g_refill_count_ofs,
+             g_refill_count_null, (unsigned)FIELD_HDR_OFS, g_refill_count_ofs,
              g_refill_count_size, g_refill_count_arena, g_refill_count_unreadable,
              g_refill_count_write, g_refill_probe_live, g_refill_probe_stale);
     LogMsg(msg);
