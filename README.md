@@ -702,31 +702,77 @@ at most once a day per record. `AnyGroupDue` is the same question from the
 watchdog thread, for the session that stands where it booted and has no further
 chunk to be called on.
 
+sv23 is sv22's refill read against its own counters, and the two things those
+counters said were wrong. **The post-teleport failure is a full array, not a
+stopped pass.** The run's `recorded` sat at sv22's `REFILL_MAX` of 8192 while its
+`dropped` printed 0 — sv22 raised the cap and never counted past it — and the tiles
+a teleport loads had passed 8451 chunks, so they were never recorded at all and no
+pass could re-point them. That is exactly the standing-still case: the resident
+chunks of the new zone are the ones that never got a slot. **The other half is the
+crash report.** The readable one names instruction `0x6b0835` reading `0x3ba31de5`,
+and `0x6b0835` is `movzx edx, byte ptr [edx + ecx]` inside the combined-texture
+packer at `0x6b0770`, where `ecx` is the chunk's shadow-map address — pushed at
+`0x6b0332` from `[ecx+0x144]` in `CMapChunk::DecodeCombined 0x6b02f0` — and `edx`
+is `bitindex >> 3`, 0..63. The faulting address *is* whatever sits at `chunk+0x144`
+plus at most 63, a heap address in the client's `0x3b…` band: the stock `MCSH`
+address sv22 remembered at load time and handed back for the `absent` case had gone
+dangling. `NULL` is guarded by the client; staleness is not.
+
+So sv23 changes four things about the same machine. **The record is a hashed table,
+not an array behind a cap**: `REFILL_SLOTS 16384` open-addressing slots keyed by the
+chunk address (`RefillSlotOf` multiplies by `2654435761u`, xor-shifts `>>15`, masks —
+the objects are `WCHUNK` pool blocks 3,892 bytes apart, so the low bits carry no
+information), and a chunk loaded again refreshes its own slot rather than taking
+another one, so the day's thousands of loads cost a probe each; `REFILL_LOAD = SLOTS`
+refuses only a genuinely full table, `REFILL_KEEP = SLOTS - SLOTS/8` keeps 2048 slots
+free so a probe almost always lands on a free one, and `g_refill_dropped` and
+`g_refill_evicted` name the two ways a claim can fail. **A slot is taken back the
+moment it stops being about its tile**, which is what the run's monotonically growing
+`unowned` (1415 → 6083, never looked at again) asked for: two probes per live slot,
+the chunk's live column/row at `+0x8c`/`+0x90` still making the recorded key, and the
+chunk's live header at `+0xf08` still answering as a shadow slot — non-null, non-null
+`ofsMCSH`, `sizeMCSH ≥ 512`, not inside this DLL's own arena, read inside a `__try`,
+because reading a freed header *is* the access violation a crash report names. Each
+reason is counted apart (`count_null`, `count_ofs`, `count_size`, `count_arena`,
+`count_fault`) and printed apart as `freed_hdr` and `unown`. **Nothing stores a stock
+address any more**: `fixup_chunk` keeps no `hdr + ofsMCSH`, and the pass re-reads
+`hdr + ofs` out of the chunk's *live* header when a tile has no entry in the picked
+record — the same address the client itself dereferences for that chunk now, kept
+alive by the same chunk that names it, so sv22's crash has no address left in this
+design that could have been read at load time and handed back later. **The clock is
+asked once per map group, not once per chunk**: the pass's first loop syncs
+`g_set_applied[start]` for every group that has live slots and the per-chunk read is
+then one array read, where sv22 re-ran `PickRunIdx` per chunk — its own comment
+counted 16643 chunks a day, so that was 16643 clock reads and record scans per
+crossing for a question whose answer is one per map. `g_group_live[start]` and
+`g_group_slot[start]` are kept by the claims and the pass so the watchdog's `AnyGroupDue`
+can skip a group that has stopped having anything standing on it without walking all
+16384 slots, and a fully stale group self-terminates; `AnyGroupDue` also probes one
+recorded chunk of a group before declaring it due, so the log's `live`/`stale` counts
+say whether a crossing is worth a pass at all.
+
 ## What this machine produces
 
-The sv22 build, i.e. what this branch's HEAD is: `out\ShadowMaps.dll`
-**172,032 bytes**, i686, exports `Load` at RVA `0x2cd0`, accepted by `verify_dll.py`
-with zero complaints, and its log banner reads `sv22` (82 times, with no `sv21`,
-`sv20` or `sv19` in the image). It is installed in the game folder at
+The sv23 build, i.e. what this branch's HEAD is: `out\ShadowMaps.dll`
+**174,080 bytes**, i686, exports `Load` at RVA `0x2e80`, accepted by `verify_dll.py`
+with zero complaints — stub b/c/d are 36/12/29 bytes and the 24-byte `gx_rect_thunk`
+is found in `.rdata` at `0x1401d420` with `0x58ac70` in its imm32 — and its log banner
+reads `sv23` (83 times; the two older stamps in the image are literals inside log
+strings, `sv13` in the TrimLog banner and `sv14` in the sun-arc window line, and no
+`sv22` remains). It is installed in the game folder at
 `G:\Games\twmoa_1181\ShadowMaps.dll`, byte-identical, sha256
-`0fc13c5e40dc51603f0474e662a3832e3689ded703ab6258519eb92fbef30194`. The sv21 build
-was 171,520 bytes with `Load` at `0x2cc0` — sv22's refill code moves the export by
-16 bytes — and sv18's was 169,472 bytes there, and sv16's was 165,888 with `Load` at
-was 165,888 with `Load` at `0x2c90`: sv22 changes the refill's writes, its trigger
-and the load's record of a chunk it left stock, so an sv21 log line and an sv22 one
-about the same `.dat` differ in what the refill found, not in what it accepted. The
+`574ddb40a796c769f13fa2f91ae60e62a5759b0614b59c15e6cd29f6a072ca48`.
+
+The build before it, sv22, was 172,032 bytes with `Load` at RVA `0x2cd0` and sha256
+`0fc13c5e40dc51603f0474e662a3832e3689ded703ab6258519eb92fbef30194`, installed at the
+same path at that round; sv21's was 171,520 bytes with `Load` at `0x2cc0`, sv18's 169,472
+bytes there, sv17's 168,960 there and sv16's 165,888 with `Load` at `0x2c90`. sv23 keeps
+the detour, the stubs and the thunk byte for byte — `verify_dll.py`'s stub sizes and
+thunk record are identical to sv22's — and grows only the refill's bookkeeping, which
+moves the `Load` export 432 bytes. An sv22 log line and an sv23 one about the same
+`.dat` differ in what the refill found and freed, not in what it accepted. The
 paragraphs below are the sv13 round's record of the game folder and keep their own
-numbers. The sv18 image next to it
-was 169,472 bytes with `Load` at the same RVA `0x2cc0`, and sv16's was 165,888
-with `Load` at `0x2c90`: sv18 changes one comparison and two log lines, so an
-sv17 log line and an sv18 one about the same `.dat` differ only in what the
-refill's liveness test accepted. The paragraphs below are the sv13 round's record
-of the game folder and keep their own numbers. The sv17 image next to it
-was 168,960 bytes with `Load` at the same RVA `0x2cc0`, and sv16's was 165,888
-with `Load` at `0x2c90`: sv18 changes one comparison and two log lines, so an
-sv17 log line and an sv18 one about the same `.dat` differ only in what the
-refill's liveness test accepted. The paragraphs below are the sv13 round's record
-of the game folder and keep their own numbers.
+numbers.
 
 `out\ShadowMaps.dll` 146,944 bytes and `build\Release\ShadowMaps.dll` 147,968
 bytes, both i686, both exporting `Load` (at RVA `0x2530` and `0x2760`), both

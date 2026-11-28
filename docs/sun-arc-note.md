@@ -1082,3 +1082,113 @@ What the next run has to show, in order:
   resolver wrote at `+0xf1c`. A big count there means the record buffer moved
   between this DLL's read and the resolver, and the line prints both addresses and
   the arena's range so the distance is measurable.
+
+## sv23: sv22 followed the clock, then stopped after a teleport — and crashed
+
+sv22's clock-following was confirmed in game ("It worked and shadows changed real time!"),
+and the same session then showed two new facts: after a teleport to another zone of the
+same map, shadows stopped following the clock while standing still, and a rare
+`ACCESS_VIOLATION` appeared at a client site that is not one of this DLL's.
+
+### The pass's own counters said where it stopped
+
+The run's log (`G:\Games\twmoa_1181\shadow-mod.log.txt`, 854 lines, plain ASCII) carries
+every pass's line. Read across one day:
+
+| counter | what the run printed |
+| --- | --- |
+| recorded | 4293 → 4399 → 4558 → … → 8003, then stuck at **8192** while `dropped` printed 0 |
+| `refilled` | 1580 / 1399 / … / 277 / 112 / 65 — a pass that ran and did almost nothing |
+| `absent` | 450 / 195 / 132 / 175 |
+| `same` | 1298 / 946 / 840 / 960 |
+| `dead` | 0 — every recorded address passed sv22's address test |
+| `unowned` | 1415 → 1961 → 2173 → 2492 → … → 6083, one way all day |
+
+Three readings, all from the same lines:
+
+* **The array was full.** `recorded` sat at sv22's `REFILL_MAX` of 8192, and the tiles a
+  teleport loads had passed that cap by 8451 chunks: they were never recorded, so no pass
+  could re-point them. That is the post-teleport failure, and it is why standing still
+  changed nothing — the resident chunks of the new zone are exactly the ones that never
+  got a slot.
+* **`unowned` only grew.** A chunk object the client destroyed and the allocator handed to
+  another tile stayed in the array under its old key forever; sv22 stopped at such a chunk
+  but never took it back, so the table filled with records about nothing. Chunk
+  `0x35c70008` was recorded under key 371256 (column 568 row 362) and its live column/row
+  moved 569/404 → 570/351 → 585/405 across the day; one reported column 67945 row 8752,
+  i.e. a freed chunk's own words are junk.
+* **`dead` at 0 with `unowned` at 6083** says sv22's address test was the wrong question:
+  670 chunks in one pass were refused because both shadow fields held the *same stock heap
+  address*, which is exactly what a chunk the client's own `Load` wrote looks like
+  (`0x6af6fb mov edx,[this+0xf1c]` and `CreateShadowTexture`'s `mov [this+0x144],edx`).
+  Refusing them is what left their `+0xf1c` on the login's preset.
+
+### The crash is sv22's stock address, gone stale
+
+The third crash report is the readable one: instruction `0x6b0835`, reading `0x3ba31de5`.
+Disassembled, `0x6b0835` is `movzx edx, byte ptr [edx + ecx]` inside the combined-texture
+packer at `0x6b0770`, where `ecx` is the chunk's shadow-map address (pushed at
+`0x6b0332` from `[ecx+0x144]` in `CMapChunk::DecodeCombined 0x6b02f0`) and `edx` is
+`bitindex >> 3`, 0..63. So the faulting address IS whatever is at `chunk+0x144`, plus at
+most 63 — a heap address in the `0x3b…` band, i.e. **the stock `MCSH` address sv22 handed
+back for the `absent` case had become dangling**. `NULL` is guarded by the client;
+staleness is not.
+
+The dying chunk's own report makes it worse: every object field read 0 (`hdr@0xf08 0`,
+`record@0x168 0`, `MCVT@0xf14` … `MCSH@0xf1c` … `MCSE@0xf30 0`), and its header's `ofsMCSH`
+was stock-relative, so that header was not written by this DLL at all: a recycled chunk
+carrying a freed buffer's words.
+
+The other two crashes, both at instruction `0x5cfd3662` with different read addresses
+(`0x361927d4`, `0x3b2b1efc`), are still unresolved: a PE scan of all 14 DLLs in the game
+folder shows none covers that address (ShadowMaps.dll is `0x14000000..0x14061000`), it is
+outside the client image `0x400000..0xd26000`, and it is not in the arena `0x10070000..0x1ab23400`
+— so it is allocated executable memory, most likely the shader JIT or the driver.
+
+### What sv23 changed, and why each half is a question rather than an assumption
+
+* **A hashed table, not an array behind a cap.** `REFILL_SLOTS 16384` open-addressing slots
+  keyed by the *chunk address* (`RefillSlotOf`: multiply by `2654435761u`, xor-shift `>>15`,
+  mask — the objects are `WCHUNK` pool blocks 3,892 bytes apart, so the low bits carry no
+  information). A chunk loaded a second time refreshes its own slot instead of taking
+  another one, so the day's thousands of loads cost a probe each; `REFILL_LOAD = SLOTS`
+  refuses only a table that is genuinely full, and `REFILL_KEEP = SLOTS - SLOTS/8` keeps
+  2048 slots free so a probe almost always ends at a free one. `g_refill_dropped` and
+  `g_refill_evicted` print the two ways a claim can fail, and the pass prints the session's
+  totals beside them.
+* **The slot is taken back when it stops being about this tile.** Two probes per live slot:
+  the chunk's live column/row at `+0x8c`/`+0x90` must still make the recorded key
+  (`(key & 0xFFFFF) == (col << 10) | (row & 0x3FF)`), and the chunk's live header at
+  `+0xf08` must still answer as a shadow slot — header non-null, `ofsMCSH` non-null,
+  `sizeMCSH ≥ 512`, header not inside this DLL's arena, and the read itself inside a
+  `__try`, because reading a freed header *is* the access violation a crash report names.
+  Each reason is counted apart (`count_null`, `count_ofs`, `count_size`, `count_arena`,
+  `count_fault`) and the freed-slot counters are `freed_hdr` and `unown`, printed apart.
+* **Nothing stores a stock address any more.** `fixup_chunk` no longer reads `hdr + ofsMCSH`
+  into a record, and the pass re-reads `hdr + ofs` out of the chunk's *live* header when it
+  needs the stock shadow — the same address the client itself dereferences for that chunk
+  now, kept alive by the same chunk that names it. sv22's crash cannot be reproduced by
+  this design, because there is no address that was read at load time and handed back later.
+* **The clock is asked once per map group, not once per chunk.** The pass's first loop
+  syncs `g_set_applied[start]` for every group that has live slots; the per-chunk read is
+  then one array read. sv22 asked `PickRunIdx` per chunk — its own comment said the day
+  asked about 16643 chunks, so that was 16643 clock reads and record scans per crossing.
+* **Group liveness is carried, not inferred.** `g_group_live[start]` and `g_group_slot[start]`
+  are kept by the claims and by the pass, so `AnyGroupDue` skips a group that has stopped
+  having anything standing on it without walking 16384 slots for it, and a fully stale
+  group self-terminates because the pass decrements its count to 0.
+* **The watchdog's due-check probes one recorded chunk of the group it is about to walk**,
+  asking the same key/col-row question the pass asks, so the log's `live`/`stale` counts say
+  whether a crossing is worth a pass at all rather than only that the clock moved.
+
+### What the next run has to show
+
+* `recorded` (now "of the %u live slots") must not sit at a power of two, and `dropped`
+  must be small; the session line prints live slots against the hash's 16384.
+* `unowned` must stop growing after the first passes — it is freed on sight now, so it
+  counts slots, not the day's history.
+* After a teleport, standing still must produce a `refill pass:` line per crossing whose
+  `refilled` is not near 0 and whose `absent` explains the tiles the sparse record lacks.
+* The crash at `0x6b0835` must not come back. If a crash at `0x5cfd3662` does, it is not
+  this DLL's address and the next thing to read is whether the shader JIT owns it.
+* The entity and grass answers are still in game, not in the log.
