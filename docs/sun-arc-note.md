@@ -1192,3 +1192,123 @@ outside the client image `0x400000..0xd26000`, and it is not in the arena `0x100
 * The crash at `0x6b0835` must not come back. If a crash at `0x5cfd3662` does, it is not
   this DLL's address and the next thing to read is whether the shader JIT owns it.
 * The entity and grass answers are still in game, not in the log.
+
+## sv24: the crash is inside this DLL, and the report says which instruction
+
+The user's report this round is the same symptom twice: one fault on entering the world
+and one after every teleport. Both crash files of this build are readable to the
+instruction, and neither fault is in the client.
+
+`G:\Games\twmoa_1181\Errors\2026-11-28 05.06.13 Crash.txt` and `05.09.14 Crash.txt`
+carry their own module table, which is what makes the `0x5c…` EIPs decodable at all:
+twloader rebases `ShadowMaps.dll` per session, and the two reports give it as
+`0x5cfb0000..0x5d032000` and `0x5cc20000..0x5cca2000`. So
+
+| report | EIP | module base | RVA |
+| --- | --- | --- | --- |
+| 05.06.13 | `0x5cfb3a02` | `0x5cfb0000` | `0x3a02` |
+| 05.09.14 | `0x5cc23a02` | `0x5cc20000` | `0x3a02` |
+| four earlier (sv22) | `0x5cfd3662` etc. | — | `0x3662` |
+
+Disassembling the shipped image at those two RVAs names the instructions:
+
+* `0x3a02` (sv23 image): `mov edi, [ebx + 0x8c]` then `mov edx, [ebx + 0x90]` — the
+  refill's live column and row read, `ebx` the slot's recorded chunk. The reports'
+  referenced addresses are `0x435c85fc` and `0x36aca854`, which are `0x435c8570 + 0x8c`
+  and `0x36aca7c8 + 0x8c`: both in the recycled-chunk band, so the client had destroyed
+  that chunk and released its heap.
+* `0x3662` (sv22 image): `mov esi, [eax*4 + 0x1404d528]` / `mov [eax*4 + 0x1403d528], ecx`
+  — unbounded array indexing in the refill's own bookkeeping.
+
+The newest run's log ends at the moment of the fault: the last pass line is a set-6
+(the stock set stamped 21:30) refill at 167,406 ms, and the last chunk line is
+`this 0x3b120008 record 0x378f3684, fixup visits 4559`. The fault happened *during* that
+pass, which is the reason the crash follows a teleport instead of preceding one: a
+teleport is what destroys the chunks the previous zone was standing on.
+
+The concept: a slot holds an **address** the client handed this DLL once, not a handle.
+Asking anything about it is an access to memory that may already have been released, and
+that access *is* the access violation the report names. So the guard has to sit on the
+first touch of it, and sv23's guard sat on the wrong one — only the header probe was
+inside a `__try`, so the column and row read ahead of it had no protection.
+
+sv24's shape:
+
+* one `__try` at the top of the per-slot body reads everything the chunk owns —
+  `+0x8c`, `+0x90`, `+0xf08`, `hdr + 0x2c`, `hdr + 0x30`, `+0x144`, `+0xf1c`, and the
+  two texture fields at `+0x140`/`+0x13c` — and a fault frees the slot with its own
+  counted reason (`unreadable` per pass, `g_refill_count_unreadable` per session) plus a
+  first-notice line naming the chunk, the key and the field that faulted;
+* every check below it is value-only, so the decisions that follow touch no memory of
+  their own — the header checks (`hdr == 0`, inside this DLL's arena, `ofs == 0`,
+  `size < 512`) and the key check against the already-read `live_col`/`live_row`;
+* the duplicate unguarded re-reads of `+0x144`, `+0xf1c` and the two texture fields
+  further down the body were deleted, so each field is read exactly once, in the guard.
+  A second read of an address the client handed us once is a second chance to fault, and
+  the pass is what makes that chance matter: it runs while the client loads the tiles a
+  teleport brings in.
+
+Sizes: sv23 174,080 → sv24 175,104 bytes, `Load` still at RVA `0x2e80`, the stub and
+thunk records unchanged.
+
+## sv25: the guard has to cover the writes too
+
+sv24 made the *first* touch of a recorded chunk guarded; sv25 asks the same question of
+the last one. The hand-over writes — `chunk + 0x144` and `chunk + 0xf1c` — were the only
+touches of a recorded address left unguarded, and they are the riskiest of all, because
+the watchdog runs `RefillShadowTextures` on **this DLL's own thread** while the client's
+thread keeps running: between the words that answered fine a few instructions earlier and
+the two about to be written, the client can release the chunk, and a write to released
+heap faults exactly like a read does — with the report's EIP inside this DLL again.
+
+So both writes sit inside one `__try`, and a fault counts `wrote_bad` /
+`g_refill_count_write` and takes the slot back. One guard around both stores is what
+keeps the pair honest: a fault leaves the chunk as it stood, never with `+0x144` pointing
+at one preset's payload while `+0xf1c` is still on another's, which is the split-state
+the entity and grass tests would then answer differently about.
+
+The rest of the table's code was audited for the same class and needs no guard:
+`RefillNote` only compares values (`g_refill_chunk[i] == chunk`) and writes our own
+arrays; `RefillForget` and the summary counters index `g_refill_*` with an index bounded
+by `REFILL_SLOTS` and a `first` bounded by `SHADOW_DAT_MAP_MAX`, which is why sv22's
+`0x3662` array-index fault cannot happen here any more; and `AnyGroupDue`'s live probe
+was already inside a `__try`.
+
+The in-image proof that both guards are real, read off sv25's own bytes: MSVC's `/O2`
+SEH brackets a `__try` block by writing the frame's state slot at `[ebp - 4]`, the try's
+index before the block and `0xfffffffe` after it, and those writes only exist in a frame
+whose exception entry has a handler.
+
+```
+0x14003a75: mov dword ptr [ebp - 4], 0        <-- try index 0 opens
+0x14003a7c: mov eax, dword ptr [ebx + 0x8c]   <-- the column read (sv23 faulted here)
+0x14003a8b: mov edx, dword ptr [ebx + 0x90]
+0x14003a9a: mov edi, dword ptr [ebx + 0xf08]
+   ...
+0x14003af5: mov dword ptr [ebp - 4], 0xfffffffe
+
+0x14003ed5: mov dword ptr [ebp - 4], 1        <-- try index 1 opens
+0x14003edc: mov dword ptr [ebx + 0x144], edi  <-- the hand-over, now guarded
+0x14003ee2: mov dword ptr [ebx + 0xf1c], edi
+0x14003ee8: mov dword ptr [ebp - 4], 0xfffffffe
+```
+
+sv24's col/row read had moved from RVA `0x3a02` to `0x4a7c` in this image, and all the
+chunk's fields now share one base register — the reads really were folded into one block.
+
+Sizes: sv25 is 176,640 bytes, `Load` still at `0x2e80`.
+
+### What the next run has to show
+
+* No crash on entering world and none after a teleport. If a `0x5c…` EIP comes back, the
+  first thing is the report's own module table: subtract `ShadowMaps.dll`'s base and
+  disassemble that RVA in sv25's image before believing anything about the client.
+* The new counters must be legible: `unreadable` and `wrote_bad` in the pass line,
+  `g_refill_count_unreadable` and `g_refill_count_write` in the session line, and the two
+  first-notice lines ("refill first slot whose chunk is not there at all",
+  "refill first hand-over that faulted"). A pass whose `unreadable` is 0 while slots are
+  still being freed says the freed slots are being freed for the *value* reasons, which is
+  the good case.
+* Still owed, and not answerable from the log: the entity, grass and NPC walking shadows
+  follow the clock (issue 2), and the one whole-continent 21:30 bake against the
+  six-set day tiling.

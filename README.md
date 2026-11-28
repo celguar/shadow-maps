@@ -751,10 +751,61 @@ can skip a group that has stopped having anything standing on it without walking
 recorded chunk of a group before declaring it due, so the log's `live`/`stale` counts
 say whether a crossing is worth a pass at all.
 
+sv24 is the sv23 crash, read out of the report instead of guessed at. Every
+`0x5c…` faulting address in this round's crash files is **inside this DLL**: the
+report's own module table rebases `ShadowMaps.dll` per session (`0x5cfb0000..0x5d032000`
+and `0x5cc20000..0x5cca2000` in the two reports of this build), so subtracting that
+base gives RVA `0x3a02` both times, and disassembling the shipped image there is
+`mov edi, [ebx + 0x8c]` / `mov edx, [ebx + 0x90]` — the refill's live column and row
+read, with `ebx` the recorded chunk. The addresses the reports name, `0x435c85fc` and
+`0x36aca854`, are exactly `0x435c8570 + 0x8c` and `0x36aca7c8 + 0x8c`: both in the
+recycled-chunk band, i.e. the client had destroyed the chunk the slot names and
+released its heap. sv23's `__try` covered only the header probe, so this read sat
+ahead of it and the pass died in the client's reporter — which is why the crash came
+*after* a teleport and not before one. The fix is conceptual rather than local: a slot
+holds an **address** of a client object, not a handle, so the first touch of it must be
+guarded. sv24 reads everything the chunk owns — column, row, header, `ofsMCSH`,
+`sizeMCSH`, `+0x144`, `+0xf1c`, and the two texture fields — inside one `__try` at the
+top of the per-slot body; a fault frees the slot with its own counted reason
+(`unreadable`, `g_refill_count_unreadable`, printed in the pass and session lines) and
+nothing is read or written. Everything below that block is then value-only, so the
+decisions themselves touch no memory.
+
+sv25 closes the same hole on the other side of the guard: the hand-over writes to
+`chunk + 0x144` and `chunk + 0xf1c` are the only remaining unguarded touches of a
+recorded chunk address, and the watchdog runs the pass on **this DLL's own thread**
+while the client's thread keeps running, so a chunk can be released between the words
+that answered fine and the two about to be written — and a write to released heap
+faults the same way a read does. Both writes now sit inside one `__try`, so a fault
+leaves the chunk exactly as it stood (never half-pointed at one preset by `+0x144` and
+still on another's by `+0xf1c`), counts `wrote_bad` / `g_refill_count_write`, and takes
+the slot back. `RefillNote` only ever compares values, `RefillForget` and the summary
+counters only touch our own arrays, and `AnyGroupDue` already guarded its probe.
+
 ## What this machine produces
 
-The sv23 build, i.e. what this branch's HEAD is: `out\ShadowMaps.dll`
-**174,080 bytes**, i686, exports `Load` at RVA `0x2e80`, accepted by `verify_dll.py`
+The sv25 build, i.e. what this branch's HEAD is: `out\ShadowMaps.dll`
+**176,640 bytes**, i686, exports `Load` at RVA `0x2e80`, accepted by `verify_dll.py`
+with zero complaints — stub b/c/d are 36/12/29 bytes and the 24-byte `gx_rect_thunk`
+is found in `.rdata` at `0x1401d420` with `0x58ac70` in its imm32 — and its log banner
+reads `sv25` (84 times; the older stamps in the image are literals inside log
+strings — `sv13` in the TrimLog banner, `sv14` in the sun-arc window line and `sv23`
+in the line about a chunk the bake left without a shadow map — and no `sv24` remains). It is installed in the game folder at
+`G:\Games\twmoa_1181\ShadowMaps.dll`, byte-identical, sha256
+`05f0a4df83ffde4b10c3d3c5355c6056c0a70a35e72f491abc407b77fefb2ee6`.
+
+The build before it, sv24, was 175,104 bytes with the same `Load` at RVA `0x2e80` and
+sha256 `c74bec3d39f98fe12d792e0f52d87e77d299f247267dad19a4d346cb3e14c110`, installed at
+that path; sv23's was 174,080 bytes with `Load` at `0x2e80` and sha256
+`574ddb40a796c769f13fa2f91ae60e62a5759b0614b59c15e6cd29f6a072ca48`, sv22's 172,032 bytes
+with `Load` at `0x2cd0` and sha256 `0fc13c5e40dc51603f0474e662a3832e3689ded703ab6258519eb92fbef30194`,
+sv21's 171,520 bytes with `Load` at `0x2cc0`, sv18's 169,472 bytes there, sv17's 168,960
+there and sv16's 165,888 with `Load` at `0x2c90`. sv24 and sv25 keep the detour, the
+stubs and the thunk byte for byte — `verify_dll.py`'s stub sizes and thunk record are
+identical to sv22's — and grow only the refill's own body, which leaves the `Load`
+export where sv23 put it. An sv23 log line and an sv25 one about the same `.dat` differ
+in what the refill freed and why, not in what it accepted. The paragraphs below are the
+sv13 round's record of the game folder and keep their own numbers.
 with zero complaints — stub b/c/d are 36/12/29 bytes and the 24-byte `gx_rect_thunk`
 is found in `.rdata` at `0x1401d420` with `0x58ac70` in its imm32 — and its log banner
 reads `sv23` (83 times; the two older stamps in the image are literals inside log

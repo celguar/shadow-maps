@@ -329,7 +329,7 @@
 #include <string.h>
 #include "../shadow_dat.h"
 
-#define STAMP "sv23" /* build stamp, printed in every log line: an old build of
+#define STAMP "sv25" /* build stamp, printed in every log line: an old build of
                      * this DLL sitting next to a new .dat is the most common
                      * confusion, so the line says which build made it, and the
                      * mode line below names which of the seven rungs ran. sv11
@@ -727,7 +727,8 @@ static unsigned g_refill_count_null;          /* no header at chunk+0xf08       
 static unsigned g_refill_count_ofs;           /* ofsMCSH read 0 there            */
 static unsigned g_refill_count_size;          /* sizeMCSH under the shadow's own  */
 static unsigned g_refill_count_arena;         /* a header inside this DLL's arena */
-static unsigned g_refill_count_fault;         /* reading it faulted              */
+static unsigned g_refill_count_unreadable;    /* the chunk itself could not be read */
+static unsigned g_refill_count_write;         /* the hand-over write itself faulted */
 static unsigned g_refill_probe_live;          /* crossings the live probe answered yes at */
 static unsigned g_refill_probe_stale;         /* crossings it answered no at     */
 static unsigned g_arena_bytes;               /* arena size: the liveness test */
@@ -2710,6 +2711,26 @@ static void __cdecl fixup_chunk(void *self_, const void *record_)
                (hit < 0) ? REFILL_NONE : (unsigned)which);
 }
 
+/* One recorded slot, and the group bookkeeping that goes with it, given back.
+ * The pass now has three reasons that end the same way -- the chunk is standing
+ * on another tile, its header no longer answers as a shadow slot, and the chunk
+ * cannot be read at all -- and all three mean the same thing about the slot: it
+ * describes something that is no longer in the world. Factored out so the three
+ * cannot drift apart, and with the count guarded because taking a slot back is
+ * bookkeeping that must never underflow. */
+static void RefillForget(unsigned i, unsigned first)
+{
+    g_refill_live[i] = 0u;
+    if (g_refillCount > 0u)
+        --g_refillCount;
+    if (first < SHADOW_DAT_MAP_MAX) {
+        if (g_group_live[first] > 0u)
+            --g_group_live[first];
+        if (g_group_slot[first] == i)
+            g_group_slot[first] = REFILL_NONE;
+    }
+}
+
 /* ------------------------------------------------------- the refill ***/
 
 /* The pass that re-points already-resident chunks. Two things need it, and
@@ -2787,7 +2808,7 @@ static void RefillShadowTextures(void)
     unsigned i, hmin, clock, probed = 0u, refilled = 0u, moved = 0u, absent = 0u;
     unsigned same = 0u, notex = 0u, mismatch = 0u, freed_hdr = 0u, unown = 0u, bad;
     unsigned count_null = 0u, count_ofs = 0u, count_size = 0u, count_arena = 0u;
-    unsigned count_fault = 0u;
+    unsigned dead = 0u, unreadable = 0u, wrote_bad = 0u;
                                             /* the half that rejects gets one
                                              * line naming the chunk and the
                                              * addresses it compared, so a run
@@ -2796,8 +2817,13 @@ static void RefillShadowTextures(void)
                                              * that one of them did -- and sv23
                                              * counts each reason apart, because
                                              * a day of standing still answers
-                                             * the same reason every crossing */
-    int logged_unown = 0, logged_notex = 0, logged_hdr = 0;
+                                             * the same reason every crossing,
+                                             * and sv24 adds the reason the two
+                                             * crashes on entering world and on
+                                             * teleporting were: the slot's chunk
+                                             * was not there to be read at all */
+    int logged_unown = 0, logged_notex = 0, logged_hdr = 0, logged_dead = 0,
+        logged_write = 0;
     unsigned tex, tex_ofs, other_ofs, other_tex, shader_a, shader_b, tile, level;
     unsigned chunk, key, want, cur, ptr, hdr, ofs, size, first, live_col, live_row;
     GxUpdateRectThunkT mark_rect;
@@ -2949,21 +2975,77 @@ static void RefillShadowTextures(void)
         key = g_refill_key[i];
         first = g_refill_first[i];
 
+        /* Everything this slot needs out of its chunk, read once and guarded --
+         * and the guard is the whole point of sv24. A slot holds an ADDRESS the
+         * client handed this DLL once, not a handle: a chunk the client destroyed
+         * can sit in heap the client has already released, and reading it is then
+         * not a probe of a value, it is the access violation a crash report names.
+         * The two runs that started crashing on entering the world and on
+         * teleporting again are exactly this, read out of the report's own table:
+         * the module list says ShadowMaps.dll at 0x5cfb0000..0x5d032000, the
+         * trace says Load+2946, the instruction at that RVA in this build is
+         * `mov edi,[ebx+0x8c]` / `mov edx,[ebx+0x90]` -- the column and row read
+         * -- and the address it referenced is EBX + 0x8c with EBX the slot's
+         * chunk, 0x435c8570 and 0x36aca7c8, both in the recycled-chunk band. sv23
+         * had the SEH only around the header probe, so this read sat ahead of it
+         * and killed the pass, which is why the crash came after a teleport and
+         * not before one. All the chunk's fields are read here, before anything
+         * is decided, so the decisions below touch no memory of their own until
+         * the hand-over, which is guarded on the same ground. */
+        live_col = 0u; live_row = 0u;
+        hdr = 0u; ofs = 0u; size = 0u;
+        cur = 0u; ptr = 0u;
+        tex = 0u; other_tex = 0u;
+        dead = 0u; bad = 0u;
+        __try {
+            live_col = ((const unsigned *)((char *)chunk + FIELD_GLOBAL_COL))[0];
+            live_row = ((const unsigned *)((char *)chunk + FIELD_GLOBAL_ROW))[0];
+            hdr = ((const unsigned *)((char *)chunk + FIELD_HDR_OFS))[0];
+            if (hdr != 0u) {
+                ofs = ((const unsigned *)(hdr + FIELD_MCSH_OFS))[0];
+                size = ((const unsigned *)(hdr + FIELD_MCSH_SIZE))[0];
+            }
+            cur = ((const unsigned *)((char *)chunk + FIELD_SHADOW_OFS))[0];
+            ptr = ((const unsigned *)((char *)chunk + FIELD_PTR_MCSH))[0];
+            tex = ((const unsigned *)((char *)chunk + tex_ofs))[0];
+            other_tex = ((const unsigned *)((char *)chunk + other_ofs))[0];
+        } __except(1) {
+            ++unreadable;
+            ++g_refill_count_unreadable;
+            dead = 1u;
+        }
+        if (dead != 0u) {
+            ++g_refill_probe_failed;
+            if (!logged_dead) {
+                logged_dead = 1;
+                snprintf(msg, sizeof msg,
+                         STAMP " refill first slot whose chunk is not there at all:"
+                               " this %#x was recorded under key %u, and reading"
+                               " even its own column at + %#x faulted, so the chunk"
+                               " object the slot names has been destroyed and the"
+                               " client has released its heap; the slot is freed,"
+                               " nothing is read or written, and the next load of"
+                               " that tile records a fresh chunk again",
+                         (unsigned)(size_t)chunk, key, (unsigned)FIELD_GLOBAL_COL);
+                LogMsg(msg);
+            }
+            RefillForget(i, first);
+            continue;
+        }
+
         /* is this slot's chunk still the tile it was recorded under? Its own
          * global column and row at +0x8c and +0x90, the same pair the load made
-         * the key from, must still make that key. sv17..sv22 asked the same
-         * question and only stopped at the chunk; sv23 also takes the slot back,
-         * which is what makes the table hold what is standing now rather than
-         * what was loaded first. The run is what says the half that stopped was
-         * not enough: the unowned count went one way all day, 1415 then 1961,
-         * 2173, 2492 and 6083 across one day, and not one of those chunks was
-         * ever looked at again -- while the tiles a teleport loads, which had
-         * passed sv22's cap of 8192 by 8451 chunks, had never been recorded at
-         * all. A chunk the client destroyed and the allocator handed to another
-         * tile is the client's to set shadows for, so its record goes away and
-         * the next load of that tile makes a fresh one. */
-        live_col = ((const unsigned *)((char *)chunk + FIELD_GLOBAL_COL))[0];
-        live_row = ((const unsigned *)((char *)chunk + FIELD_GLOBAL_ROW))[0];
+         * the key from, must still make that key, read above. sv17..sv22 asked
+         * the same question and only stopped at the chunk; sv23 also takes the
+         * slot back, which is what makes the table hold what is standing now
+         * rather than what was loaded first. The run is what says the half that
+         * stopped was not enough: the unowned count went one way all day, 1415
+         * then 1961, 2173, 2492 and 6083 across one day, and not one of those
+         * chunks was ever looked at again -- while the tiles a teleport loads,
+         * which had passed sv22's cap of 8192 by 8451 chunks, had never been
+         * recorded at all. A chunk the client destroyed and the allocator handed
+         * to another tile is the client's to set shadows for, so its record goes
+         * away and the next load of that tile makes a fresh one. */
         if (((key & SHADOW_DAT_COORD_MAX) != live_col) ||
             ((key >> SHADOW_DAT_KEY_SHIFT) != live_row)) {
             ++unown;
@@ -2981,14 +3063,7 @@ static void RefillShadowTextures(void)
                          (unsigned)FIELD_GLOBAL_COL, (unsigned)FIELD_GLOBAL_ROW);
                 LogMsg(msg);
             }
-            g_refill_live[i] = 0u;
-            --g_refillCount;
-            if (first < SHADOW_DAT_MAP_MAX) {
-                if (g_group_live[first] > 0u)
-                    --g_group_live[first];
-                if (g_group_slot[first] == i)
-                    g_group_slot[first] = REFILL_NONE;
-            }
+            RefillForget(i, first);
             ++g_refill_probe_failed;
             continue;
         }
@@ -3004,32 +3079,25 @@ static void RefillShadowTextures(void)
          * stock addresses. Re-reading the chunk's LIVE header every pass is what
          * keeps that from happening, and the probe is what says the chunk is not
          * the one this slot belongs to: a recycled chunk can carry a header
-         * address the client no longer owns, and the read below is then the
-         * access violation a crash report names, so it sits in a __try and a
-         * header that answers no, for any reason, frees the slot rather than
-         * leaving a guessed address in it. The two reasons the pass used to be
-         * able to leave a chunk on the login's preset -- an address the client
-         * had set behind our back, and a stock address remembered from a load
-         * that has since been freed -- are gone; the reason it has now is about
-         * the chunk, and it is counted apart from the one above. */
-        hdr = 0u; ofs = 0u; size = 0u;
-        bad = 0u;
-        __try {
-            hdr = ((const unsigned *)((char *)chunk + FIELD_HDR_OFS))[0];
-            if (hdr != 0u) {
-                ofs = ((const unsigned *)(hdr + FIELD_MCSH_OFS))[0];
-                size = ((const unsigned *)(hdr + FIELD_MCSH_SIZE))[0];
-            }
-        } __except(1) {
-            ++count_fault;
-            ++g_refill_count_fault;
-            bad = 1u;
-        }
-        if (bad == 0u && hdr == 0u) {
+         * address the client no longer owns, and reading it is then the
+         * access violation a crash report names, so the read sits in the __try
+         * above and a header that answers no, for any reason, frees the slot
+         * rather than leaving a guessed address in it. The two reasons the pass
+         * used to be able to leave a chunk on the login's preset -- an address
+         * the client had set behind our back, and a stock address remembered
+         * from a load that has since been freed -- are gone; the reason it has
+         * now is about the chunk, and it is counted apart from the one above.
+         *
+         * What is checked below are the values the guarded read above answered,
+         * never memory of their own: the header probe and the column and row
+         * check now share one guard, which is what sv24 is for. A slot's chunk
+         * answers all of its fields or none of it is there, and the pass says
+         * which of the two it is rather than dying in the client's reporter. */
+        if (hdr == 0u) {
             ++count_null;
             ++g_refill_count_null;
             bad = 1u;
-        } else if (bad == 0u && g_arena &&
+        } else if (g_arena &&
                    (hdr >= (unsigned)(size_t)g_arena) &&
                    (hdr < (unsigned)(size_t)g_arena + g_arena_bytes)) {
             /* a chunk whose header sits inside this DLL's payload block is not
@@ -3166,10 +3234,14 @@ static void RefillShadowTextures(void)
          * chunk, above, not the address: the header probe proved this chunk
          * answers for this slot's tile and still has a shadow body of its own.
          * The address the pass writes is either a payload inside this arena or
-         * that live body, so it is one the chunk can answer for either way. */
-        cur = ((const unsigned *)((char *)chunk + FIELD_SHADOW_OFS))[0];
-        ptr = ((const unsigned *)((char *)chunk + FIELD_PTR_MCSH))[0];
-
+         * that live body, so it is one the chunk can answer for either way. The
+         * two words themselves were read in the guarded block above: sv23 read
+         * them a second time here, and a second read of an address the client
+         * handed us once is a second chance to fault -- the pass is what made
+         * that second chance matter, because the pass runs while the client is
+         * loading the tiles a teleport brings in, and a chunk the client has
+         * destroyed is exactly what such a moment leaves in the table. One read
+         * per field, guarded, and every decision below uses that snapshot. */
         if (cur == want && ptr == want) {
             ++same; /* the clock picked the record this chunk is already drawing
                       * and its tile is in it, or it picked a record without the
@@ -3192,9 +3264,45 @@ static void RefillShadowTextures(void)
          * anyway: it has no shadow texture to redraw, but the entity and grass
          * tests read +0xf1c every time they are asked, so writing it changes
          * what they answer, which is what a chunk with no shadow of its own
-         * needs. */
-        ((unsigned *)((char *)chunk + FIELD_SHADOW_OFS))[0] = want;
-        ((unsigned *)((char *)chunk + FIELD_PTR_MCSH))[0] = want;
+         * needs.
+         *
+         * sv24: the hand-over is guarded on the same ground as the read above it.
+         * The watchdog runs this pass on this DLL's own thread while the client's
+         * thread keeps running, so between the words that answered fine and the
+         * two that are about to be written the client can release the chunk, and
+         * writing to heap it has released faults exactly like reading it does --
+         * the same class of access violation a crash report names, with the
+         * report's module table pointing at this DLL. Both writes sit inside one
+         * guard, so a fault leaves the chunk as it stood -- never half-pointed at
+         * one preset's payload by +0x144 and still on another's by +0xf1c -- and
+         * the slot is taken back, so the next load of that tile records a fresh
+         * chunk and makes the decision again. */
+        bad = 0u;
+        __try {
+            ((unsigned *)((char *)chunk + FIELD_SHADOW_OFS))[0] = want;
+            ((unsigned *)((char *)chunk + FIELD_PTR_MCSH))[0] = want;
+        } __except(1) {
+            ++wrote_bad;
+            ++g_refill_count_write;
+            bad = 1u;
+        }
+        if (bad != 0u) {
+            ++g_refill_probe_failed;
+            if (!logged_write) {
+                logged_write = 1;
+                snprintf(msg, sizeof msg,
+                         STAMP " refill first hand-over that faulted: this %#x"
+                               " answered every read above and writing its + %#x"
+                               " and + %#x did not, so the client released the"
+                               " chunk while the pass was walking; nothing was"
+                               " half-written and the slot is taken back",
+                         (unsigned)(size_t)chunk, (unsigned)FIELD_SHADOW_OFS,
+                         (unsigned)FIELD_PTR_MCSH);
+                LogMsg(msg);
+            }
+            RefillForget(i, first);
+            continue;
+        }
         g_refill_set[i] = which;
 
         /* the chunk's shadow texture is at +0x140, except on a client whose
@@ -3209,10 +3317,11 @@ static void RefillShadowTextures(void)
          * under the read is what makes asking the right field not depend on the
          * switches at all: exactly one of the two fields holds a texture, so the
          * refill marks the one that exists, and only a chunk with 0 at BOTH is
-         * left with nothing to mark. */
-        tex = ((const unsigned *)((char *)chunk + tex_ofs))[0];
+         * left with nothing to mark. The two words were read in the guarded block
+         * above, so nothing here reaches into the chunk again: the mark goes to
+         * the texture object that read named, which is a value the pass already
+         * has. */
         if (tex == 0u) {
-            other_tex = ((const unsigned *)((char *)chunk + other_ofs))[0];
             if (other_tex != 0u) {
                 ++mismatch; /* this chunk's shadow-carrying texture is at the
                               * other field than the two switches say, so its load
@@ -3301,12 +3410,16 @@ static void RefillShadowTextures(void)
                     " chunk+%#x no longer answers as a shadow slot: %u had no"
                     " header there, %u read ofsMCSH 0, %u a body under the"
                     " shadow's own size of %u, %u a header inside this DLL's"
-                    " arena and %u could not be read at all; %u were marked at"
-                    " the other texture field than the shader switches picked"
+                    " arena, %u were not readable at all, the chunk object"
+                    " the slot names having been destroyed and its heap released"
+                    " by the client, and %u answered every read here and still"
+                    " could not be written to, the client having released the"
+                    " chunk between the read and the hand-over; %u were marked"
+                    " at the other texture field than the shader switches picked"
                     " and %u took a new address with no texture at either field",
-             freed_hdr + unown, freed_hdr, (unsigned)FIELD_HDR_OFS, count_null, count_ofs,
+             freed_hdr + unown + unreadable + wrote_bad, freed_hdr, (unsigned)FIELD_HDR_OFS, count_null, count_ofs,
              count_size, (unsigned)SHADOW_DAT_PAYLOAD_BYTES, count_arena,
-             count_fault, mismatch, notex);
+             unreadable, wrote_bad, mismatch, notex);
     LogMsg(msg);
     snprintf(msg, sizeof msg,
              STAMP " refill so far: %u of the %u slots the hash has are live,"
@@ -3314,15 +3427,18 @@ static void RefillShadowTextures(void)
                    " %u live slots have been walked by this session's passes and"
                    " %u of them were taken back: %u had no header at chunk+%#x,"
                    " %u read ofsMCSH 0 there, %u a body under the shadow's own"
-                   " size, %u a header inside this DLL's arena and %u could not"
-                   " be read at all; the watchdog's live probe answered yes at"
+                   " size, %u a header inside this DLL's arena, %u could not"
+                   " be read at all, the chunk object the slot names having"
+                   " been destroyed and its heap released by the client, and"
+                   " %u answered every read and still could not be written to;"
+                   " the watchdog's live probe answered yes at"
                    " %u crossings and named a record whose chunk is another"
                    " tile's at %u",
              g_refillCount, (unsigned)REFILL_SLOTS, g_refill_dropped,
              g_refill_evicted, g_refill_probed, g_refill_probe_failed,
              (unsigned)FIELD_HDR_OFS, g_refill_count_null, g_refill_count_ofs,
-             g_refill_count_size, g_refill_count_arena, g_refill_count_fault,
-             g_refill_probe_live, g_refill_probe_stale);
+             g_refill_count_size, g_refill_count_arena, g_refill_count_unreadable,
+             g_refill_count_write, g_refill_probe_live, g_refill_probe_stale);
     LogMsg(msg);
     g_refill_busy = 0;
 }
